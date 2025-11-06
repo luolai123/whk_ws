@@ -1,0 +1,7 @@
+<launch>
+  <include file="$(find autonomy_demo)/launch/sim.launch" />
+
+  <node pkg="autonomy_demo" type="inference_node.py" name="distance_inference" output="screen">
+    <param name="model_path" value="$(env HOME)/autonomy_demo/model.pt" />
+  </node>
+</launch>
