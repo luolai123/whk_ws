@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Random obstacle world generator for RViz visualization and occupancy data."""
 
-import ast
 import math
 import random
 from dataclasses import dataclass
-from typing import Iterable, List, Tuple
+from typing import List, Tuple
 
 import rospy
 from nav_msgs.msg import MapMetaData, OccupancyGrid
@@ -23,11 +22,11 @@ class WorldGenerator:
     """Generates a random set of box obstacles and publishes them for visualization."""
 
     def __init__(self) -> None:
-        self.world_size = self._get_float_list("~world_size", [20.0, 20.0, 5.0], 3)
-        self.obstacle_count = self._get_int("~obstacle_count", 40)
-        self.height_range = self._get_float_list("~height_range", [0.5, 3.0], 2)
-        self.size_range = self._get_float_list("~size_range", [0.5, 2.5], 2)
-        self.occupancy_resolution = self._get_float("~occupancy_resolution", 0.5)
+        self.world_size = rospy.get_param("~world_size", [20.0, 20.0, 5.0])
+        self.obstacle_count = rospy.get_param("~obstacle_count", 40)
+        self.height_range = rospy.get_param("~height_range", [0.5, 3.0])
+        self.size_range = rospy.get_param("~size_range", [0.5, 2.5])
+        self.occupancy_resolution = rospy.get_param("~occupancy_resolution", 0.5)
         self.frame_id = rospy.get_param("~frame_id", "map")
 
         self.marker_pub = rospy.Publisher("world/obstacles", MarkerArray, queue_size=1, latch=True)
@@ -123,59 +122,6 @@ class WorldGenerator:
                     data[iy * width + ix] = 100
         grid.data = data
         return grid
-
-    @staticmethod
-    def _maybe_parse_literal(value, name: str = ""):
-        if isinstance(value, str):
-            try:
-                return ast.literal_eval(value)
-            except (ValueError, SyntaxError):
-                if name:
-                    rospy.logwarn("Failed to parse parameter %s as literal, using raw string", name)
-                else:
-                    rospy.logwarn("Failed to parse parameter value '%s' as literal", value)
-        return value
-
-    @classmethod
-    def _coerce_sequence(cls, value) -> Iterable:
-        parsed = cls._maybe_parse_literal(value)
-        if isinstance(parsed, (list, tuple)):
-            return parsed
-        return [parsed]
-
-    @classmethod
-    def _get_float_list(cls, name: str, default: List[float], expected_len: int) -> List[float]:
-        raw = rospy.get_param(name, default)
-        values = [float(x) for x in cls._coerce_sequence(cls._maybe_parse_literal(raw, name))]
-        if len(values) != expected_len:
-            rospy.logwarn(
-                "Parameter %s expected %d values but got %d, falling back to default",
-                name,
-                expected_len,
-                len(values),
-            )
-            return list(default)
-        return values
-
-    @classmethod
-    def _get_float(cls, name: str, default: float) -> float:
-        raw = rospy.get_param(name, default)
-        parsed = cls._maybe_parse_literal(raw, name)
-        try:
-            return float(parsed)
-        except (TypeError, ValueError):
-            rospy.logwarn("Parameter %s could not be parsed as float, using default", name)
-            return float(default)
-
-    @classmethod
-    def _get_int(cls, name: str, default: int) -> int:
-        raw = rospy.get_param(name, default)
-        parsed = cls._maybe_parse_literal(raw, name)
-        try:
-            return int(parsed)
-        except (TypeError, ValueError):
-            rospy.logwarn("Parameter %s could not be parsed as int, using default", name)
-            return int(default)
 
 
 def main() -> None:
