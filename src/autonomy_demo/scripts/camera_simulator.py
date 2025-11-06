@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import math
 from dataclasses import dataclass
 from typing import List, Optional
@@ -25,11 +26,11 @@ class Obstacle:
 class CameraSimulator:
     def __init__(self) -> None:
         self.frame_id = rospy.get_param("~frame_id", "map")
-        self.image_width = rospy.get_param("~width", 128)
-        self.image_height = rospy.get_param("~height", 72)
-        self.fov_deg = rospy.get_param("~fov_deg", 120.0)
-        self.max_range = rospy.get_param("~max_range", 12.0)
-        self.publish_rate = rospy.get_param("~rate", 10.0)
+        self.image_width = self._get_int_param("~width", 128)
+        self.image_height = self._get_int_param("~height", 72)
+        self.fov_deg = self._get_float_param("~fov_deg", 120.0)
+        self.max_range = self._get_float_param("~max_range", 12.0)
+        self.publish_rate = self._get_float_param("~rate", 10.0)
 
         self.bridge = CvBridge()
         self.latest_pose: Optional[PoseStamped] = None
@@ -105,8 +106,11 @@ class CameraSimulator:
                 fy = fx
                 cx = self.image_width / 2.0
                 cy = self.image_height / 2.0
-                info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
-                info.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+                info.distortion_model = "plumb_bob"
+                info.D = [0.0, 0.0, 0.0, 0.0, 0.0]
+                info.K = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+                info.R = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+                info.P = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
                 self.image_pub.publish(msg)
                 self.info_pub.publish(info)
             rate.sleep()
@@ -114,6 +118,38 @@ class CameraSimulator:
     @property
     def child_frame_id(self) -> str:
         return rospy.get_param("~camera_frame", "rgb_optical")
+
+    @staticmethod
+    def _maybe_parse_literal(value, name: str = ""):
+        if isinstance(value, str):
+            try:
+                return ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                if name:
+                    rospy.logwarn("Failed to parse parameter %s as literal, using raw string", name)
+                else:
+                    rospy.logwarn("Failed to parse parameter value '%s' as literal", value)
+        return value
+
+    @classmethod
+    def _get_float_param(cls, name: str, default: float) -> float:
+        raw = rospy.get_param(name, default)
+        parsed = cls._maybe_parse_literal(raw, name)
+        try:
+            return float(parsed)
+        except (TypeError, ValueError):
+            rospy.logwarn("Parameter %s could not be parsed as float, using default", name)
+            return float(default)
+
+    @classmethod
+    def _get_int_param(cls, name: str, default: int) -> int:
+        raw = rospy.get_param(name, default)
+        parsed = cls._maybe_parse_literal(raw, name)
+        try:
+            return int(parsed)
+        except (TypeError, ValueError):
+            rospy.logwarn("Parameter %s could not be parsed as int, using default", name)
+            return int(default)
 
 
 def main() -> None:
