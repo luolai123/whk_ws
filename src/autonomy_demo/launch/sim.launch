@@ -1,0 +1,23 @@
+<launch>
+  <node pkg="autonomy_demo" type="world_generator.py" name="world_generator" output="screen">
+    <param name="world_size" value="[20.0, 20.0, 5.0]" />
+    <param name="obstacle_count" value="45" />
+    <param name="size_range" value="[0.5, 2.0]" />
+    <param name="height_range" value="[0.5, 3.0]" />
+    <param name="occupancy_resolution" value="0.5" />
+  </node>
+
+  <node pkg="autonomy_demo" type="drone_simulator.py" name="drone_simulator" output="screen">
+    <param name="max_speed" value="1.5" />
+    <param name="altitude" value="1.5" />
+  </node>
+
+  <node pkg="autonomy_demo" type="camera_simulator.py" name="camera_simulator" output="screen">
+    <param name="width" value="128" />
+    <param name="height" value="72" />
+    <param name="fov_deg" value="120.0" />
+    <param name="max_range" value="12.0" />
+  </node>
+
+  <node pkg="rviz" type="rviz" name="rviz" args="-d $(find autonomy_demo)/config/world.rviz" />
+</launch>
