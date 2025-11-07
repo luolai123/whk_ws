@@ -2,9 +2,8 @@
 """Automated RGB data collector with distance-based labeling."""
 
 import math
-from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
 import rospy
@@ -13,58 +12,55 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image
 from std_msgs.msg import Header
 from tf_conversions import transformations
-from visualization_msgs.msg import Marker, MarkerArray
+from visualization_msgs.msg import MarkerArray
 
-
-@dataclass
-class Obstacle:
-    shape: str
-    center: np.ndarray
-    size: np.ndarray
-    rotation: np.ndarray
-    half_extents: np.ndarray = dataclass_field(init=False, repr=False)
-    inv_rotation: np.ndarray = dataclass_field(init=False, repr=False)
-    bounding_radius: float = dataclass_field(init=False)
-    bounding_radius_sq: float = dataclass_field(init=False, repr=False)
-    _sphere_radius: float = dataclass_field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self.center = np.asarray(self.center, dtype=np.float32)
-        self.size = np.asarray(self.size, dtype=np.float32)
-        if self.rotation is None:
-            self.rotation = np.identity(3, dtype=np.float32)
-        else:
-            self.rotation = np.asarray(self.rotation, dtype=np.float32)
-        if self.shape == "sphere":
-            radius = float(self.size[0]) / 2.0
-            self.half_extents = np.array([radius, radius, radius], dtype=np.float32)
-            self._sphere_radius = radius
-        else:
-            self.half_extents = self.size / 2.0
-            self._sphere_radius = float(max(self.size[0], self.size[1])) / 2.0
-        self.inv_rotation = self.rotation.T
-        self.bounding_radius = float(np.linalg.norm(self.half_extents))
-        self.bounding_radius_sq = self.bounding_radius * self.bounding_radius
-
-    @property
-    def radius(self) -> float:
-        return self._sphere_radius
+from obstacle_field import ObstacleField
 
 
 class DataCollector:
     def __init__(self) -> None:
         self.bridge = CvBridge()
         self.pose: Optional[PoseStamped] = None
-        self.obstacles: List[Obstacle] = []
+        self.obstacle_field = ObstacleField()
 
         self.max_range = rospy.get_param("~max_range", 12.0)
         self.fov_deg = rospy.get_param("~fov_deg", 120.0)
         self.near_threshold = rospy.get_param("~near_threshold", 4.0)
         offset_raw = rospy.get_param("~camera_offset", [0.15, 0.0, 0.05])
         self.camera_offset = self._parse_offset(offset_raw)
-        self.output_dir = Path(rospy.get_param("~output_dir", str(Path.home() / "autonomy_demo" / "dataset")))
+        self.output_dir = Path(
+            rospy.get_param("~output_dir", str(Path.home() / "autonomy_demo" / "dataset"))
+        )
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.sample_count = 0
+
+        self.hardware_accel = rospy.get_param("~hardware_accel", False)
+        self.hardware_device = rospy.get_param("~hardware_device", "cuda")
+        self._torch = None
+        self._device = None
+        self._use_torch = False
+        if self.hardware_accel:
+            try:
+                import torch
+
+                requested_device = self.hardware_device
+                try:
+                    device = torch.device(requested_device)
+                except (TypeError, ValueError):
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                if device.type == "cuda" and not torch.cuda.is_available():
+                    rospy.logwarn(
+                        "hardware_accel requested for data collector but CUDA is unavailable; using CPU"
+                    )
+                else:
+                    self._torch = torch
+                    self._device = device
+                    self._use_torch = True
+                    rospy.loginfo("Data collector using torch hardware acceleration on %s", device)
+            except ImportError:
+                rospy.logwarn(
+                    "Torch is not available; data collector will run ray casting on the CPU"
+                )
 
         rospy.Subscriber("drone/pose", PoseStamped, self.pose_callback)
         rospy.Subscriber("world/obstacles", MarkerArray, self.obstacle_callback)
@@ -76,40 +72,12 @@ class DataCollector:
         self.pose = msg
 
     def obstacle_callback(self, msg: MarkerArray) -> None:
-        parsed: List[Obstacle] = []
-        for marker in msg.markers:
-            center = np.array(
-                [
-                    float(marker.pose.position.x),
-                    float(marker.pose.position.y),
-                    float(marker.pose.position.z),
-                ],
-                dtype=np.float32,
-            )
-            size = np.array(
-                [
-                    max(float(marker.scale.x), 1e-3),
-                    max(float(marker.scale.y), 1e-3),
-                    max(float(marker.scale.z), 1e-3),
-                ],
-                dtype=np.float32,
-            )
-            quat = [
-                float(marker.pose.orientation.x),
-                float(marker.pose.orientation.y),
-                float(marker.pose.orientation.z),
-                float(marker.pose.orientation.w),
-            ]
-            if marker.type == Marker.SPHERE:
-                rotation = np.identity(3, dtype=np.float32)
-                shape = "sphere"
-            else:
-                rotation = self._quaternion_to_matrix(quat)
-                shape = "box"
-            parsed.append(
-                Obstacle(shape=shape, center=center, size=size, rotation=rotation)
-            )
-        self.obstacles = parsed
+        self.obstacle_field.update_from_markers(
+            msg.markers,
+            use_torch=self._use_torch,
+            torch_module=self._torch,
+            device=self._device,
+        )
 
     def compute_distances(self, width: int) -> np.ndarray:
         if self.pose is None:
@@ -123,28 +91,51 @@ class DataCollector:
             [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
         )
         basis = rotation[0:3, 0:3].astype(np.float32)
-        forward = self._normalize(basis[:, 0])
-        right = self._normalize(basis[:, 1])
         camera_position = base_position + basis.dot(self.camera_offset)
+
+        forward = basis[:, 0]
+        right = basis[:, 1]
 
         fov = math.radians(self.fov_deg)
         tan_half_h = math.tan(fov / 2.0)
-        distances = np.full(width, self.max_range, dtype=np.float32)
+        u = (np.arange(width, dtype=np.float32) + 0.5) / float(width)
+        u_ndc = (u * 2.0) - 1.0
+        directions = forward[np.newaxis, :] + (u_ndc[:, np.newaxis] * tan_half_h * right[np.newaxis, :])
+        norms = np.linalg.norm(directions, axis=1, keepdims=True)
+        norms = np.clip(norms, 1e-6, None)
+        directions = directions / norms
 
-        for u in range(width):
-            u_ndc = 2.0 * ((u + 0.5) / float(width)) - 1.0
-            direction = self._normalize(forward + u_ndc * tan_half_h * right)
-            hit = self._cast_ray(camera_position, direction)
-            if hit is None:
-                continue
-            distance, _ = hit
-            if distance <= 0.0:
-                continue
-            distances[u] = min(distance, self.max_range)
+        if self._use_torch and self.obstacle_field.supports_torch:
+            torch = self._torch
+            origin_t = torch.from_numpy(camera_position).to(
+                device=self._device, dtype=torch.float32
+            )
+            directions_t = torch.from_numpy(directions).to(
+                device=self._device, dtype=torch.float32
+            )
+            ray_result = self.obstacle_field.cast_rays_torch(
+                torch, self._device, origin_t, directions_t, float(self.max_range)
+            )
+            distances = ray_result.distances.detach().cpu().numpy()
+        else:
+            ray_result = self.obstacle_field.cast_rays_cpu(
+                camera_position, directions, float(self.max_range)
+            )
+            distances = ray_result.distances
+
+        distances = np.where(
+            np.isfinite(distances), distances.astype(np.float32), float(self.max_range)
+        )
+        distances = np.clip(distances, 0.0, float(self.max_range))
         return distances
 
     def image_callback(self, msg: Image) -> None:
-        if self.pose is None or not self.obstacles:
+        if self.pose is None:
+            return
+        if (
+            self.obstacle_field.sphere_centers.size == 0
+            and self.obstacle_field.box_centers.size == 0
+        ):
             return
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
         height, width, _ = cv_image.shape
@@ -170,129 +161,6 @@ class DataCollector:
             "frame_id": header.frame_id,
             "seq": header.seq,
         }
-
-    @staticmethod
-    def _normalize(vec: np.ndarray) -> np.ndarray:
-        norm = float(np.linalg.norm(vec))
-        if norm <= 1e-8:
-            return vec
-        return vec / norm
-
-    @staticmethod
-    def _quaternion_to_matrix(quat: List[float]) -> np.ndarray:
-        if abs(sum(q * q for q in quat)) <= 1e-12:
-            return np.identity(3, dtype=np.float32)
-        matrix = transformations.quaternion_matrix(quat)
-        return matrix[0:3, 0:3].astype(np.float32)
-
-    def _cast_ray(self, origin: np.ndarray, direction: np.ndarray) -> Optional[tuple]:
-        best_distance = float(self.max_range)
-        best_normal: Optional[np.ndarray] = None
-        for obstacle in self.obstacles:
-            offset = obstacle.center - origin
-            proj = float(np.dot(offset, direction))
-            if proj < -obstacle.bounding_radius or proj - obstacle.bounding_radius > best_distance:
-                continue
-            closest_sq = float(np.dot(offset, offset)) - proj * proj
-            if closest_sq > obstacle.bounding_radius_sq:
-                continue
-
-            if obstacle.shape == "sphere":
-                result = self._intersect_sphere(origin, direction, obstacle, best_distance)
-            else:
-                result = self._intersect_box(origin, direction, obstacle, best_distance)
-            if result is None:
-                continue
-            distance, normal = result
-            if distance <= 0.0 or distance > best_distance:
-                continue
-            best_distance = distance
-            best_normal = normal
-
-        if best_normal is None:
-            return None
-        return best_distance, best_normal
-
-    @staticmethod
-    def _intersect_sphere(
-        origin: np.ndarray,
-        direction: np.ndarray,
-        obstacle: Obstacle,
-        max_distance: float,
-    ) -> Optional[tuple]:
-        center = obstacle.center
-        radius = obstacle._sphere_radius
-        oc = origin - center
-        b = 2.0 * float(np.dot(direction, oc))
-        c = float(np.dot(oc, oc)) - radius * radius
-        discriminant = b * b - 4.0 * c
-        if discriminant < 0.0:
-            return None
-        sqrt_disc = math.sqrt(discriminant)
-        t1 = (-b - sqrt_disc) / 2.0
-        t2 = (-b + sqrt_disc) / 2.0
-        t_hit = None
-        for t in (t1, t2):
-            if t_hit is None or (0.0 < t < t_hit):
-                if t > 0.0:
-                    t_hit = t
-        if t_hit is None:
-            return None
-        if t_hit > max_distance:
-            return None
-        point = origin + direction * t_hit
-        normal = DataCollector._normalize(point - center)
-        return t_hit, normal
-
-    @staticmethod
-    def _intersect_box(
-        origin: np.ndarray,
-        direction: np.ndarray,
-        obstacle: Obstacle,
-        max_distance: float,
-    ) -> Optional[tuple]:
-        half_extents = obstacle.half_extents
-        inv_rotation = obstacle.inv_rotation
-        rotation = obstacle.rotation
-        center = obstacle.center
-        local_origin = inv_rotation.dot(origin - center)
-        local_direction = inv_rotation.dot(direction)
-
-        tmin = -float("inf")
-        tmax = float("inf")
-        for i in range(3):
-            if abs(local_direction[i]) < 1e-6:
-                if abs(local_origin[i]) > half_extents[i]:
-                    return None
-                continue
-            inv_dir = 1.0 / local_direction[i]
-            t1 = (-half_extents[i] - local_origin[i]) * inv_dir
-            t2 = (half_extents[i] - local_origin[i]) * inv_dir
-            if t1 > t2:
-                t1, t2 = t2, t1
-            tmin = max(tmin, t1)
-            tmax = min(tmax, t2)
-            if tmax < tmin:
-                return None
-
-        if tmax < 0.0:
-            return None
-        t_hit = tmin if tmin > 0.0 else tmax
-        if t_hit < 0.0:
-            return None
-        if t_hit > max_distance:
-            return None
-
-        local_point = local_origin + local_direction * t_hit
-        abs_diff = [abs(abs(local_point[i]) - half_extents[i]) for i in range(3)]
-        axis = int(np.argmin(abs_diff))
-        if abs_diff[axis] > 1e-4:
-            axis = int(np.argmax(np.abs(local_point / half_extents)))
-        normal_local = np.zeros(3, dtype=np.float32)
-        normal_local[axis] = math.copysign(1.0, local_point[axis])
-        normal_world = rotation.dot(normal_local)
-        normal_world = DataCollector._normalize(normal_world)
-        return t_hit, normal_world
 
     @staticmethod
     def _parse_offset(value) -> np.ndarray:

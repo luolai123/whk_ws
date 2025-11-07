@@ -7,8 +7,8 @@ This workspace contains a complete ROS1 (Noetic) simulation for a UAV navigating
 - **Random obstacle world** featuring a mix of colorful boxes and spheres published as `visualization_msgs/MarkerArray` and `nav_msgs/OccupancyGrid`, ready for RViz visualization and programmatic access.
 - **Configurable environment scale** with tunable obstacle density, size ranges, and shape ratios.
 - **Kinematic UAV simulator** that responds to RViz 2D Nav Goal inputs and publishes pose/odometry data.
-- **Synthetic RGB camera** that renders obstacle distances into color-coded imagery.
-- **Automated data collection** pipeline that records RGB frames with near/far obstacle labels using analytic distance computation.
+- **Synthetic RGB camera** that renders obstacle distances into color-coded imagery with optional torch-powered acceleration.
+- **Automated data collection** pipeline that records RGB frames with near/far obstacle labels using analytic distance computation, reusing the same accelerated ray casting path as the camera.
 - **PyTorch training utilities** for a two-class distance classifier and an inference node that streams classification maps in real time.
 
 ## Prerequisites
@@ -59,7 +59,7 @@ rosservice call /world_generator/regenerate
 
 ### Customizing the World Layout
 
-- Increase the simulated airspace or avoid seeing beyond the borders by raising `world_size` (default `40 x 40 x 8` meters).
+- Increase the simulated airspace or avoid seeing beyond the borders by raising `world_size` (the default launch configuration spans `160 x 160 x 14` meters).
 - Control crowding with `obstacle_density` (obstacles per square meter). When the density is zero the system falls back to the legacy `obstacle_count` parameter.
 - Mix shape variety with `sphere_ratio` (0.0–1.0) to choose how many obstacles are rendered as spheres versus boxes.
 - Adjust `size_range` and `height_range` to refine individual obstacle proportions. All parameters can be overridden in `sim.launch` or via ROS command-line arguments when launching.
@@ -76,6 +76,24 @@ roslaunch autonomy_demo data_collection.launch output_dir:=/your/dataset/path
 - The default near/far threshold is 4 meters; override with the `near_threshold` parameter if required.
 
 > Tip: move the UAV around using RViz goals while data collection is running to diversify the dataset. You can also call the regenerate service to change obstacle layouts between runs.
+
+### Optional Hardware Acceleration
+
+- Both the RGB camera simulator and the automated data collector can offload ray casting to PyTorch. Enable the GPU-backed code paths (requires a CUDA-capable build of PyTorch) by appending launch arguments, for example:
+
+  ```bash
+  roslaunch autonomy_demo sim.launch hardware_accel:=true hardware_device:=cuda
+  ```
+
+  The `hardware_device` parameter accepts any device string understood by `torch.device` (e.g. `cuda:0`, `cuda:1`, or `cpu`).
+
+- The data collection pipeline inherits the same arguments:
+
+  ```bash
+  roslaunch autonomy_demo data_collection.launch hardware_accel:=true output_dir:=/tmp/dataset
+  ```
+
+- When CUDA is unavailable or PyTorch is not installed, the nodes automatically fall back to the optimized NumPy implementation.
 
 ## Training the Distance Classifier
 

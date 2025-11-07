@@ -5,54 +5,18 @@ from __future__ import annotations
 
 import ast
 import math
-from dataclasses import dataclass, field as dataclass_field
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
 import rospy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from sensor_msgs.msg import CameraInfo, Image
-from visualization_msgs.msg import Marker, MarkerArray
+from visualization_msgs.msg import MarkerArray
 import tf2_ros
 from tf_conversions import transformations
 
-
-@dataclass
-class Obstacle:
-    """Simple container describing a rendered obstacle."""
-
-    shape: str
-    center: np.ndarray
-    size: np.ndarray
-    rotation: np.ndarray
-    half_extents: np.ndarray = dataclass_field(init=False, repr=False)
-    inv_rotation: np.ndarray = dataclass_field(init=False, repr=False)
-    bounding_radius: float = dataclass_field(init=False)
-    bounding_radius_sq: float = dataclass_field(init=False, repr=False)
-    _sphere_radius: float = dataclass_field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self.center = np.asarray(self.center, dtype=np.float32)
-        self.size = np.asarray(self.size, dtype=np.float32)
-        if self.rotation is None:
-            self.rotation = np.identity(3, dtype=np.float32)
-        else:
-            self.rotation = np.asarray(self.rotation, dtype=np.float32)
-        if self.shape == "sphere":
-            radius = float(self.size[0]) / 2.0
-            self.half_extents = np.array([radius, radius, radius], dtype=np.float32)
-            self._sphere_radius = radius
-        else:
-            self.half_extents = self.size / 2.0
-            self._sphere_radius = float(max(self.size[0], self.size[1])) / 2.0
-        self.inv_rotation = self.rotation.T
-        self.bounding_radius = float(np.linalg.norm(self.half_extents))
-        self.bounding_radius_sq = self.bounding_radius * self.bounding_radius
-
-    @property
-    def radius(self) -> float:
-        return self._sphere_radius
+from obstacle_field import ObstacleField
 
 
 class CameraSimulator:
@@ -76,11 +40,47 @@ class CameraSimulator:
         else:
             self.camera_offset = [0.15, 0.0, 0.05]
 
+        self.hardware_accel = rospy.get_param("~hardware_accel", False)
+        self.hardware_device = rospy.get_param("~hardware_device", "cuda")
+        self._torch = None
+        self._device = None
+        self._use_torch = False
+        if self.hardware_accel:
+            try:
+                import torch
+
+                requested_device = self.hardware_device
+                try:
+                    device = torch.device(requested_device)
+                except (TypeError, ValueError):
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                if device.type == "cuda" and not torch.cuda.is_available():
+                    rospy.logwarn(
+                        "hardware_accel requested but CUDA not available; falling back to CPU"
+                    )
+                else:
+                    self._torch = torch
+                    self._device = device
+                    self._use_torch = True
+                    rospy.loginfo(
+                        "Camera simulator using torch hardware acceleration on %s", device
+                    )
+            except ImportError:
+                rospy.logwarn(
+                    "Torch is not available; camera simulator will use CPU ray casting"
+                )
+
         self.bridge = CvBridge()
         self.latest_pose: Optional[PoseStamped] = None
-        self.obstacles: List[Obstacle] = []
+        self.obstacle_field = ObstacleField()
         self._local_rays = self._precompute_rays()
         self._pixel_count = self._local_rays.shape[0]
+        if self._use_torch:
+            self._torch_rays = self._torch.from_numpy(self._local_rays).to(
+                device=self._device, dtype=self._torch.float32
+            )
+        else:
+            self._torch_rays = None
         self._camera_offset_vec = np.array(self.camera_offset, dtype=np.float32)
         self._light_dir = self._normalize(np.array([-0.2, -0.4, -1.0], dtype=np.float32))
         self._ground_color = np.array([88, 120, 80], dtype=np.float32)
@@ -103,38 +103,12 @@ class CameraSimulator:
         self.latest_pose = msg
 
     def obstacle_callback(self, msg: MarkerArray) -> None:
-        obstacles: List[Obstacle] = []
-        for marker in msg.markers:
-            center = np.array(
-                [
-                    float(marker.pose.position.x),
-                    float(marker.pose.position.y),
-                    float(marker.pose.position.z),
-                ],
-                dtype=np.float32,
-            )
-            size = np.array(
-                [
-                    max(float(marker.scale.x), 1e-3),
-                    max(float(marker.scale.y), 1e-3),
-                    max(float(marker.scale.z), 1e-3),
-                ],
-                dtype=np.float32,
-            )
-            quat = [
-                float(marker.pose.orientation.x),
-                float(marker.pose.orientation.y),
-                float(marker.pose.orientation.z),
-                float(marker.pose.orientation.w),
-            ]
-            if marker.type == Marker.SPHERE:
-                rotation = np.identity(3, dtype=np.float32)
-                shape = "sphere"
-            else:
-                rotation = self._quaternion_to_matrix(quat)
-                shape = "box"
-            obstacles.append(Obstacle(shape=shape, center=center, size=size, rotation=rotation))
-        self.obstacles = obstacles
+        self.obstacle_field.update_from_markers(
+            msg.markers,
+            use_torch=self._use_torch,
+            torch_module=self._torch,
+            device=self._device,
+        )
 
     def render_image(self) -> Optional[np.ndarray]:
         if self.latest_pose is None:
@@ -155,37 +129,64 @@ class CameraSimulator:
         if width <= 0 or height <= 0:
             return np.zeros((0, 0, 3), dtype=np.uint8)
 
-        directions = self._local_rays.dot(basis.T)
-        light_dir = self._light_dir
-        ground_color = self._ground_color
-        sky_color_top = self._sky_color_top
-        sky_color_horizon = self._sky_color_horizon
-        obstacle_color = self._obstacle_color
+        directions_world = self._local_rays.dot(basis.T)
 
-        pixels = np.empty((self._pixel_count, 3), dtype=np.uint8)
-        for idx, direction in enumerate(directions):
-            hit = self._cast_ray(camera_position, direction)
-            if hit is not None:
-                distance, normal = hit
-                lambert = max(0.0, float(np.dot(normal, -light_dir)))
-                shade = 0.25 + 0.75 * lambert
-                attenuation = 1.0 / (1.0 + 0.08 * max(distance, 0.0))
-                base = obstacle_color * shade * attenuation
-                pixels[idx, :] = np.clip(base, 0.0, 255.0).astype(np.uint8)
-                continue
+        if self._use_torch and self.obstacle_field.supports_torch:
+            torch = self._torch
+            basis_t = torch.from_numpy(basis).to(device=self._device, dtype=torch.float32)
+            origin_t = torch.from_numpy(camera_position).to(
+                device=self._device, dtype=torch.float32
+            )
+            directions_t = self._torch_rays @ basis_t.t()
+            ray_result = self.obstacle_field.cast_rays_torch(
+                torch, self._device, origin_t, directions_t, float(self.max_range)
+            )
+            distances = ray_result.distances.detach().cpu().numpy()
+            normals = ray_result.normals.detach().cpu().numpy()
+            hit_mask = ray_result.hit_mask.detach().cpu().numpy()
+        else:
+            ray_result = self.obstacle_field.cast_rays_cpu(
+                camera_position, directions_world, float(self.max_range)
+            )
+            distances = ray_result.distances
+            normals = ray_result.normals
+            hit_mask = ray_result.hit_mask
 
-            if direction[2] < -1e-4:
-                t_ground = (camera_position[2]) / -direction[2]
-                if 0.0 < t_ground <= self.max_range * 3.0:
-                    point = camera_position + direction * t_ground
-                    tiling = (math.sin(point[0] * 0.6) + math.sin(point[1] * 0.6)) * 0.5
-                    base = ground_color * (0.7 + 0.2 * tiling)
-                    pixels[idx, :] = np.clip(base, 0.0, 255.0).astype(np.uint8)
-                    continue
+        directions = directions_world
+        sky_mix = np.clip((directions[:, 2] + 1.0) * 0.5, 0.0, 1.0)
+        pixels = (
+            self._sky_color_horizon * (1.0 - sky_mix)[:, None]
+            + self._sky_color_top * sky_mix[:, None]
+        )
+        pixels = np.clip(pixels, 0.0, 255.0).astype(np.uint8)
 
-            t = max(0.0, min(1.0, (direction[2] + 1.0) * 0.5))
-            sky = sky_color_horizon * (1.0 - t) + sky_color_top * t
-            pixels[idx, :] = np.clip(sky, 0.0, 255.0).astype(np.uint8)
+        if np.any(hit_mask):
+            lambert = np.dot(normals[hit_mask], -self._light_dir)
+            lambert = np.clip(lambert, 0.0, 1.0)
+            shade = 0.25 + 0.75 * lambert
+            attenuation = 1.0 / (1.0 + 0.08 * np.maximum(distances[hit_mask], 0.0))
+            base = self._obstacle_color * shade[:, None] * attenuation[:, None]
+            pixels[hit_mask] = np.clip(base, 0.0, 255.0).astype(np.uint8)
+
+        remaining_idx = np.where(~hit_mask)[0]
+        if remaining_idx.size:
+            subset = directions[remaining_idx]
+            dir_z = subset[:, 2]
+            t_ground = np.full(subset.shape[0], np.inf, dtype=np.float32)
+            ground_dirs = dir_z < -1e-4
+            t_ground[ground_dirs] = camera_position[2] / -dir_z[ground_dirs]
+            ground_valid = (
+                ground_dirs
+                & (t_ground > 0.0)
+                & (t_ground <= float(self.max_range) * 3.0)
+            )
+            if np.any(ground_valid):
+                points = camera_position + subset[ground_valid] * t_ground[ground_valid][:, None]
+                tiling = (np.sin(points[:, 0] * 0.6) + np.sin(points[:, 1] * 0.6)) * 0.5
+                base = self._ground_color * (0.7 + 0.2 * tiling)[:, None]
+                pixels[remaining_idx[ground_valid]] = np.clip(base, 0.0, 255.0).astype(
+                    np.uint8
+                )
 
         return pixels.reshape(height, width, 3)
 
@@ -231,14 +232,10 @@ class CameraSimulator:
         y_components = v[:, np.newaxis] * tan_half_v
 
         ones = np.ones((height, width), dtype=np.float32)
-        local_dirs = np.stack(
-            (
-                ones,
-                np.broadcast_to(x_components, (height, width)),
-                y_components,
-            ),
-            axis=-1,
-        )
+        x_grid = np.broadcast_to(x_components, (height, width))
+        y_grid = np.broadcast_to(y_components, (height, width))
+
+        local_dirs = np.stack((ones, x_grid, y_grid), axis=-1)
         norms = np.linalg.norm(local_dirs, axis=-1, keepdims=True)
         norms = np.clip(norms, 1e-6, None)
         local_dirs /= norms
@@ -296,123 +293,6 @@ class CameraSimulator:
         if norm <= 1e-8:
             return vec
         return vec / norm
-
-    @staticmethod
-    def _quaternion_to_matrix(quat: List[float]) -> np.ndarray:
-        if abs(sum(q * q for q in quat)) <= 1e-12:
-            return np.identity(3, dtype=np.float32)
-        matrix = transformations.quaternion_matrix(quat)
-        return matrix[0:3, 0:3].astype(np.float32)
-
-    def _cast_ray(self, origin: np.ndarray, direction: np.ndarray) -> Optional[tuple]:
-        best_distance = float(self.max_range)
-        best_normal: Optional[np.ndarray] = None
-        for obstacle in self.obstacles:
-            offset = obstacle.center - origin
-            proj = float(np.dot(offset, direction))
-            if proj < -obstacle.bounding_radius or proj - obstacle.bounding_radius > best_distance:
-                continue
-            closest_sq = float(np.dot(offset, offset)) - proj * proj
-            if closest_sq > obstacle.bounding_radius_sq:
-                continue
-
-            if obstacle.shape == "sphere":
-                result = self._intersect_sphere(origin, direction, obstacle, best_distance)
-            else:
-                result = self._intersect_box(origin, direction, obstacle, best_distance)
-            if result is None:
-                continue
-            distance, normal = result
-            if distance <= 0.0 or distance > best_distance:
-                continue
-            best_distance = distance
-            best_normal = normal
-
-        if best_normal is None:
-            return None
-        return best_distance, best_normal
-
-    @staticmethod
-    def _intersect_sphere(
-        origin: np.ndarray,
-        direction: np.ndarray,
-        obstacle: Obstacle,
-        max_distance: float,
-    ) -> Optional[tuple]:
-        center = obstacle.center
-        radius = obstacle._sphere_radius
-        oc = origin - center
-        b = 2.0 * float(np.dot(direction, oc))
-        c = float(np.dot(oc, oc)) - radius * radius
-        discriminant = b * b - 4.0 * c
-        if discriminant < 0.0:
-            return None
-        sqrt_disc = math.sqrt(discriminant)
-        t1 = (-b - sqrt_disc) / 2.0
-        t2 = (-b + sqrt_disc) / 2.0
-        t_hit = None
-        for t in (t1, t2):
-            if t_hit is None or (0.0 < t < t_hit):
-                if t > 0.0:
-                    t_hit = t
-        if t_hit is None:
-            return None
-        if t_hit > max_distance:
-            return None
-        point = origin + direction * t_hit
-        normal = CameraSimulator._normalize(point - center)
-        return t_hit, normal
-
-    @staticmethod
-    def _intersect_box(
-        origin: np.ndarray,
-        direction: np.ndarray,
-        obstacle: Obstacle,
-        max_distance: float,
-    ) -> Optional[tuple]:
-        half_extents = obstacle.half_extents
-        rotation = obstacle.rotation
-        inv_rotation = obstacle.inv_rotation
-        center = obstacle.center
-        local_origin = inv_rotation.dot(origin - center)
-        local_direction = inv_rotation.dot(direction)
-
-        tmin = -float("inf")
-        tmax = float("inf")
-        for i in range(3):
-            if abs(local_direction[i]) < 1e-6:
-                if abs(local_origin[i]) > half_extents[i]:
-                    return None
-                continue
-            inv_dir = 1.0 / local_direction[i]
-            t1 = (-half_extents[i] - local_origin[i]) * inv_dir
-            t2 = (half_extents[i] - local_origin[i]) * inv_dir
-            if t1 > t2:
-                t1, t2 = t2, t1
-            tmin = max(tmin, t1)
-            tmax = min(tmax, t2)
-            if tmax < tmin:
-                return None
-
-        if tmax < 0.0:
-            return None
-        t_hit = tmin if tmin > 0.0 else tmax
-        if t_hit < 0.0:
-            return None
-        if t_hit > max_distance:
-            return None
-
-        local_point = local_origin + local_direction * t_hit
-        normal_local = np.zeros(3, dtype=np.float32)
-        abs_diff = [abs(abs(local_point[i]) - half_extents[i]) for i in range(3)]
-        axis = int(np.argmin(abs_diff))
-        if abs_diff[axis] > 1e-4:
-            axis = int(np.argmax(np.abs(local_point / half_extents)))
-        normal_local[axis] = math.copysign(1.0, local_point[axis])
-
-        normal_world = rotation.dot(normal_local)
-        normal_world = CameraSimulator._normalize(normal_world)
-        return t_hit, normal_world
 
 
 def main() -> None:

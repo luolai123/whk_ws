@@ -1,5 +1,11 @@
 <launch>
-  <include file="$(find autonomy_demo)/launch/sim.launch" />
+  <arg name="hardware_accel" default="false" />
+  <arg name="hardware_device" default="cuda" />
+
+  <include file="$(find autonomy_demo)/launch/sim.launch">
+    <arg name="hardware_accel" value="$(arg hardware_accel)" />
+    <arg name="hardware_device" value="$(arg hardware_device)" />
+  </include>
 
   <node pkg="autonomy_demo" type="inference_node.py" name="distance_inference" output="screen">
     <param name="model_path" value="$(env HOME)/autonomy_demo/model.pt" />
