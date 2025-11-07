@@ -19,6 +19,7 @@ class Obstacle:
     size: Tuple[float, float, float]
     shape: str
     category: str = "obstacle"
+    yaw: float = 0.0
 
 
 class WorldGenerator:
@@ -93,6 +94,8 @@ class WorldGenerator:
         self.obstacles = []
         obstacle_total = self._compute_obstacle_total()
         count = 0
+        half_world_x = self.world_size[0] / 2.0
+        half_world_y = self.world_size[1] / 2.0
         while count < obstacle_total:
             x = random.uniform(-self.world_size[0] / 2.0, self.world_size[0] / 2.0)
             y = random.uniform(-self.world_size[1] / 2.0, self.world_size[1] / 2.0)
@@ -105,16 +108,27 @@ class WorldGenerator:
                     size=(radius * 2.0, radius * 2.0, radius * 2.0),
                     shape="sphere",
                 )
+                if not self._obstacles_within_world([obstacle], half_world_x, half_world_y):
+                    continue
                 self.obstacles.append(obstacle)
+                count += 1
             elif roll < self.sphere_ratio + self.gate_ratio:
                 gate_parts = self._create_gate_obstacles(x, y)
                 if gate_parts:
                     self.obstacles.extend(gate_parts)
-                else:
-                    self.obstacles.append(self._create_box_obstacle(x, y))
+                    count += 1
+                    continue
+                box = self._create_box_obstacle(x, y)
+                if not self._obstacles_within_world([box], half_world_x, half_world_y):
+                    continue
+                self.obstacles.append(box)
+                count += 1
             else:
-                self.obstacles.append(self._create_box_obstacle(x, y))
-            count += 1
+                box = self._create_box_obstacle(x, y)
+                if not self._obstacles_within_world([box], half_world_x, half_world_y):
+                    continue
+                self.obstacles.append(box)
+                count += 1
         rospy.loginfo("Generated %d obstacles", len(self.obstacles))
 
     def publish_world(self) -> None:
@@ -131,7 +145,17 @@ class WorldGenerator:
             marker.pose.position.x = obstacle.position[0]
             marker.pose.position.y = obstacle.position[1]
             marker.pose.position.z = obstacle.position[2]
-            marker.pose.orientation.w = 1.0
+            if obstacle.shape == "sphere":
+                marker.pose.orientation.x = 0.0
+                marker.pose.orientation.y = 0.0
+                marker.pose.orientation.z = 0.0
+                marker.pose.orientation.w = 1.0
+            else:
+                qx, qy, qz, qw = self._yaw_to_quaternion(obstacle.yaw)
+                marker.pose.orientation.x = qx
+                marker.pose.orientation.y = qy
+                marker.pose.orientation.z = qz
+                marker.pose.orientation.w = qw
             marker.scale.x = obstacle.size[0]
             marker.scale.y = obstacle.size[1]
             marker.scale.z = obstacle.size[2]
@@ -150,10 +174,12 @@ class WorldGenerator:
         height = min(height, max_height)
         sx = random.uniform(self.size_range[0], self.size_range[1])
         sy = random.uniform(self.size_range[0], self.size_range[1])
+        yaw = random.uniform(-math.pi, math.pi)
         return Obstacle(
             position=(x, y, height / 2.0),
             size=(sx, sy, height),
             shape="box",
+            yaw=yaw,
         )
 
     def _create_gate_obstacles(self, x: float, y: float) -> List[Obstacle]:
@@ -174,35 +200,44 @@ class WorldGenerator:
         beam_height = gate_height - top_thickness / 2.0
         if beam_height <= 0.0:
             return []
-        left_center_x = x - (opening / 2.0 + post_thickness / 2.0)
-        right_center_x = x + (opening / 2.0 + post_thickness / 2.0)
-        if (
-            left_center_x - post_thickness / 2.0 < -half_world_x
-            or right_center_x + post_thickness / 2.0 > half_world_x
-            or y - depth / 2.0 < -half_world_y
-            or y + depth / 2.0 > half_world_y
-        ):
-            return []
+
+        yaw = random.uniform(-math.pi, math.pi)
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        lateral_offset = opening / 2.0 + post_thickness / 2.0
+
+        left_center_x = x - lateral_offset * cos_yaw
+        left_center_y = y - lateral_offset * sin_yaw
+        right_center_x = x + lateral_offset * cos_yaw
+        right_center_y = y + lateral_offset * sin_yaw
+
         posts_z = gate_height / 2.0
         left_post = Obstacle(
-            position=(left_center_x, y, posts_z),
+            position=(left_center_x, left_center_y, posts_z),
             size=(post_thickness, depth, gate_height),
             shape="box",
             category="gate",
+            yaw=yaw,
         )
         right_post = Obstacle(
-            position=(right_center_x, y, posts_z),
+            position=(right_center_x, right_center_y, posts_z),
             size=(post_thickness, depth, gate_height),
             shape="box",
             category="gate",
+            yaw=yaw,
         )
         beam = Obstacle(
             position=(x, y, beam_height),
             size=(opening + post_thickness * 2.0, depth, top_thickness),
             shape="box",
             category="gate",
+            yaw=yaw,
         )
-        return [left_post, right_post, beam]
+
+        gate_parts = [left_post, right_post, beam]
+        if not self._obstacles_within_world(gate_parts, half_world_x, half_world_y):
+            return []
+        return gate_parts
 
     def create_occupancy_grid(self, timestamp: rospy.Time) -> OccupancyGrid:
         resolution = float(self.occupancy_resolution)
@@ -233,12 +268,7 @@ class WorldGenerator:
                 min_y = obstacle.position[1] - radius
                 max_y = obstacle.position[1] + radius
             else:
-                half_x = obstacle.size[0] / 2.0
-                half_y = obstacle.size[1] / 2.0
-                min_x = obstacle.position[0] - half_x
-                max_x = obstacle.position[0] + half_x
-                min_y = obstacle.position[1] - half_y
-                max_y = obstacle.position[1] + half_y
+                min_x, max_x, min_y, max_y = self._box_bounds(obstacle)
 
             min_ix = max(0, int((min_x - origin_x) / resolution))
             max_ix = min(width - 1, int((max_x - origin_x) / resolution))
@@ -254,6 +284,11 @@ class WorldGenerator:
                             cell_y - obstacle.position[1]
                         ) ** 2 > radius ** 2:
                             continue
+                    else:
+                        cell_x = origin_x + (ix + 0.5) * resolution
+                        cell_y = origin_y + (iy + 0.5) * resolution
+                        if not self._point_inside_box(cell_x, cell_y, obstacle):
+                            continue
                     data[iy * width + ix] = 100
         grid.data = data
         return grid
@@ -264,6 +299,73 @@ class WorldGenerator:
             total = int(area * self.obstacle_density)
             return max(total, 1)
         return max(self.obstacle_count, 1)
+
+    @staticmethod
+    def _yaw_to_quaternion(yaw: float) -> Tuple[float, float, float, float]:
+        half = yaw * 0.5
+        return (0.0, 0.0, math.sin(half), math.cos(half))
+
+    @staticmethod
+    def _rotate_point(x: float, y: float, cos_yaw: float, sin_yaw: float) -> Tuple[float, float]:
+        return (x * cos_yaw - y * sin_yaw, x * sin_yaw + y * cos_yaw)
+
+    def _box_corners(self, obstacle: Obstacle) -> List[Tuple[float, float]]:
+        half_x = obstacle.size[0] / 2.0
+        half_y = obstacle.size[1] / 2.0
+        cos_yaw = math.cos(obstacle.yaw)
+        sin_yaw = math.sin(obstacle.yaw)
+        local_corners = [
+            (-half_x, -half_y),
+            (-half_x, half_y),
+            (half_x, -half_y),
+            (half_x, half_y),
+        ]
+        corners: List[Tuple[float, float]] = []
+        for lx, ly in local_corners:
+            rx, ry = self._rotate_point(lx, ly, cos_yaw, sin_yaw)
+            corners.append((obstacle.position[0] + rx, obstacle.position[1] + ry))
+        return corners
+
+    def _box_bounds(self, obstacle: Obstacle) -> Tuple[float, float, float, float]:
+        corners = self._box_corners(obstacle)
+        xs = [pt[0] for pt in corners]
+        ys = [pt[1] for pt in corners]
+        return (min(xs), max(xs), min(ys), max(ys))
+
+    def _point_inside_box(self, x: float, y: float, obstacle: Obstacle) -> bool:
+        rel_x = x - obstacle.position[0]
+        rel_y = y - obstacle.position[1]
+        cos_yaw = math.cos(obstacle.yaw)
+        sin_yaw = math.sin(obstacle.yaw)
+        local_x = rel_x * cos_yaw + rel_y * sin_yaw
+        local_y = -rel_x * sin_yaw + rel_y * cos_yaw
+        half_x = obstacle.size[0] / 2.0
+        half_y = obstacle.size[1] / 2.0
+        return abs(local_x) <= half_x and abs(local_y) <= half_y
+
+    def _obstacles_within_world(
+        self, obstacles: List[Obstacle], half_world_x: float, half_world_y: float
+    ) -> bool:
+        for obstacle in obstacles:
+            if obstacle.shape == "sphere":
+                radius = obstacle.size[0] / 2.0
+                if (
+                    obstacle.position[0] - radius < -half_world_x
+                    or obstacle.position[0] + radius > half_world_x
+                    or obstacle.position[1] - radius < -half_world_y
+                    or obstacle.position[1] + radius > half_world_y
+                ):
+                    return False
+            else:
+                min_x, max_x, min_y, max_y = self._box_bounds(obstacle)
+                if (
+                    min_x < -half_world_x
+                    or max_x > half_world_x
+                    or min_y < -half_world_y
+                    or max_y > half_world_y
+                ):
+                    return False
+        return True
 
     @staticmethod
     def _maybe_parse_literal(value, name: str = ""):
