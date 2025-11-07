@@ -1,0 +1,8 @@
+<launch>
+  <include file="$(find autonomy_demo)/launch/sim.launch" />
+
+  <node pkg="autonomy_demo" type="data_collector.py" name="data_collector" output="screen">
+    <param name="output_dir" value="$(env HOME)/autonomy_demo/dataset" />
+    <param name="near_threshold" value="4.0" />
+  </node>
+</launch>

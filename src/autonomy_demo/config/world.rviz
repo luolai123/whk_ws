@@ -1,0 +1,77 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Selection
+    Name: Selection
+  - Class: rviz/Tool Properties
+    Expanded:
+      - /2D Nav Goal1
+    Name: Tool Properties
+  - Class: rviz/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz/Grid
+      Color: 160; 160; 160
+      Enabled: true
+      Name: Grid
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: map
+    - Class: rviz/TF
+      Enabled: true
+      Name: TF
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /world/obstacles
+      Name: Obstacles
+      Queue Size: 100
+    - Alpha: 0.7
+      Class: rviz/Map
+      Enabled: true
+      Name: Occupancy
+      Topic: /world/occupancy
+    - Class: rviz/Path
+      Enabled: false
+      Name: Drone Path
+      Topic: /drone/odometry
+    - Class: rviz/Pose
+      Arrow Length: 0.8
+      Axes Length: 0.8
+      Axes Radius: 0.05
+      Color: 255; 0; 0
+      Enabled: true
+      Name: Drone Pose
+      Shape: Axes
+      Topic: /drone/pose
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /drone/visualization
+      Name: Drone Model
+      Queue Size: 10
+    - Class: rviz/Image
+      Enabled: true
+      Image Topic: /drone/rgb/image_raw
+      Name: RGB
+    - Class: rviz/Image
+      Enabled: true
+      Image Topic: /drone/rgb/distance_class
+      Name: Distance Class
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/Measure
+    - Class: rviz/SetInitialPose
+    - Class: rviz/SetGoal
+      Topic: /move_base_simple/goal
+  Value: true
