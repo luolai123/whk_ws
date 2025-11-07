@@ -55,6 +55,9 @@ class CameraSimulator:
         self.publish_rate = self._get_float_param("~rate", 10.0)
         self.base_frame = rospy.get_param("~base_frame", "base_link")
         self.camera_frame = rospy.get_param("~camera_frame", "rgb_optical")
+        self.max_obstacle_candidates = max(
+            0, self._get_int_param("~max_obstacle_candidates", 512)
+        )
         offset_raw = rospy.get_param("~camera_offset", [0.15, 0.0, 0.05])
         offset_parsed = self._maybe_parse_literal(offset_raw, "~camera_offset")
         if isinstance(offset_parsed, (list, tuple)) and len(offset_parsed) >= 3:
@@ -99,6 +102,7 @@ class CameraSimulator:
         self.bridge = CvBridge()
         self.latest_pose: Optional[PoseStamped] = None
         self.obstacle_field = ObstacleField()
+        self.obstacle_field.max_candidates = self.max_obstacle_candidates
         self._local_rays = self._precompute_rays()
         self._pixel_count = self._local_rays.shape[0]
         if self._use_torch:

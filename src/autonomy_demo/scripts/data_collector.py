@@ -48,6 +48,15 @@ class DataCollector:
         self.bridge = CvBridge()
         self.pose: Optional[PoseStamped] = None
         self.obstacle_field = ObstacleField()
+        max_candidates_raw = rospy.get_param("~max_obstacle_candidates", 512)
+        try:
+            max_candidates = int(max_candidates_raw)
+        except (TypeError, ValueError):
+            rospy.logwarn(
+                "Data collector received invalid max_obstacle_candidates; defaulting to 512"
+            )
+            max_candidates = 512
+        self.obstacle_field.max_candidates = max(0, max_candidates)
 
         self.max_range = rospy.get_param("~max_range", 12.0)
         self.fov_deg = rospy.get_param("~fov_deg", 120.0)

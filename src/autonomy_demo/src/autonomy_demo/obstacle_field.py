@@ -37,10 +37,13 @@ class ObstacleField:
     def __init__(self) -> None:
         self.sphere_centers: np.ndarray = np.empty((0, 3), dtype=np.float32)
         self.sphere_radii: np.ndarray = np.empty((0,), dtype=np.float32)
+        self.sphere_bounds: np.ndarray = np.empty((0,), dtype=np.float32)
         self.box_centers: np.ndarray = np.empty((0, 3), dtype=np.float32)
         self.box_half_extents: np.ndarray = np.empty((0, 3), dtype=np.float32)
         self.box_rotations: np.ndarray = np.empty((0, 3, 3), dtype=np.float32)
         self.box_inv_rotations: np.ndarray = np.empty((0, 3, 3), dtype=np.float32)
+        self.box_bounding_radii: np.ndarray = np.empty((0,), dtype=np.float32)
+        self.max_candidates: int = 512
 
         self._torch = None
         self._device = None
@@ -118,6 +121,11 @@ class ObstacleField:
             if sphere_radii
             else np.empty((0,), dtype=np.float32)
         )
+        self.sphere_bounds = (
+            self.sphere_radii.copy()
+            if self.sphere_radii.size
+            else np.empty((0,), dtype=np.float32)
+        )
         self.box_centers = (
             np.asarray(box_centers, dtype=np.float32)
             if box_centers
@@ -137,6 +145,11 @@ class ObstacleField:
             np.asarray(box_inv_rotations, dtype=np.float32)
             if box_inv_rotations
             else np.empty((0, 3, 3), dtype=np.float32)
+        )
+        self.box_bounding_radii = (
+            np.linalg.norm(self.box_half_extents, axis=1)
+            if self.box_half_extents.size
+            else np.empty((0,), dtype=np.float32)
         )
 
         if use_torch and torch_module is not None:
@@ -181,6 +194,31 @@ class ObstacleField:
             self.box_rotations_t = None
             self.box_inv_rotations_t = None
 
+    def _cull_indices(
+        self,
+        centers: np.ndarray,
+        radii: np.ndarray,
+        origin: np.ndarray,
+        max_range: float,
+    ) -> np.ndarray:
+        if centers.size == 0:
+            return np.empty((0,), dtype=np.int32)
+
+        origin_vec = origin.astype(np.float32)
+        diff = centers - origin_vec[np.newaxis, :]
+        dist_sq = np.sum(diff * diff, axis=1)
+        reach = max_range + radii
+        reach_sq = reach * reach
+        mask = dist_sq <= reach_sq
+        if not np.any(mask):
+            return np.empty((0,), dtype=np.int32)
+
+        indices = np.nonzero(mask)[0]
+        if self.max_candidates > 0 and indices.size > self.max_candidates:
+            order = np.argsort(dist_sq[indices])
+            indices = indices[order[: self.max_candidates]]
+        return indices.astype(np.int32)
+
     def cast_rays_cpu(
         self, origin: np.ndarray, directions: np.ndarray, max_range: float
     ) -> RaycastResult:
@@ -193,30 +231,73 @@ class ObstacleField:
         hit_indices = np.full(num_rays, -1, dtype=np.int32)
         normals = np.zeros((num_rays, 3), dtype=np.float32)
 
+        sphere_dist = np.full(num_rays, np.inf, dtype=np.float32)
+        sphere_idx = np.zeros(num_rays, dtype=np.int32)
+        sphere_hit_mask = np.zeros(num_rays, dtype=bool)
+        sphere_subset = None
         if self.sphere_centers.size:
-            sphere_result = self._intersect_spheres_cpu(origin, directions, max_range)
-            sphere_dist, sphere_idx, sphere_hit_mask = sphere_result
-            update_mask = sphere_hit_mask & (sphere_dist < best_dist)
-            if np.any(update_mask):
-                best_dist[update_mask] = sphere_dist[update_mask]
-                hit_mask[update_mask] = True
-                hit_types[update_mask] = 0
+            subset = self._cull_indices(
+                self.sphere_centers, self.sphere_bounds, origin, max_range
+            )
+            if subset.size:
+                centers = self.sphere_centers[subset]
+                radii = self.sphere_radii[subset]
+                sphere_dist, sphere_idx, sphere_hit_mask = self._intersect_spheres_cpu(
+                    origin, directions, centers, radii, max_range
+                )
+                sphere_subset = subset
+
+        update_mask = sphere_hit_mask & (sphere_dist < best_dist)
+        if np.any(update_mask):
+            best_dist[update_mask] = sphere_dist[update_mask]
+            hit_mask[update_mask] = True
+            hit_types[update_mask] = 0
+            if sphere_subset is not None:
+                global_idx = sphere_subset[sphere_idx]
+                hit_indices[update_mask] = global_idx[update_mask]
+            else:
                 hit_indices[update_mask] = sphere_idx[update_mask]
 
-        box_aux = None
+        box_dist = np.full(num_rays, np.inf, dtype=np.float32)
+        box_idx = np.zeros(num_rays, dtype=np.int32)
+        box_hit_mask = np.zeros(num_rays, dtype=bool)
+        box_subset = None
+        box_subset_arrays = None
         if self.box_centers.size:
-            box_result = self._intersect_boxes_cpu(origin, directions, max_range)
-            box_dist, box_idx, box_hit_mask, box_aux = box_result
-            update_mask = box_hit_mask & (box_dist < best_dist)
-            if np.any(update_mask):
-                best_dist[update_mask] = box_dist[update_mask]
-                hit_mask[update_mask] = True
-                hit_types[update_mask] = 1
+            subset = self._cull_indices(
+                self.box_centers, self.box_bounding_radii, origin, max_range
+            )
+            if subset.size:
+                centers = self.box_centers[subset]
+                half_extents = self.box_half_extents[subset]
+                rotations = self.box_rotations[subset]
+                inv_rotations = self.box_inv_rotations[subset]
+                box_dist, box_idx, box_hit_mask = self._intersect_boxes_cpu(
+                    origin,
+                    directions,
+                    centers,
+                    half_extents,
+                    rotations,
+                    inv_rotations,
+                    max_range,
+                )
+                box_subset = subset
+                box_subset_arrays = (centers, half_extents, rotations, inv_rotations)
+
+        update_mask = box_hit_mask & (box_dist < best_dist)
+        if np.any(update_mask):
+            best_dist[update_mask] = box_dist[update_mask]
+            hit_mask[update_mask] = True
+            hit_types[update_mask] = 1
+            if box_subset is not None:
+                global_idx = box_subset[box_idx]
+                hit_indices[update_mask] = global_idx[update_mask]
+            else:
                 hit_indices[update_mask] = box_idx[update_mask]
 
         if np.any(hit_mask):
             sphere_hit = hit_mask & (hit_types == 0)
-            if np.any(sphere_hit):
+            if np.any(sphere_hit) and sphere_subset is not None:
                 idx = hit_indices[sphere_hit]
                 dist = best_dist[sphere_hit]
                 centers = self.sphere_centers[idx]
@@ -224,24 +305,27 @@ class ObstacleField:
                 normals[sphere_hit] = self._normalize_rows(hit_points - centers)
 
             box_hit = hit_mask & (hit_types == 1)
-            if np.any(box_hit) and box_aux is not None:
-                local_origin, local_dir = box_aux
-                idx = hit_indices[box_hit]
+            if np.any(box_hit) and box_subset_arrays is not None:
+                centers, half_extents, rotations, inv_rotations = box_subset_arrays
+                local_idx = box_idx[box_hit]
                 dist = best_dist[box_hit]
-                local_origin_sel = local_origin[idx]
-                # local_dir has shape (num_rays, num_boxes, 3)
-                ld = local_dir[box_hit, idx, :]
-                local_hit = local_origin_sel + ld * dist[:, None]
-                half_extents = self.box_half_extents[idx]
-                abs_diff = np.abs(np.abs(local_hit) - half_extents)
+                centers_sel = centers[local_idx]
+                inv_rot_sel = inv_rotations[local_idx]
+                rot_sel = rotations[local_idx]
+                half_sel = half_extents[local_idx]
+                diff = origin[np.newaxis, :].astype(np.float32) - centers_sel
+                local_origin = np.einsum("bi,bij->bj", diff, inv_rot_sel)
+                dirs_sel = directions[box_hit]
+                local_dir = np.einsum("ri,rij->rj", dirs_sel, inv_rot_sel)
+                local_hit = local_origin + local_dir * dist[:, None]
+                abs_diff = np.abs(np.abs(local_hit) - half_sel)
                 axis = np.argmin(abs_diff, axis=1)
                 normal_local = np.zeros_like(local_hit)
                 normal_local[np.arange(normal_local.shape[0]), axis] = np.sign(
                     local_hit[np.arange(local_hit.shape[0]), axis]
                 )
-                rotations = self.box_rotations[idx]
-                normal_world = np.einsum("mij,mj->mi", rotations, normal_local)
-                normals[box_hit] = self._normalize_rows(normal_world)
+                normal_world = np.einsum("bij,bj->bi", rot_sel, normal_local)
+                normals[box_hit] = self._normalize_rows(normal_world.astype(np.float32))
 
         return RaycastResult(best_dist, normals, hit_mask, hit_types, hit_indices)
 
@@ -258,71 +342,113 @@ class ObstacleField:
         torch = torch_module
         num_rays = directions.shape[0]
         dtype = directions.dtype
-        inf = torch.tensor(float("inf"), device=device, dtype=dtype)
         best_dist = torch.full((num_rays,), float("inf"), device=device, dtype=dtype)
         hit_mask = torch.zeros(num_rays, dtype=torch.bool, device=device)
         hit_types = torch.full((num_rays,), -1, dtype=torch.int8, device=device)
         hit_indices = torch.full((num_rays,), -1, dtype=torch.int64, device=device)
         normals = torch.zeros((num_rays, 3), device=device, dtype=dtype)
 
-        sphere_data = None
+        origin_np = origin.detach().cpu().numpy()
+
+        sphere_dist = torch.full((num_rays,), float("inf"), device=device, dtype=dtype)
+        sphere_idx = torch.zeros(num_rays, dtype=torch.int64, device=device)
+        sphere_hit_mask = torch.zeros(num_rays, dtype=torch.bool, device=device)
+        sphere_subset = None
         if self.sphere_centers_t is not None and self.sphere_centers_t.numel() > 0:
-            sphere_data = self._intersect_spheres_torch(
-                torch, device, origin, directions, max_range
+            subset_np = self._cull_indices(
+                self.sphere_centers, self.sphere_bounds, origin_np, max_range
             )
-            sphere_dist, sphere_idx, sphere_hit_mask = sphere_data
-            update_mask = sphere_hit_mask & (sphere_dist < best_dist)
-            if torch.any(update_mask):
-                best_dist[update_mask] = sphere_dist[update_mask]
-                hit_mask[update_mask] = True
-                hit_types[update_mask] = 0
+            if subset_np.size:
+                subset = torch.from_numpy(subset_np).to(device=device, dtype=torch.long)
+                centers = self.sphere_centers_t.index_select(0, subset)
+                radii = self.sphere_radii_t.index_select(0, subset)
+                sphere_dist, sphere_idx, sphere_hit_mask = self._intersect_spheres_torch(
+                    torch, device, origin, directions, centers, radii, max_range
+                )
+                sphere_subset = subset
+
+        update_mask = sphere_hit_mask & (sphere_dist < best_dist)
+        if torch.any(update_mask):
+            best_dist[update_mask] = sphere_dist[update_mask]
+            hit_mask[update_mask] = True
+            hit_types[update_mask] = 0
+            if sphere_subset is not None:
+                global_idx = sphere_subset[sphere_idx]
+                hit_indices[update_mask] = global_idx[update_mask]
+            else:
                 hit_indices[update_mask] = sphere_idx[update_mask]
 
-        box_data = None
+        box_dist = torch.full((num_rays,), float("inf"), device=device, dtype=dtype)
+        box_idx = torch.zeros(num_rays, dtype=torch.int64, device=device)
+        box_hit_mask = torch.zeros(num_rays, dtype=torch.bool, device=device)
+        box_subset = None
+        box_subset_arrays = None
         if self.box_centers_t is not None and self.box_centers_t.numel() > 0:
-            box_data = self._intersect_boxes_torch(
-                torch, device, origin, directions, max_range
+            subset_np = self._cull_indices(
+                self.box_centers, self.box_bounding_radii, origin_np, max_range
             )
-            box_dist, box_idx, box_hit_mask, box_aux = box_data
-            update_mask = box_hit_mask & (box_dist < best_dist)
-            if torch.any(update_mask):
-                best_dist[update_mask] = box_dist[update_mask]
-                hit_mask[update_mask] = True
-                hit_types[update_mask] = 1
+            if subset_np.size:
+                subset = torch.from_numpy(subset_np).to(device=device, dtype=torch.long)
+                centers = self.box_centers_t.index_select(0, subset)
+                half_extents = self.box_half_extents_t.index_select(0, subset)
+                rotations = self.box_rotations_t.index_select(0, subset)
+                inv_rotations = self.box_inv_rotations_t.index_select(0, subset)
+                box_dist, box_idx, box_hit_mask = self._intersect_boxes_torch(
+                    torch,
+                    device,
+                    origin,
+                    directions,
+                    centers,
+                    half_extents,
+                    rotations,
+                    inv_rotations,
+                    max_range,
+                )
+                box_subset = subset
+                box_subset_arrays = (centers, half_extents, rotations, inv_rotations)
+
+        update_mask = box_hit_mask & (box_dist < best_dist)
+        if torch.any(update_mask):
+            best_dist[update_mask] = box_dist[update_mask]
+            hit_mask[update_mask] = True
+            hit_types[update_mask] = 1
+            if box_subset is not None:
+                global_idx = box_subset[box_idx]
+                hit_indices[update_mask] = global_idx[update_mask]
+            else:
                 hit_indices[update_mask] = box_idx[update_mask]
 
         if torch.any(hit_mask):
-            if sphere_data is not None:
-                sphere_dist, _, _ = sphere_data
-            if box_data is not None:
-                _, _, _, (local_origin, local_dir) = box_data
-
             sphere_hit = hit_mask & (hit_types == 0)
-            if torch.any(sphere_hit) and sphere_data is not None:
+            if torch.any(sphere_hit) and self.sphere_centers_t is not None:
                 idx = hit_indices[sphere_hit]
                 dist = best_dist[sphere_hit]
-                centers = self.sphere_centers_t[idx]
+                centers = self.sphere_centers_t.index_select(0, idx)
                 hit_points = origin + directions[sphere_hit] * dist.unsqueeze(1)
                 normals[sphere_hit] = self._normalize_rows_torch(
                     torch, hit_points - centers
                 )
 
             box_hit = hit_mask & (hit_types == 1)
-            if torch.any(box_hit) and box_data is not None:
-                idx = hit_indices[box_hit]
+            if torch.any(box_hit) and box_subset_arrays is not None:
+                centers, half_extents, rotations, inv_rotations = box_subset_arrays
+                local_idx = box_idx[box_hit]
                 dist = best_dist[box_hit]
-                local_origin_sel = local_origin[idx]
-                ld = local_dir[box_hit]
-                ld = ld[torch.arange(ld.shape[0], device=device), idx, :]
-                local_hit = local_origin_sel + ld * dist.unsqueeze(1)
-                half_extents = self.box_half_extents_t[idx]
-                abs_diff = torch.abs(torch.abs(local_hit) - half_extents)
+                centers_sel = centers.index_select(0, local_idx)
+                inv_rot_sel = inv_rotations.index_select(0, local_idx)
+                rot_sel = rotations.index_select(0, local_idx)
+                half_sel = half_extents.index_select(0, local_idx)
+                diff = origin.unsqueeze(0) - centers_sel
+                local_origin = torch.einsum("bi,bij->bj", diff, inv_rot_sel)
+                dirs_sel = directions[box_hit]
+                local_dir = torch.einsum("ri,rij->rj", dirs_sel, inv_rot_sel)
+                local_hit = local_origin + local_dir * dist.unsqueeze(1)
+                abs_diff = torch.abs(torch.abs(local_hit) - half_sel)
                 axis = torch.argmin(abs_diff, dim=1)
                 normal_local = torch.zeros_like(local_hit)
                 row_indices = torch.arange(normal_local.shape[0], device=device)
                 normal_local[row_indices, axis] = torch.sign(local_hit[row_indices, axis])
-                rotations = self.box_rotations_t[idx]
-                normal_world = torch.einsum("mij,mj->mi", rotations, normal_local)
+                normal_world = torch.einsum("bij,bj->bi", rot_sel, normal_local)
                 normals[box_hit] = self._normalize_rows_torch(torch, normal_world)
 
         return TorchRaycastResult(best_dist, normals, hit_mask, hit_types, hit_indices)
@@ -331,11 +457,22 @@ class ObstacleField:
     # CPU helpers
     # ------------------------------------------------------------------
     def _intersect_spheres_cpu(
-        self, origin: np.ndarray, directions: np.ndarray, max_range: float
+        self,
+        origin: np.ndarray,
+        directions: np.ndarray,
+        centers: np.ndarray,
+        radii: np.ndarray,
+        max_range: float,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        oc = origin - self.sphere_centers
+        if centers.size == 0:
+            infs = np.full(directions.shape[0], np.inf, dtype=np.float32)
+            zeros = np.zeros_like(infs, dtype=np.int32)
+            hits = np.zeros_like(infs, dtype=bool)
+            return infs, zeros, hits
+
+        oc = origin - centers
         b = 2.0 * directions.dot(oc.T)
-        c = np.sum(oc * oc, axis=1) - self.sphere_radii * self.sphere_radii
+        c = np.sum(oc * oc, axis=1) - radii * radii
         discriminant = b * b - 4.0 * c
         mask = discriminant >= 0.0
         if not np.any(mask):
@@ -355,12 +492,25 @@ class ObstacleField:
         return distances.astype(np.float32), indices.astype(np.int32), hit_mask
 
     def _intersect_boxes_cpu(
-        self, origin: np.ndarray, directions: np.ndarray, max_range: float
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[np.ndarray, np.ndarray]]:
-        diff = origin - self.box_centers
-        local_origin = np.einsum("bi,bij->bj", diff, self.box_inv_rotations)
-        local_dir = np.einsum("ri,bij->rbj", directions, self.box_inv_rotations)
-        half = self.box_half_extents[np.newaxis, :, :]
+        self,
+        origin: np.ndarray,
+        directions: np.ndarray,
+        centers: np.ndarray,
+        half_extents: np.ndarray,
+        rotations: np.ndarray,
+        inv_rotations: np.ndarray,
+        max_range: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if centers.size == 0:
+            infs = np.full(directions.shape[0], np.inf, dtype=np.float32)
+            zeros = np.zeros_like(infs, dtype=np.int32)
+            hits = np.zeros_like(infs, dtype=bool)
+            return infs, zeros, hits
+
+        diff = origin - centers
+        local_origin = np.einsum("bi,bij->bj", diff, inv_rotations)
+        local_dir = np.einsum("ri,bij->rbj", directions, inv_rotations)
+        half = half_extents[np.newaxis, :, :]
         local_origin_b = local_origin[np.newaxis, :, :]
 
         abs_dir = np.abs(local_dir)
@@ -394,7 +544,6 @@ class ObstacleField:
             distances.astype(np.float32),
             indices.astype(np.int32),
             hit_mask,
-            (local_origin, local_dir),
         )
 
     # ------------------------------------------------------------------
@@ -406,11 +555,21 @@ class ObstacleField:
         device,
         origin: "torch.Tensor",
         directions: "torch.Tensor",
+        centers: "torch.Tensor",
+        radii: "torch.Tensor",
         max_range: float,
     ) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
-        oc = origin - self.sphere_centers_t
+        if centers.numel() == 0:
+            distances = torch.full(
+                (directions.shape[0],), float("inf"), device=device, dtype=directions.dtype
+            )
+            indices = torch.zeros_like(distances, dtype=torch.int64)
+            hits = torch.zeros_like(distances, dtype=torch.bool)
+            return distances, indices, hits
+
+        oc = origin - centers
         b = 2.0 * directions @ oc.t()
-        c = torch.sum(oc * oc, dim=1) - self.sphere_radii_t * self.sphere_radii_t
+        c = torch.sum(oc * oc, dim=1) - radii * radii
         discriminant = b * b - 4.0 * c
         mask = discriminant >= 0.0
         if not torch.any(mask):
@@ -436,17 +595,24 @@ class ObstacleField:
         device,
         origin: "torch.Tensor",
         directions: "torch.Tensor",
+        centers: "torch.Tensor",
+        half_extents: "torch.Tensor",
+        rotations: "torch.Tensor",
+        inv_rotations: "torch.Tensor",
         max_range: float,
-    ) -> Tuple[
-        "torch.Tensor",
-        "torch.Tensor",
-        "torch.Tensor",
-        Tuple["torch.Tensor", "torch.Tensor"],
-    ]:
-        diff = origin - self.box_centers_t
-        local_origin = torch.einsum("bi,bij->bj", diff, self.box_inv_rotations_t)
-        local_dir = torch.einsum("ri,bij->rbj", directions, self.box_inv_rotations_t)
-        half = self.box_half_extents_t.unsqueeze(0)
+    ) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        if centers.numel() == 0:
+            distances = torch.full(
+                (directions.shape[0],), float("inf"), device=device, dtype=directions.dtype
+            )
+            indices = torch.zeros_like(distances, dtype=torch.int64)
+            hits = torch.zeros_like(distances, dtype=torch.bool)
+            return distances, indices, hits
+
+        diff = origin - centers
+        local_origin = torch.einsum("bi,bij->bj", diff, inv_rotations)
+        local_dir = torch.einsum("ri,bij->rbj", directions, inv_rotations)
+        half = half_extents.unsqueeze(0)
         local_origin_b = local_origin.unsqueeze(0)
 
         abs_dir = torch.abs(local_dir)
@@ -477,7 +643,7 @@ class ObstacleField:
         t_candidate = torch.where(valid, t_candidate, inf_tensor)
         distances, indices = torch.min(t_candidate, dim=1)
         hit_mask = torch.isfinite(distances)
-        return distances, indices, hit_mask, (local_origin, local_dir)
+        return distances, indices, hit_mask
 
     @staticmethod
     def _normalize_rows(vectors: np.ndarray, eps: float = 1e-8) -> np.ndarray:

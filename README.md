@@ -95,6 +95,10 @@ roslaunch autonomy_demo data_collection.launch output_dir:=/your/dataset/path
 
 - When CUDA is unavailable or PyTorch is not installed, the nodes automatically fall back to the optimized NumPy implementation.
 
+### Performance Tuning
+
+- Use `max_obstacle_candidates` (default `512`) to cap how many nearby objects each ray considers. Lower values improve frame rate at the cost of ignoring far obstacles; `0` keeps the full set. The parameter is exposed on `sim.launch` and `data_collection.launch` for both the camera simulator and the dataset recorder.
+
 ## Training the Distance Classifier
 
 After gathering data, train the neural network:
