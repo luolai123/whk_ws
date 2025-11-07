@@ -11,9 +11,11 @@ from typing import List, Optional
 import numpy as np
 import rospy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from sensor_msgs.msg import CameraInfo, Image
 from visualization_msgs.msg import MarkerArray
+import tf2_ros
+from tf_conversions import transformations
 
 
 @dataclass
@@ -31,6 +33,18 @@ class CameraSimulator:
         self.fov_deg = self._get_float_param("~fov_deg", 120.0)
         self.max_range = self._get_float_param("~max_range", 12.0)
         self.publish_rate = self._get_float_param("~rate", 10.0)
+        self.base_frame = rospy.get_param("~base_frame", "base_link")
+        self.camera_frame = rospy.get_param("~camera_frame", "rgb_optical")
+        offset_raw = rospy.get_param("~camera_offset", [0.15, 0.0, 0.05])
+        offset_parsed = self._maybe_parse_literal(offset_raw, "~camera_offset")
+        if isinstance(offset_parsed, (list, tuple)) and len(offset_parsed) >= 3:
+            try:
+                self.camera_offset = [float(offset_parsed[0]), float(offset_parsed[1]), float(offset_parsed[2])]
+            except (TypeError, ValueError):
+                rospy.logwarn("Camera offset parameter malformed, using default offset")
+                self.camera_offset = [0.15, 0.0, 0.05]
+        else:
+            self.camera_offset = [0.15, 0.0, 0.05]
 
         self.bridge = CvBridge()
         self.latest_pose: Optional[PoseStamped] = None
@@ -38,6 +52,9 @@ class CameraSimulator:
 
         self.image_pub = rospy.Publisher("drone/rgb/image_raw", Image, queue_size=1)
         self.info_pub = rospy.Publisher("drone/rgb/camera_info", CameraInfo, queue_size=1)
+        self.static_broadcaster = tf2_ros.StaticTransformBroadcaster()
+
+        self.publish_static_transform()
 
         rospy.Subscriber("drone/pose", PoseStamped, self.pose_callback)
         rospy.Subscriber("world/obstacles", MarkerArray, self.obstacle_callback)
@@ -58,9 +75,29 @@ class CameraSimulator:
         if self.latest_pose is None:
             return None
 
-        pose = self.latest_pose.pose.position
-        cx = pose.x
-        cy = pose.y
+        pose = self.latest_pose.pose
+        position = pose.position
+        orientation = pose.orientation
+        cx = position.x
+        cy = position.y
+
+        rotation = transformations.quaternion_matrix([
+            orientation.x,
+            orientation.y,
+            orientation.z,
+            orientation.w,
+        ])
+        forward = rotation[0:3, 0]
+        right = rotation[0:3, 1]
+
+        def normalize(vec):
+            norm = math.sqrt(float(np.dot(vec, vec)))
+            if norm <= 1e-6:
+                return vec
+            return vec / norm
+
+        forward = normalize(forward)
+        right = normalize(right)
 
         width = self.image_width
         height = self.image_height
@@ -69,8 +106,13 @@ class CameraSimulator:
         start_angle = -fov / 2.0
 
         for u in range(width):
-            angle = start_angle + (u / float(width - 1)) * fov
-            direction = (math.cos(angle), math.sin(angle))
+            angle = start_angle + (u / float(max(width - 1, 1))) * fov
+            ray = normalize(forward * math.cos(angle) + right * math.sin(angle))
+            dir_xy = (ray[0], ray[1])
+            horizontal_norm = math.hypot(dir_xy[0], dir_xy[1])
+            if horizontal_norm <= 1e-6:
+                continue
+            direction = (dir_xy[0] / horizontal_norm, dir_xy[1] / horizontal_norm)
             distance = self.max_range
             for obs in self.obstacles:
                 dx = obs.x - cx
@@ -97,7 +139,7 @@ class CameraSimulator:
             if image is not None:
                 msg = self.bridge.cv2_to_imgmsg(image, encoding="rgb8")
                 msg.header.stamp = rospy.Time.now()
-                msg.header.frame_id = self.child_frame_id
+                msg.header.frame_id = self.camera_frame
                 info = CameraInfo()
                 info.header = msg.header
                 info.height = self.image_height
@@ -115,9 +157,19 @@ class CameraSimulator:
                 self.info_pub.publish(info)
             rate.sleep()
 
-    @property
-    def child_frame_id(self) -> str:
-        return rospy.get_param("~camera_frame", "rgb_optical")
+    def publish_static_transform(self) -> None:
+        transform = TransformStamped()
+        transform.header.stamp = rospy.Time.now()
+        transform.header.frame_id = self.base_frame
+        transform.child_frame_id = self.camera_frame
+        transform.transform.translation.x = float(self.camera_offset[0]) if len(self.camera_offset) > 0 else 0.15
+        transform.transform.translation.y = float(self.camera_offset[1]) if len(self.camera_offset) > 1 else 0.0
+        transform.transform.translation.z = float(self.camera_offset[2]) if len(self.camera_offset) > 2 else 0.05
+        transform.transform.rotation.x = 0.0
+        transform.transform.rotation.y = 0.0
+        transform.transform.rotation.z = 0.0
+        transform.transform.rotation.w = 1.0
+        self.static_broadcaster.sendTransform(transform)
 
     @staticmethod
     def _maybe_parse_literal(value, name: str = ""):

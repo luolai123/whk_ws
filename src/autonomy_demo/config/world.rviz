@@ -47,6 +47,11 @@ Visualization Manager:
       Name: Drone Pose
       Shape: Axes
       Topic: /drone/pose
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /drone/visualization
+      Name: Drone Model
+      Queue Size: 10
     - Class: rviz/Image
       Enabled: true
       Image Topic: /drone/rgb/image_raw
