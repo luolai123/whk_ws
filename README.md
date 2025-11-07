@@ -4,7 +4,8 @@ This workspace contains a complete ROS1 (Noetic) simulation for a UAV navigating
 
 ## Features
 
-- **Random obstacle world** published as `visualization_msgs/MarkerArray` and `nav_msgs/OccupancyGrid`, ready for RViz visualization and programmatic access.
+- **Random obstacle world** featuring a mix of colorful boxes and spheres published as `visualization_msgs/MarkerArray` and `nav_msgs/OccupancyGrid`, ready for RViz visualization and programmatic access.
+- **Configurable environment scale** with tunable obstacle density, size ranges, and shape ratios.
 - **Kinematic UAV simulator** that responds to RViz 2D Nav Goal inputs and publishes pose/odometry data.
 - **Synthetic RGB camera** that renders obstacle distances into color-coded imagery.
 - **Automated data collection** pipeline that records RGB frames with near/far obstacle labels using analytic distance computation.
@@ -55,6 +56,13 @@ To regenerate obstacles at runtime:
 ```bash
 rosservice call /world_generator/regenerate
 ```
+
+### Customizing the World Layout
+
+- Increase the simulated airspace or avoid seeing beyond the borders by raising `world_size` (default `40 x 40 x 8` meters).
+- Control crowding with `obstacle_density` (obstacles per square meter). When the density is zero the system falls back to the legacy `obstacle_count` parameter.
+- Mix shape variety with `sphere_ratio` (0.0–1.0) to choose how many obstacles are rendered as spheres versus boxes.
+- Adjust `size_range` and `height_range` to refine individual obstacle proportions. All parameters can be overridden in `sim.launch` or via ROS command-line arguments when launching.
 
 ## Automated Dataset Collection
 
@@ -120,7 +128,7 @@ src/autonomy_demo/
 
 - If RViz cannot find topics, ensure the workspace has been built (`catkin_make`) and the `devel/setup.bash` file is sourced in the current shell.
 - The `camera_simulator` assumes the drone yaw is aligned with the positive X-axis. For more advanced dynamics, extend `drone_simulator.py` to track yaw and feed it into the camera rendering logic.
-- To adjust world density, tune the `obstacle_count`, `size_range`, and `height_range` parameters in `sim.launch` or via dynamic reconfigure YAML.
+- To adjust world density or composition, tune `obstacle_density`, `obstacle_count`, `sphere_ratio`, `size_range`, and `height_range` in `sim.launch` or override them on the launch command line.
 
 ## License
 

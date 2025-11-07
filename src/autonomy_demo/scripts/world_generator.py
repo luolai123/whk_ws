@@ -17,18 +17,20 @@ from visualization_msgs.msg import Marker, MarkerArray
 class Obstacle:
     position: Tuple[float, float, float]
     size: Tuple[float, float, float]
+    shape: str
 
 
 class WorldGenerator:
-    """Generates a random set of box obstacles and publishes them for visualization."""
+    """Generates a random set of box and sphere obstacles for visualization."""
 
     def __init__(self) -> None:
         self.world_size = self._ensure_float_tuple(
-            self._get_float_tuple("~world_size", [20.0, 20.0, 5.0], 3),
+            self._get_float_tuple("~world_size", [40.0, 40.0, 8.0], 3),
             "~world_size",
-            fallback=(20.0, 20.0, 5.0),
+            fallback=(40.0, 40.0, 8.0),
         )
         self.obstacle_count = self._get_int("~obstacle_count", 40)
+        self.obstacle_density = max(0.0, self._get_float("~obstacle_density", 0.0))
         self.height_range = self._ensure_float_tuple(
             self._get_float_tuple("~height_range", [0.5, 3.0], 2),
             "~height_range",
@@ -41,6 +43,7 @@ class WorldGenerator:
         )
         self.occupancy_resolution = self._get_float("~occupancy_resolution", 0.5)
         self.frame_id = rospy.get_param("~frame_id", "map")
+        self.sphere_ratio = max(0.0, min(1.0, self._get_float("~sphere_ratio", 0.3)))
 
         self.marker_pub = rospy.Publisher("world/obstacles", MarkerArray, queue_size=1, latch=True)
         self.grid_pub = rospy.Publisher("world/occupancy", OccupancyGrid, queue_size=1, latch=True)
@@ -59,13 +62,28 @@ class WorldGenerator:
 
     def generate_world(self) -> None:
         self.obstacles = []
-        for _ in range(self.obstacle_count):
+        obstacle_total = self._compute_obstacle_total()
+        for _ in range(obstacle_total):
             x = random.uniform(-self.world_size[0] / 2.0, self.world_size[0] / 2.0)
             y = random.uniform(-self.world_size[1] / 2.0, self.world_size[1] / 2.0)
-            height = random.uniform(self.height_range[0], self.height_range[1])
-            sx = random.uniform(self.size_range[0], self.size_range[1])
-            sy = random.uniform(self.size_range[0], self.size_range[1])
-            obstacle = Obstacle(position=(x, y, height / 2.0), size=(sx, sy, height))
+            shape = "sphere" if random.random() < self.sphere_ratio else "box"
+            if shape == "sphere":
+                diameter = random.uniform(self.size_range[0], self.size_range[1])
+                radius = diameter / 2.0
+                obstacle = Obstacle(
+                    position=(x, y, radius),
+                    size=(diameter, diameter, diameter),
+                    shape=shape,
+                )
+            else:
+                height = random.uniform(self.height_range[0], self.height_range[1])
+                sx = random.uniform(self.size_range[0], self.size_range[1])
+                sy = random.uniform(self.size_range[0], self.size_range[1])
+                obstacle = Obstacle(
+                    position=(x, y, height / 2.0),
+                    size=(sx, sy, height),
+                    shape=shape,
+                )
             self.obstacles.append(obstacle)
         rospy.loginfo("Generated %d obstacles", len(self.obstacles))
 
@@ -78,7 +96,7 @@ class WorldGenerator:
             marker.header.stamp = timestamp
             marker.ns = "obstacles"
             marker.id = idx
-            marker.type = Marker.CUBE
+            marker.type = Marker.SPHERE if obstacle.shape == "sphere" else Marker.CUBE
             marker.action = Marker.ADD
             marker.pose.position.x = obstacle.position[0]
             marker.pose.position.y = obstacle.position[1]
@@ -87,10 +105,15 @@ class WorldGenerator:
             marker.scale.x = obstacle.size[0]
             marker.scale.y = obstacle.size[1]
             marker.scale.z = obstacle.size[2]
-            marker.color.r = 0.8
-            marker.color.g = 0.1
-            marker.color.b = 0.1
-            marker.color.a = 0.8
+            if obstacle.shape == "sphere":
+                marker.color.r = 0.16
+                marker.color.g = 0.62
+                marker.color.b = 0.87
+            else:
+                marker.color.r = 0.89
+                marker.color.g = 0.58
+                marker.color.b = 0.13
+            marker.color.a = 0.85
             markers.markers.append(marker)
         self.marker_pub.publish(markers)
         self.grid_pub.publish(self.create_occupancy_grid(timestamp))
@@ -118,12 +141,19 @@ class WorldGenerator:
 
         data = [0] * (width * height)
         for obstacle in self.obstacles:
-            half_x = obstacle.size[0] / 2.0
-            half_y = obstacle.size[1] / 2.0
-            min_x = obstacle.position[0] - half_x
-            max_x = obstacle.position[0] + half_x
-            min_y = obstacle.position[1] - half_y
-            max_y = obstacle.position[1] + half_y
+            if obstacle.shape == "sphere":
+                radius = obstacle.size[0] / 2.0
+                min_x = obstacle.position[0] - radius
+                max_x = obstacle.position[0] + radius
+                min_y = obstacle.position[1] - radius
+                max_y = obstacle.position[1] + radius
+            else:
+                half_x = obstacle.size[0] / 2.0
+                half_y = obstacle.size[1] / 2.0
+                min_x = obstacle.position[0] - half_x
+                max_x = obstacle.position[0] + half_x
+                min_y = obstacle.position[1] - half_y
+                max_y = obstacle.position[1] + half_y
 
             min_ix = max(0, int((min_x - origin_x) / resolution))
             max_ix = min(width - 1, int((max_x - origin_x) / resolution))
@@ -132,9 +162,23 @@ class WorldGenerator:
 
             for iy in range(min_iy, max_iy + 1):
                 for ix in range(min_ix, max_ix + 1):
+                    if obstacle.shape == "sphere":
+                        cell_x = origin_x + (ix + 0.5) * resolution
+                        cell_y = origin_y + (iy + 0.5) * resolution
+                        if (cell_x - obstacle.position[0]) ** 2 + (
+                            cell_y - obstacle.position[1]
+                        ) ** 2 > radius ** 2:
+                            continue
                     data[iy * width + ix] = 100
         grid.data = data
         return grid
+
+    def _compute_obstacle_total(self) -> int:
+        if self.obstacle_density > 0.0:
+            area = self.world_size[0] * self.world_size[1]
+            total = int(area * self.obstacle_density)
+            return max(total, 1)
+        return max(self.obstacle_count, 1)
 
     @staticmethod
     def _maybe_parse_literal(value, name: str = ""):
