@@ -2,7 +2,7 @@
 """Automated RGB data collector with distance-based labeling."""
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import List, Optional
 
@@ -22,12 +22,33 @@ class Obstacle:
     center: np.ndarray
     size: np.ndarray
     rotation: np.ndarray
+    half_extents: np.ndarray = dataclass_field(init=False, repr=False)
+    inv_rotation: np.ndarray = dataclass_field(init=False, repr=False)
+    bounding_radius: float = dataclass_field(init=False)
+    bounding_radius_sq: float = dataclass_field(init=False, repr=False)
+    _sphere_radius: float = dataclass_field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.center = np.asarray(self.center, dtype=np.float32)
+        self.size = np.asarray(self.size, dtype=np.float32)
+        if self.rotation is None:
+            self.rotation = np.identity(3, dtype=np.float32)
+        else:
+            self.rotation = np.asarray(self.rotation, dtype=np.float32)
+        if self.shape == "sphere":
+            radius = float(self.size[0]) / 2.0
+            self.half_extents = np.array([radius, radius, radius], dtype=np.float32)
+            self._sphere_radius = radius
+        else:
+            self.half_extents = self.size / 2.0
+            self._sphere_radius = float(max(self.size[0], self.size[1])) / 2.0
+        self.inv_rotation = self.rotation.T
+        self.bounding_radius = float(np.linalg.norm(self.half_extents))
+        self.bounding_radius_sq = self.bounding_radius * self.bounding_radius
 
     @property
     def radius(self) -> float:
-        if self.shape == "sphere":
-            return float(self.size[0]) / 2.0
-        return float(max(self.size[0], self.size[1])) / 2.0
+        return self._sphere_radius
 
 
 class DataCollector:
@@ -101,7 +122,7 @@ class DataCollector:
         rotation = transformations.quaternion_matrix(
             [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
         )
-        basis = rotation[0:3, 0:3]
+        basis = rotation[0:3, 0:3].astype(np.float32)
         forward = self._normalize(basis[:, 0])
         right = self._normalize(basis[:, 1])
         camera_position = base_position + basis.dot(self.camera_offset)
@@ -165,31 +186,42 @@ class DataCollector:
         return matrix[0:3, 0:3].astype(np.float32)
 
     def _cast_ray(self, origin: np.ndarray, direction: np.ndarray) -> Optional[tuple]:
-        hit_distance: Optional[float] = None
-        hit_normal: Optional[np.ndarray] = None
+        best_distance = float(self.max_range)
+        best_normal: Optional[np.ndarray] = None
         for obstacle in self.obstacles:
+            offset = obstacle.center - origin
+            proj = float(np.dot(offset, direction))
+            if proj < -obstacle.bounding_radius or proj - obstacle.bounding_radius > best_distance:
+                continue
+            closest_sq = float(np.dot(offset, offset)) - proj * proj
+            if closest_sq > obstacle.bounding_radius_sq:
+                continue
+
             if obstacle.shape == "sphere":
-                result = self._intersect_sphere(origin, direction, obstacle)
+                result = self._intersect_sphere(origin, direction, obstacle, best_distance)
             else:
-                result = self._intersect_box(origin, direction, obstacle)
+                result = self._intersect_box(origin, direction, obstacle, best_distance)
             if result is None:
                 continue
             distance, normal = result
-            if distance <= 0.0:
+            if distance <= 0.0 or distance > best_distance:
                 continue
-            if hit_distance is None or distance < hit_distance:
-                hit_distance = distance
-                hit_normal = normal
-        if hit_distance is None or hit_normal is None:
+            best_distance = distance
+            best_normal = normal
+
+        if best_normal is None:
             return None
-        return hit_distance, hit_normal
+        return best_distance, best_normal
 
     @staticmethod
     def _intersect_sphere(
-        origin: np.ndarray, direction: np.ndarray, obstacle: Obstacle
+        origin: np.ndarray,
+        direction: np.ndarray,
+        obstacle: Obstacle,
+        max_distance: float,
     ) -> Optional[tuple]:
         center = obstacle.center
-        radius = obstacle.radius
+        radius = obstacle._sphere_radius
         oc = origin - center
         b = 2.0 * float(np.dot(direction, oc))
         c = float(np.dot(oc, oc)) - radius * radius
@@ -206,19 +238,25 @@ class DataCollector:
                     t_hit = t
         if t_hit is None:
             return None
+        if t_hit > max_distance:
+            return None
         point = origin + direction * t_hit
         normal = DataCollector._normalize(point - center)
         return t_hit, normal
 
     @staticmethod
     def _intersect_box(
-        origin: np.ndarray, direction: np.ndarray, obstacle: Obstacle
+        origin: np.ndarray,
+        direction: np.ndarray,
+        obstacle: Obstacle,
+        max_distance: float,
     ) -> Optional[tuple]:
-        half_extents = obstacle.size / 2.0
+        half_extents = obstacle.half_extents
+        inv_rotation = obstacle.inv_rotation
         rotation = obstacle.rotation
         center = obstacle.center
-        local_origin = rotation.T.dot(origin - center)
-        local_direction = rotation.T.dot(direction)
+        local_origin = inv_rotation.dot(origin - center)
+        local_direction = inv_rotation.dot(direction)
 
         tmin = -float("inf")
         tmax = float("inf")
@@ -241,6 +279,8 @@ class DataCollector:
             return None
         t_hit = tmin if tmin > 0.0 else tmax
         if t_hit < 0.0:
+            return None
+        if t_hit > max_distance:
             return None
 
         local_point = local_origin + local_direction * t_hit

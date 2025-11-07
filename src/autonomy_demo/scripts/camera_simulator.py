@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import ast
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from typing import List, Optional
 
 import numpy as np
@@ -26,12 +26,33 @@ class Obstacle:
     center: np.ndarray
     size: np.ndarray
     rotation: np.ndarray
+    half_extents: np.ndarray = dataclass_field(init=False, repr=False)
+    inv_rotation: np.ndarray = dataclass_field(init=False, repr=False)
+    bounding_radius: float = dataclass_field(init=False)
+    bounding_radius_sq: float = dataclass_field(init=False, repr=False)
+    _sphere_radius: float = dataclass_field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.center = np.asarray(self.center, dtype=np.float32)
+        self.size = np.asarray(self.size, dtype=np.float32)
+        if self.rotation is None:
+            self.rotation = np.identity(3, dtype=np.float32)
+        else:
+            self.rotation = np.asarray(self.rotation, dtype=np.float32)
+        if self.shape == "sphere":
+            radius = float(self.size[0]) / 2.0
+            self.half_extents = np.array([radius, radius, radius], dtype=np.float32)
+            self._sphere_radius = radius
+        else:
+            self.half_extents = self.size / 2.0
+            self._sphere_radius = float(max(self.size[0], self.size[1])) / 2.0
+        self.inv_rotation = self.rotation.T
+        self.bounding_radius = float(np.linalg.norm(self.half_extents))
+        self.bounding_radius_sq = self.bounding_radius * self.bounding_radius
 
     @property
     def radius(self) -> float:
-        if self.shape == "sphere":
-            return float(self.size[0]) / 2.0
-        return float(max(self.size[0], self.size[1])) / 2.0
+        return self._sphere_radius
 
 
 class CameraSimulator:
@@ -58,6 +79,14 @@ class CameraSimulator:
         self.bridge = CvBridge()
         self.latest_pose: Optional[PoseStamped] = None
         self.obstacles: List[Obstacle] = []
+        self._local_rays = self._precompute_rays()
+        self._pixel_count = self._local_rays.shape[0]
+        self._camera_offset_vec = np.array(self.camera_offset, dtype=np.float32)
+        self._light_dir = self._normalize(np.array([-0.2, -0.4, -1.0], dtype=np.float32))
+        self._ground_color = np.array([88, 120, 80], dtype=np.float32)
+        self._sky_color_top = np.array([120, 170, 220], dtype=np.float32)
+        self._sky_color_horizon = np.array([180, 200, 220], dtype=np.float32)
+        self._obstacle_color = np.array([160, 160, 160], dtype=np.float32)
 
         self.image_pub = rospy.Publisher("drone/rgb/image_raw", Image, queue_size=1)
         self.info_pub = rospy.Publisher("drone/rgb/camera_info", CameraInfo, queue_size=1)
@@ -118,68 +147,47 @@ class CameraSimulator:
         rotation = transformations.quaternion_matrix(
             [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
         )
-        basis = rotation[0:3, 0:3]
-        forward = self._normalize(basis[:, 0])
-        right = self._normalize(basis[:, 1])
-        up = self._normalize(basis[:, 2])
+        basis = rotation[0:3, 0:3].astype(np.float32)
+        camera_position = base_position + basis.dot(self._camera_offset_vec)
 
-        camera_offset = np.array(self.camera_offset, dtype=np.float32)
-        camera_position = base_position + basis.dot(camera_offset)
-
-        width = self.image_width
-        height = self.image_height
-        image = np.zeros((height, width, 3), dtype=np.uint8)
+        width = int(self.image_width)
+        height = int(self.image_height)
         if width <= 0 or height <= 0:
-            return image
+            return np.zeros((0, 0, 3), dtype=np.uint8)
 
-        fov_h = math.radians(self.fov_deg)
-        aspect = height / float(width)
-        fov_v = 2.0 * math.atan(math.tan(fov_h / 2.0) * aspect)
-        tan_half_h = math.tan(fov_h / 2.0)
-        tan_half_v = math.tan(fov_v / 2.0)
+        directions = self._local_rays.dot(basis.T)
+        light_dir = self._light_dir
+        ground_color = self._ground_color
+        sky_color_top = self._sky_color_top
+        sky_color_horizon = self._sky_color_horizon
+        obstacle_color = self._obstacle_color
 
-        light_dir = self._normalize(np.array([-0.2, -0.4, -1.0], dtype=np.float32))
-        ground_color = np.array([88, 120, 80], dtype=np.float32)
-        sky_color_top = np.array([120, 170, 220], dtype=np.float32)
-        sky_color_horizon = np.array([180, 200, 220], dtype=np.float32)
-        obstacle_color = np.array([160, 160, 160], dtype=np.float32)
+        pixels = np.empty((self._pixel_count, 3), dtype=np.uint8)
+        for idx, direction in enumerate(directions):
+            hit = self._cast_ray(camera_position, direction)
+            if hit is not None:
+                distance, normal = hit
+                lambert = max(0.0, float(np.dot(normal, -light_dir)))
+                shade = 0.25 + 0.75 * lambert
+                attenuation = 1.0 / (1.0 + 0.08 * max(distance, 0.0))
+                base = obstacle_color * shade * attenuation
+                pixels[idx, :] = np.clip(base, 0.0, 255.0).astype(np.uint8)
+                continue
 
-        for v in range(height):
-            v_ndc = 1.0 - 2.0 * ((v + 0.5) / float(height))
-            y_component = v_ndc * tan_half_v
-            for u in range(width):
-                u_ndc = 2.0 * ((u + 0.5) / float(width)) - 1.0
-                x_component = u_ndc * tan_half_h
-                direction = self._normalize(
-                    forward + x_component * right + y_component * up
-                )
-                hit = self._cast_ray(camera_position, direction)
-                if hit is not None:
-                    distance, normal = hit
-                    lambert = max(0.0, float(np.dot(normal, -light_dir)))
-                    shade = 0.25 + 0.75 * lambert
-                    attenuation = 1.0 / (1.0 + 0.08 * max(distance, 0.0))
-                    base = obstacle_color * shade * attenuation
-                    color = np.clip(base, 0.0, 255.0)
-                    image[v, u, :] = color.astype(np.uint8)
+            if direction[2] < -1e-4:
+                t_ground = (camera_position[2]) / -direction[2]
+                if 0.0 < t_ground <= self.max_range * 3.0:
+                    point = camera_position + direction * t_ground
+                    tiling = (math.sin(point[0] * 0.6) + math.sin(point[1] * 0.6)) * 0.5
+                    base = ground_color * (0.7 + 0.2 * tiling)
+                    pixels[idx, :] = np.clip(base, 0.0, 255.0).astype(np.uint8)
                     continue
 
-                # Check ground plane intersection when looking downward
-                if direction[2] < -1e-4:
-                    t_ground = (camera_position[2]) / -direction[2]
-                    if 0.0 < t_ground <= self.max_range * 3.0:
-                        point = camera_position + direction * t_ground
-                        tiling = (math.sin(point[0] * 0.6) + math.sin(point[1] * 0.6)) * 0.5
-                        base = ground_color * (0.7 + 0.2 * tiling)
-                        image[v, u, :] = np.clip(base, 0.0, 255.0).astype(np.uint8)
-                        continue
+            t = max(0.0, min(1.0, (direction[2] + 1.0) * 0.5))
+            sky = sky_color_horizon * (1.0 - t) + sky_color_top * t
+            pixels[idx, :] = np.clip(sky, 0.0, 255.0).astype(np.uint8)
 
-                # Otherwise render sky gradient
-                t = max(0.0, min(1.0, (direction[2] + 1.0) * 0.5))
-                sky = sky_color_horizon * (1.0 - t) + sky_color_top * t
-                image[v, u, :] = np.clip(sky, 0.0, 255.0).astype(np.uint8)
-
-        return image
+        return pixels.reshape(height, width, 3)
 
     def publish(self) -> None:
         rate = rospy.Rate(self.publish_rate)
@@ -205,6 +213,36 @@ class CameraSimulator:
                 self.image_pub.publish(msg)
                 self.info_pub.publish(info)
             rate.sleep()
+
+    def _precompute_rays(self) -> np.ndarray:
+        width = max(1, int(self.image_width))
+        height = max(1, int(self.image_height))
+        fov_h = math.radians(self.fov_deg)
+        aspect = height / float(width)
+        tan_half_h = math.tan(fov_h / 2.0)
+        tan_half_v = tan_half_h * aspect
+
+        u = (np.arange(width, dtype=np.float32) + 0.5) / float(width)
+        v = (np.arange(height, dtype=np.float32) + 0.5) / float(height)
+        u = (u * 2.0) - 1.0
+        v = 1.0 - (v * 2.0)
+
+        x_components = u * tan_half_h
+        y_components = v[:, np.newaxis] * tan_half_v
+
+        ones = np.ones((height, width), dtype=np.float32)
+        local_dirs = np.stack(
+            (
+                ones,
+                np.broadcast_to(x_components, (height, width)),
+                y_components,
+            ),
+            axis=-1,
+        )
+        norms = np.linalg.norm(local_dirs, axis=-1, keepdims=True)
+        norms = np.clip(norms, 1e-6, None)
+        local_dirs /= norms
+        return local_dirs.reshape(-1, 3)
 
     def publish_static_transform(self) -> None:
         transform = TransformStamped()
@@ -267,32 +305,42 @@ class CameraSimulator:
         return matrix[0:3, 0:3].astype(np.float32)
 
     def _cast_ray(self, origin: np.ndarray, direction: np.ndarray) -> Optional[tuple]:
-        hit_distance: Optional[float] = None
-        hit_normal: Optional[np.ndarray] = None
+        best_distance = float(self.max_range)
+        best_normal: Optional[np.ndarray] = None
         for obstacle in self.obstacles:
-            result: Optional[tuple]
+            offset = obstacle.center - origin
+            proj = float(np.dot(offset, direction))
+            if proj < -obstacle.bounding_radius or proj - obstacle.bounding_radius > best_distance:
+                continue
+            closest_sq = float(np.dot(offset, offset)) - proj * proj
+            if closest_sq > obstacle.bounding_radius_sq:
+                continue
+
             if obstacle.shape == "sphere":
-                result = self._intersect_sphere(origin, direction, obstacle)
+                result = self._intersect_sphere(origin, direction, obstacle, best_distance)
             else:
-                result = self._intersect_box(origin, direction, obstacle)
+                result = self._intersect_box(origin, direction, obstacle, best_distance)
             if result is None:
                 continue
             distance, normal = result
-            if distance <= 0.0:
+            if distance <= 0.0 or distance > best_distance:
                 continue
-            if hit_distance is None or distance < hit_distance:
-                hit_distance = distance
-                hit_normal = normal
-        if hit_distance is None or hit_normal is None:
+            best_distance = distance
+            best_normal = normal
+
+        if best_normal is None:
             return None
-        return hit_distance, hit_normal
+        return best_distance, best_normal
 
     @staticmethod
     def _intersect_sphere(
-        origin: np.ndarray, direction: np.ndarray, obstacle: Obstacle
+        origin: np.ndarray,
+        direction: np.ndarray,
+        obstacle: Obstacle,
+        max_distance: float,
     ) -> Optional[tuple]:
         center = obstacle.center
-        radius = obstacle.radius
+        radius = obstacle._sphere_radius
         oc = origin - center
         b = 2.0 * float(np.dot(direction, oc))
         c = float(np.dot(oc, oc)) - radius * radius
@@ -309,19 +357,25 @@ class CameraSimulator:
                     t_hit = t
         if t_hit is None:
             return None
+        if t_hit > max_distance:
+            return None
         point = origin + direction * t_hit
         normal = CameraSimulator._normalize(point - center)
         return t_hit, normal
 
     @staticmethod
     def _intersect_box(
-        origin: np.ndarray, direction: np.ndarray, obstacle: Obstacle
+        origin: np.ndarray,
+        direction: np.ndarray,
+        obstacle: Obstacle,
+        max_distance: float,
     ) -> Optional[tuple]:
-        half_extents = obstacle.size / 2.0
+        half_extents = obstacle.half_extents
         rotation = obstacle.rotation
+        inv_rotation = obstacle.inv_rotation
         center = obstacle.center
-        local_origin = rotation.T.dot(origin - center)
-        local_direction = rotation.T.dot(direction)
+        local_origin = inv_rotation.dot(origin - center)
+        local_direction = inv_rotation.dot(direction)
 
         tmin = -float("inf")
         tmax = float("inf")
@@ -344,6 +398,8 @@ class CameraSimulator:
             return None
         t_hit = tmin if tmin > 0.0 else tmax
         if t_hit < 0.0:
+            return None
+        if t_hit > max_distance:
             return None
 
         local_point = local_origin + local_direction * t_hit
