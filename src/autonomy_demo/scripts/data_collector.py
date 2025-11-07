@@ -14,7 +14,33 @@ from std_msgs.msg import Header
 from tf_conversions import transformations
 from visualization_msgs.msg import MarkerArray
 
-from obstacle_field import ObstacleField
+try:
+    from autonomy_demo.obstacle_field import ObstacleField
+except ImportError:
+    import os
+    import sys
+
+    candidate_paths = [
+        os.path.join(os.path.dirname(__file__), "..", "src"),
+    ]
+
+    try:
+        import rospkg  # type: ignore
+    except ImportError:
+        rospkg = None  # type: ignore
+    if rospkg is not None:
+        try:
+            pkg_path = rospkg.RosPack().get_path("autonomy_demo")
+        except rospkg.ResourceNotFound:
+            pkg_path = None
+        if pkg_path:
+            candidate_paths.append(os.path.join(pkg_path, "src"))
+
+    for path in candidate_paths:
+        abs_path = os.path.abspath(path)
+        if os.path.isdir(abs_path) and abs_path not in sys.path:
+            sys.path.append(abs_path)
+    from autonomy_demo.obstacle_field import ObstacleField
 
 
 class DataCollector:

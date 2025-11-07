@@ -15,6 +15,8 @@ find_package(catkin REQUIRED COMPONENTS
   tf_conversions
 )
 
+catkin_python_setup()
+
 catkin_package()
 
 catkin_install_python(PROGRAMS
