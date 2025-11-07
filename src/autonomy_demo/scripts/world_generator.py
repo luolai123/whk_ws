@@ -18,6 +18,7 @@ class Obstacle:
     position: Tuple[float, float, float]
     size: Tuple[float, float, float]
     shape: str
+    category: str = "obstacle"
 
 
 class WorldGenerator:
@@ -25,25 +26,53 @@ class WorldGenerator:
 
     def __init__(self) -> None:
         self.world_size = self._ensure_float_tuple(
-            self._get_float_tuple("~world_size", [40.0, 40.0, 8.0], 3),
+            self._get_float_tuple("~world_size", [120.0, 120.0, 12.0], 3),
             "~world_size",
-            fallback=(40.0, 40.0, 8.0),
+            fallback=(120.0, 120.0, 12.0),
         )
-        self.obstacle_count = self._get_int("~obstacle_count", 40)
+        self.obstacle_count = self._get_int("~obstacle_count", 70)
         self.obstacle_density = max(0.0, self._get_float("~obstacle_density", 0.0))
         self.height_range = self._ensure_float_tuple(
-            self._get_float_tuple("~height_range", [0.5, 3.0], 2),
+            self._get_float_tuple("~height_range", [1.2, 7.5], 2),
             "~height_range",
-            fallback=(0.5, 3.0),
+            fallback=(1.2, 7.5),
         )
         self.size_range = self._ensure_float_tuple(
-            self._get_float_tuple("~size_range", [0.5, 2.5], 2),
+            self._get_float_tuple("~size_range", [1.0, 4.5], 2),
             "~size_range",
-            fallback=(0.5, 2.5),
+            fallback=(1.0, 4.5),
         )
         self.occupancy_resolution = self._get_float("~occupancy_resolution", 0.5)
         self.frame_id = rospy.get_param("~frame_id", "map")
         self.sphere_ratio = max(0.0, min(1.0, self._get_float("~sphere_ratio", 0.3)))
+        raw_gate_ratio = self._get_float("~gate_ratio", 0.2)
+        self.gate_ratio = max(0.0, min(1.0 - self.sphere_ratio, raw_gate_ratio))
+        self.gate_opening_range = self._ensure_float_tuple(
+            self._get_float_tuple("~gate_opening_range", [3.0, 6.5], 2),
+            "~gate_opening_range",
+            fallback=(3.0, 6.5),
+        )
+        self.gate_height_range = self._ensure_float_tuple(
+            self._get_float_tuple("~gate_height_range", [4.0, 8.5], 2),
+            "~gate_height_range",
+            fallback=(4.0, 8.5),
+        )
+        self.gate_post_thickness_range = self._ensure_float_tuple(
+            self._get_float_tuple("~gate_post_thickness_range", [0.4, 0.9], 2),
+            "~gate_post_thickness_range",
+            fallback=(0.4, 0.9),
+        )
+        self.gate_depth_range = self._ensure_float_tuple(
+            self._get_float_tuple("~gate_depth_range", [0.7, 1.4], 2),
+            "~gate_depth_range",
+            fallback=(0.7, 1.4),
+        )
+        self.gate_top_thickness_range = self._ensure_float_tuple(
+            self._get_float_tuple("~gate_top_thickness_range", [0.3, 0.6], 2),
+            "~gate_top_thickness_range",
+            fallback=(0.3, 0.6),
+        )
+        self.obstacle_color = (0.55, 0.55, 0.55, 0.9)
 
         self.marker_pub = rospy.Publisher("world/obstacles", MarkerArray, queue_size=1, latch=True)
         self.grid_pub = rospy.Publisher("world/occupancy", OccupancyGrid, queue_size=1, latch=True)
@@ -63,28 +92,29 @@ class WorldGenerator:
     def generate_world(self) -> None:
         self.obstacles = []
         obstacle_total = self._compute_obstacle_total()
-        for _ in range(obstacle_total):
+        count = 0
+        while count < obstacle_total:
             x = random.uniform(-self.world_size[0] / 2.0, self.world_size[0] / 2.0)
             y = random.uniform(-self.world_size[1] / 2.0, self.world_size[1] / 2.0)
-            shape = "sphere" if random.random() < self.sphere_ratio else "box"
-            if shape == "sphere":
+            roll = random.random()
+            if roll < self.sphere_ratio:
                 diameter = random.uniform(self.size_range[0], self.size_range[1])
-                radius = diameter / 2.0
+                radius = min(diameter / 2.0, self.world_size[2] / 2.0)
                 obstacle = Obstacle(
                     position=(x, y, radius),
-                    size=(diameter, diameter, diameter),
-                    shape=shape,
+                    size=(radius * 2.0, radius * 2.0, radius * 2.0),
+                    shape="sphere",
                 )
+                self.obstacles.append(obstacle)
+            elif roll < self.sphere_ratio + self.gate_ratio:
+                gate_parts = self._create_gate_obstacles(x, y)
+                if gate_parts:
+                    self.obstacles.extend(gate_parts)
+                else:
+                    self.obstacles.append(self._create_box_obstacle(x, y))
             else:
-                height = random.uniform(self.height_range[0], self.height_range[1])
-                sx = random.uniform(self.size_range[0], self.size_range[1])
-                sy = random.uniform(self.size_range[0], self.size_range[1])
-                obstacle = Obstacle(
-                    position=(x, y, height / 2.0),
-                    size=(sx, sy, height),
-                    shape=shape,
-                )
-            self.obstacles.append(obstacle)
+                self.obstacles.append(self._create_box_obstacle(x, y))
+            count += 1
         rospy.loginfo("Generated %d obstacles", len(self.obstacles))
 
     def publish_world(self) -> None:
@@ -105,19 +135,74 @@ class WorldGenerator:
             marker.scale.x = obstacle.size[0]
             marker.scale.y = obstacle.size[1]
             marker.scale.z = obstacle.size[2]
-            if obstacle.shape == "sphere":
-                marker.color.r = 0.16
-                marker.color.g = 0.62
-                marker.color.b = 0.87
-            else:
-                marker.color.r = 0.89
-                marker.color.g = 0.58
-                marker.color.b = 0.13
-            marker.color.a = 0.85
+            marker.color.r = self.obstacle_color[0]
+            marker.color.g = self.obstacle_color[1]
+            marker.color.b = self.obstacle_color[2]
+            marker.color.a = self.obstacle_color[3]
             markers.markers.append(marker)
         self.marker_pub.publish(markers)
         self.grid_pub.publish(self.create_occupancy_grid(timestamp))
         rospy.loginfo("Published world markers and occupancy grid")
+
+    def _create_box_obstacle(self, x: float, y: float) -> Obstacle:
+        height = random.uniform(self.height_range[0], self.height_range[1])
+        max_height = self.world_size[2] * 0.95
+        height = min(height, max_height)
+        sx = random.uniform(self.size_range[0], self.size_range[1])
+        sy = random.uniform(self.size_range[0], self.size_range[1])
+        return Obstacle(
+            position=(x, y, height / 2.0),
+            size=(sx, sy, height),
+            shape="box",
+        )
+
+    def _create_gate_obstacles(self, x: float, y: float) -> List[Obstacle]:
+        half_world_x = self.world_size[0] / 2.0
+        half_world_y = self.world_size[1] / 2.0
+        max_height = self.world_size[2] * 0.95
+        gate_height = random.uniform(self.gate_height_range[0], self.gate_height_range[1])
+        gate_height = min(gate_height, max_height)
+        opening = random.uniform(self.gate_opening_range[0], self.gate_opening_range[1])
+        post_thickness = random.uniform(
+            self.gate_post_thickness_range[0], self.gate_post_thickness_range[1]
+        )
+        depth = random.uniform(self.gate_depth_range[0], self.gate_depth_range[1])
+        top_thickness = random.uniform(
+            self.gate_top_thickness_range[0], self.gate_top_thickness_range[1]
+        )
+        top_thickness = min(top_thickness, max(gate_height * 0.3, self.gate_top_thickness_range[0]))
+        beam_height = gate_height - top_thickness / 2.0
+        if beam_height <= 0.0:
+            return []
+        left_center_x = x - (opening / 2.0 + post_thickness / 2.0)
+        right_center_x = x + (opening / 2.0 + post_thickness / 2.0)
+        if (
+            left_center_x - post_thickness / 2.0 < -half_world_x
+            or right_center_x + post_thickness / 2.0 > half_world_x
+            or y - depth / 2.0 < -half_world_y
+            or y + depth / 2.0 > half_world_y
+        ):
+            return []
+        posts_z = gate_height / 2.0
+        left_post = Obstacle(
+            position=(left_center_x, y, posts_z),
+            size=(post_thickness, depth, gate_height),
+            shape="box",
+            category="gate",
+        )
+        right_post = Obstacle(
+            position=(right_center_x, y, posts_z),
+            size=(post_thickness, depth, gate_height),
+            shape="box",
+            category="gate",
+        )
+        beam = Obstacle(
+            position=(x, y, beam_height),
+            size=(opening + post_thickness * 2.0, depth, top_thickness),
+            shape="box",
+            category="gate",
+        )
+        return [left_post, right_post, beam]
 
     def create_occupancy_grid(self, timestamp: rospy.Time) -> OccupancyGrid:
         resolution = float(self.occupancy_resolution)

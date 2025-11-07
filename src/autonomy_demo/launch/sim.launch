@@ -1,11 +1,14 @@
 <launch>
   <node pkg="autonomy_demo" type="world_generator.py" name="world_generator" output="screen">
-    <param name="world_size" value="[40.0, 40.0, 8.0]" />
-    <param name="obstacle_density" value="0.05" />
-    <param name="obstacle_count" value="45" />
-    <param name="size_range" value="[0.6, 2.6]" />
-    <param name="height_range" value="[0.6, 3.5]" />
-    <param name="sphere_ratio" value="0.35" />
+    <param name="world_size" value="[160.0, 160.0, 14.0]" />
+    <param name="obstacle_density" value="0.045" />
+    <param name="obstacle_count" value="80" />
+    <param name="size_range" value="[1.2, 4.8]" />
+    <param name="height_range" value="[1.5, 8.5]" />
+    <param name="sphere_ratio" value="0.3" />
+    <param name="gate_ratio" value="0.2" />
+    <param name="gate_opening_range" value="[3.5, 7.5]" />
+    <param name="gate_height_range" value="[4.5, 9.5]" />
     <param name="occupancy_resolution" value="0.5" />
   </node>
 
