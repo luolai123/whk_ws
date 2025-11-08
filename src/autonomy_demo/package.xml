@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>autonomy_demo</name>
+  <version>0.0.1</version>
+  <description>Autonomy demo workspace with random obstacle world, drone simulation, and ML pipeline.</description>
+  <maintainer email="example@example.com">Example Maintainer</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>message_generation</depend>
+  <depend>cv_bridge</depend>
+  <depend>image_transport</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf_conversions</depend>
+  <export></export>
+</package>
