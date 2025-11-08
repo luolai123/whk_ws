@@ -66,6 +66,42 @@ class ObstacleField:
             and self.box_inv_rotations_t is not None
         )
 
+    def distance_to_point(self, point: Sequence[float]) -> float:
+        """Return the minimum signed distance from *point* to any obstacle surface."""
+
+        point_arr = np.asarray(point, dtype=np.float32)
+        if point_arr.shape != (3,):
+            point_arr = point_arr.reshape(3)
+
+        distances: List[np.ndarray] = []
+
+        if self.sphere_centers.size:
+            diff = self.sphere_centers - point_arr
+            if self.sphere_radii.size:
+                radii = self.sphere_radii
+            else:
+                radii = np.zeros(diff.shape[0], dtype=np.float32)
+            sphere_dist = np.linalg.norm(diff, axis=1) - radii
+            distances.append(sphere_dist)
+
+        if self.box_centers.size:
+            rel = point_arr[None, :] - self.box_centers
+            local = np.einsum("nij,nj->ni", self.box_inv_rotations, rel)
+            excess = np.abs(local) - self.box_half_extents
+            outside = np.maximum(excess, 0.0)
+            outside_dist = np.linalg.norm(outside, axis=1)
+            inside = np.minimum(np.max(excess, axis=1), 0.0)
+            box_dist = outside_dist + inside
+            distances.append(box_dist)
+
+        if not distances:
+            return float("inf")
+
+        stacked = np.concatenate(distances)
+        if stacked.size == 0:
+            return float("inf")
+        return float(np.min(stacked))
+
     def update_from_markers(
         self,
         markers: Sequence,

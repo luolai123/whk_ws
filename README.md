@@ -96,6 +96,20 @@ roslaunch autonomy_demo data_collection.launch output_dir:=/your/dataset/path
 
 - When CUDA is unavailable or PyTorch is not installed, the nodes automatically fall back to the optimized NumPy implementation.
 
+### Offline Batch Dataset Generation
+
+- To procedurally capture large datasets without running ROS, use the standalone generator:
+
+  ```bash
+  python3 src/autonomy_demo/training/auto_dataset_generator.py \
+    src/autonomy_demo/config/auto_dataset.yaml \
+    --overwrite
+  ```
+
+- The script mirrors the live simulator: it samples the same obstacle shapes, reuses the analytic ray caster for RGB rendering and distance labels, and stores each environment (geometry snapshot plus RGB/label/depth triplets) under the configured output directory.
+
+- Customize `src/autonomy_demo/config/auto_dataset.yaml` to tweak world scale, obstacle density, camera intrinsics, altitude/orientation bounds, or dataset counts. Provide `--output` to override the destination directory and `--overwrite` to clear an existing dataset before generation.
+
 ### Performance Tuning
 
 - Use `max_obstacle_candidates` (default `512`) to cap how many nearby objects each ray considers. Lower values improve frame rate at the cost of ignoring far obstacles; `0` keeps the full set. The parameter is exposed on `sim.launch` and `data_collection.launch` for both the camera simulator and the dataset recorder.
