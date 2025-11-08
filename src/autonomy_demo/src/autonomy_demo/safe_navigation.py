@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -178,3 +178,40 @@ def is_pixel_safe(safe_mask: np.ndarray, col: float, row: float) -> bool:
         and 0 <= col_idx < safe_mask.shape[1]
         and bool(safe_mask[row_idx, col_idx])
     )
+
+
+def _smoothstep(t: float) -> float:
+    """Cubic smoothstep used to ease YOPO-style trajectory blends."""
+
+    t = max(0.0, min(1.0, float(t)))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def sample_yopo_directions(
+    base_direction: np.ndarray,
+    yaw_offset: float,
+    pitch_offset: float,
+    steps: int,
+) -> List[np.ndarray]:
+    """Return a list of interpolated directions along a YOPO-like primitive.
+
+    The offsets are progressively blended with a ``smoothstep`` profile so the
+    early portion of the trajectory closely follows ``base_direction`` while
+    the later portion converges on the fully offset heading.  This mirrors the
+    "You Only Plan Once" (YOPO) idea of precomputing smooth motion primitives
+    that can be evaluated quickly during inference.
+    """
+
+    steps = max(1, int(steps))
+    directions: List[np.ndarray] = []
+    for idx in range(1, steps + 1):
+        fraction = idx / float(steps)
+        blend = _smoothstep(fraction)
+        directions.append(
+            rotate_direction(
+                base_direction,
+                yaw_offset * blend,
+                pitch_offset * blend,
+            )
+        )
+    return directions

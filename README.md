@@ -10,7 +10,7 @@ This workspace contains a complete ROS1 (Noetic) simulation for a UAV navigating
 - **Synthetic RGB camera** that renders obstacle distances into color-coded imagery with optional torch-powered acceleration.
 - **Automated data collection** pipeline that records RGB frames with near/far obstacle labels using analytic distance computation, reusing the same accelerated ray casting path as the camera.
 - **PyTorch training utilities** for a two-class distance classifier and an inference node that streams classification maps in real time.
-- **Binary-image-driven safe navigation** that extracts dominant safe zones, emits goal-aligned motion primitives, and evaluates torch-trained offset policies in under 2 ms per frame.
+- **Binary-image-driven safe navigation** that extracts dominant safe zones, emits YOPO-style motion primitives with full trajectory visualization, and evaluates torch-trained offset policies in under 2 ms per frame.
 
 ## Prerequisites
 
@@ -134,12 +134,13 @@ roslaunch autonomy_demo inference.launch \
 ```
 
 - The `distance_inference` node subscribes to the RGB stream, produces the binary classification overlay on `/drone/rgb/distance_class`, and extracts the largest contiguous safe zone (default minimum area 5%).
-- A differentiable policy evaluates the noisy safe mask and current airspeed to emit motion primitives and offset recommendations. Outputs are published on:
+- A differentiable policy evaluates the noisy safe mask and current airspeed to emit motion primitives, YOPO-inspired trajectories, and offset recommendations. Outputs are published on:
   - `/drone/safe_center` (`geometry_msgs/PointStamped`): normalized safe-zone centroid and area fraction.
   - `/drone/movement_primitive` (`geometry_msgs/Vector3Stamped`): base vector toward the safe centroid with current-speed magnitude.
   - `/drone/movement_command` (`geometry_msgs/Vector3Stamped`): final command after applying length/angle offsets.
   - `/drone/movement_offsets` (`std_msgs/Float32MultiArray`): `[length_scale, pitch_deg, yaw_deg]` adjustments chosen by the policy.
   - `/drone/fallback_primitives` (`geometry_msgs/PoseArray`): rear/side slip options that remain available when no safe region is detected.
+  - `/drone/safe_trajectory` (`nav_msgs/Path`): YOPO-blended path for the selected safe primitive, suitable for RViz overlays.
 - End-to-end processing is throttled to under 2 ms per frame; the node logs a warning if runtime exceeds the budget.
 - RViz continues to display the RGB feed, the classification overlay, and the drone model. Use the 2D Nav Goal tool to validate how the navigation cues react to new viewpoints.
 

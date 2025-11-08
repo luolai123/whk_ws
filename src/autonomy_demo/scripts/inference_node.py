@@ -10,8 +10,14 @@ import numpy as np
 import rospy
 import torch
 from cv_bridge import CvBridge
-from geometry_msgs.msg import PointStamped, Pose, PoseArray, Vector3Stamped
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import (
+    PointStamped,
+    Pose,
+    PoseArray,
+    PoseStamped,
+    Vector3Stamped,
+)
+from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Float32MultiArray
 from tf_conversions import transformations
@@ -22,6 +28,7 @@ from autonomy_demo.safe_navigation import (
     is_pixel_safe,
     project_direction_to_pixel,
     rotate_direction,
+    sample_yopo_directions,
 )
 
 
@@ -127,10 +134,13 @@ class InferenceNode:
         self.command_pub = rospy.Publisher("drone/movement_command", Vector3Stamped, queue_size=1)
         self.offset_pub = rospy.Publisher("drone/movement_offsets", Float32MultiArray, queue_size=1)
         self.fallback_pub = rospy.Publisher("drone/fallback_primitives", PoseArray, queue_size=1)
+        self.trajectory_pub = rospy.Publisher("drone/safe_trajectory", Path, queue_size=1)
 
         rospy.Subscriber("drone/rgb/camera_info", CameraInfo, self.camera_info_callback, queue_size=1)
         rospy.Subscriber("drone/odometry", Odometry, self.odom_callback, queue_size=1)
         rospy.Subscriber("drone/rgb/image_raw", Image, self.image_callback, queue_size=1)
+
+        self.trajectory_steps = int(rospy.get_param("~trajectory_steps", 12))
 
     def camera_info_callback(self, info: CameraInfo) -> None:
         self.camera_info = info
@@ -262,6 +272,18 @@ class InferenceNode:
         else:
             final_direction_local = base_direction
 
+        yaw_offset, pitch_offset, length_scale = self._evaluate_offsets(
+            base_direction,
+            yaw_offset,
+            pitch_offset,
+            length_scale,
+            safe_mask,
+            width,
+            height,
+            fov_deg,
+        )
+        final_direction_local = rotate_direction(base_direction, yaw_offset, pitch_offset)
+
         final_world_direction = rotation.dot(final_direction_local)
         final_world_direction /= np.linalg.norm(final_world_direction)
         final_vector_world = final_world_direction * (speed * length_scale)
@@ -283,6 +305,16 @@ class InferenceNode:
         offsets_msg = Float32MultiArray()
         offsets_msg.data = [length_scale, math.degrees(pitch_offset), math.degrees(yaw_offset)]
         self.offset_pub.publish(offsets_msg)
+
+        self._publish_trajectory(
+            msg.header,
+            rotation,
+            base_direction,
+            yaw_offset,
+            pitch_offset,
+            length_scale,
+            speed,
+        )
 
         self._publish_fallback(msg.header.stamp, include_default=False)
         self._log_timing(start_time)
@@ -328,6 +360,14 @@ class InferenceNode:
             pose_array.poses.append(pose)
         self.fallback_pub.publish(pose_array)
         if include_default:
+            if vectors:
+                direction = rotation.dot(
+                    vectors[0] / max(float(np.linalg.norm(vectors[0])), 1e-6)
+                )
+                self._publish_vector_trajectory(stamp, direction)
+            else:
+                self._publish_empty_trajectory(stamp)
+        if include_default:
             primitive_msg = Vector3Stamped()
             primitive_msg.header.stamp = stamp
             primitive_msg.header.frame_id = self.odom.header.frame_id or "map"
@@ -343,6 +383,183 @@ class InferenceNode:
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
         if elapsed_ms > 2.0:
             rospy.logwarn_throttle(1.0, "Navigation inference exceeded 2 ms: %.3f ms", elapsed_ms)
+
+    def _evaluate_offsets(
+        self,
+        base_direction: np.ndarray,
+        yaw_offset: float,
+        pitch_offset: float,
+        length_scale: float,
+        safe_mask: np.ndarray,
+        width: int,
+        height: int,
+        fov_deg: float,
+    ) -> Tuple[float, float, float]:
+        target_scale = float(length_scale)
+        for scale in (1.0, 0.75, 0.5, 0.25, 0.0):
+            yaw_candidate = yaw_offset * scale
+            pitch_candidate = pitch_offset * scale
+            length_candidate = 1.0 + (target_scale - 1.0) * scale
+            length_candidate = float(np.clip(length_candidate, 0.5, 1.5))
+            if self._trajectory_is_safe(
+                base_direction,
+                yaw_candidate,
+                pitch_candidate,
+                length_candidate,
+                safe_mask,
+                width,
+                height,
+                fov_deg,
+            ):
+                return yaw_candidate, pitch_candidate, length_candidate
+        return 0.0, 0.0, 1.0
+
+    def _trajectory_is_safe(
+        self,
+        base_direction: np.ndarray,
+        yaw_offset: float,
+        pitch_offset: float,
+        length_scale: float,
+        safe_mask: np.ndarray,
+        width: int,
+        height: int,
+        fov_deg: float,
+    ) -> bool:
+        directions = sample_yopo_directions(
+            base_direction,
+            yaw_offset,
+            pitch_offset,
+            max(2, self.trajectory_steps),
+        )
+        for direction in directions:
+            col, row = project_direction_to_pixel(direction, width, height, fov_deg)
+            if not is_pixel_safe(safe_mask, col, row):
+                return False
+        return True
+
+    def _publish_trajectory(
+        self,
+        header,
+        rotation: np.ndarray,
+        base_direction: np.ndarray,
+        yaw_offset: float,
+        pitch_offset: float,
+        length_scale: float,
+        speed: float,
+    ) -> None:
+        if self.odom is None:
+            return
+        path_msg = Path()
+        path_msg.header.stamp = header.stamp
+        path_msg.header.frame_id = self.odom.header.frame_id or "map"
+
+        origin = np.array(
+            [
+                self.odom.pose.pose.position.x,
+                self.odom.pose.pose.position.y,
+                self.odom.pose.pose.position.z,
+            ],
+            dtype=np.float32,
+        )
+        start_pose = PoseStamped()
+        start_pose.header = path_msg.header
+        start_pose.pose.position.x = float(origin[0])
+        start_pose.pose.position.y = float(origin[1])
+        start_pose.pose.position.z = float(origin[2])
+        start_pose.pose.orientation = self.odom.pose.pose.orientation
+        path_msg.poses.append(start_pose)
+
+        steps = max(2, self.trajectory_steps)
+        segment_length = (speed * length_scale) / steps
+        current = origin.copy()
+        directions = sample_yopo_directions(base_direction, yaw_offset, pitch_offset, steps)
+
+        for direction_local in directions:
+            world_dir = rotation.dot(direction_local)
+            norm = float(np.linalg.norm(world_dir))
+            if norm < 1e-6:
+                continue
+            step_vec = world_dir / norm * segment_length
+            current = current + step_vec
+
+            pose = PoseStamped()
+            pose.header = path_msg.header
+            pose.pose.position.x = float(current[0])
+            pose.pose.position.y = float(current[1])
+            pose.pose.position.z = float(current[2])
+            yaw = math.atan2(world_dir[1], world_dir[0])
+            pitch = math.atan2(world_dir[2], math.sqrt(world_dir[0] ** 2 + world_dir[1] ** 2))
+            quat = transformations.quaternion_from_euler(0.0, pitch, yaw)
+            pose.pose.orientation.x = quat[0]
+            pose.pose.orientation.y = quat[1]
+            pose.pose.orientation.z = quat[2]
+            pose.pose.orientation.w = quat[3]
+            path_msg.poses.append(pose)
+
+        self.trajectory_pub.publish(path_msg)
+
+    def _publish_vector_trajectory(self, stamp: rospy.Time, unit_vector: np.ndarray) -> None:
+        if self.odom is None:
+            return
+        norm = float(np.linalg.norm(unit_vector))
+        if norm < 1e-6:
+            self._publish_empty_trajectory(stamp)
+            return
+        unit_vector = unit_vector / norm
+        steps = max(2, self.trajectory_steps)
+        step_length = self.default_speed / steps
+
+        path_msg = Path()
+        path_msg.header.stamp = stamp
+        path_msg.header.frame_id = self.odom.header.frame_id or "map"
+
+        origin = np.array(
+            [
+                self.odom.pose.pose.position.x,
+                self.odom.pose.pose.position.y,
+                self.odom.pose.pose.position.z,
+            ],
+            dtype=np.float32,
+        )
+
+        start_pose = PoseStamped()
+        start_pose.header = path_msg.header
+        start_pose.pose.position.x = float(origin[0])
+        start_pose.pose.position.y = float(origin[1])
+        start_pose.pose.position.z = float(origin[2])
+        start_pose.pose.orientation = self.odom.pose.pose.orientation
+        path_msg.poses.append(start_pose)
+
+        current = origin.copy()
+        for _ in range(steps):
+            current = current + unit_vector * step_length
+            pose = PoseStamped()
+            pose.header = path_msg.header
+            pose.pose.position.x = float(current[0])
+            pose.pose.position.y = float(current[1])
+            pose.pose.position.z = float(current[2])
+            yaw = math.atan2(unit_vector[1], unit_vector[0])
+            pitch = math.atan2(unit_vector[2], math.sqrt(unit_vector[0] ** 2 + unit_vector[1] ** 2))
+            quat = transformations.quaternion_from_euler(0.0, pitch, yaw)
+            pose.pose.orientation.x = quat[0]
+            pose.pose.orientation.y = quat[1]
+            pose.pose.orientation.z = quat[2]
+            pose.pose.orientation.w = quat[3]
+            path_msg.poses.append(pose)
+
+        self.trajectory_pub.publish(path_msg)
+
+    def _publish_empty_trajectory(self, stamp: rospy.Time) -> None:
+        if self.odom is None:
+            return
+        path_msg = Path()
+        path_msg.header.stamp = stamp
+        path_msg.header.frame_id = self.odom.header.frame_id or "map"
+        start_pose = PoseStamped()
+        start_pose.header = path_msg.header
+        start_pose.pose = self.odom.pose.pose
+        path_msg.poses.append(start_pose)
+        self.trajectory_pub.publish(path_msg)
 
 
 def main() -> None:

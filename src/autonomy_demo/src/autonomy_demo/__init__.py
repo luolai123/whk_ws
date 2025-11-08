@@ -8,6 +8,7 @@ from .safe_navigation import (
     is_pixel_safe,
     project_direction_to_pixel,
     rotate_direction,
+    sample_yopo_directions,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "is_pixel_safe",
     "project_direction_to_pixel",
     "rotate_direction",
+    "sample_yopo_directions",
 ]
