@@ -207,7 +207,21 @@ class ObstacleField:
         origin_vec = origin.astype(np.float32)
         diff = centers - origin_vec[np.newaxis, :]
         dist_sq = np.sum(diff * diff, axis=1)
-        reach = max_range + radii
+
+        radii_array = np.asarray(radii, dtype=np.float32)
+        center_count = centers.shape[0]
+        if radii_array.size == 0:
+            radii_array = np.zeros((center_count,), dtype=np.float32)
+        elif radii_array.shape[0] != center_count:
+            if radii_array.size > center_count:
+                radii_array = radii_array[:center_count]
+            else:
+                pad = np.zeros((center_count - radii_array.size,), dtype=np.float32)
+                if radii_array.size:
+                    pad.fill(float(radii_array[-1]))
+                radii_array = np.concatenate([radii_array, pad])
+
+        reach = max_range + radii_array
         reach_sq = reach * reach
         mask = dist_sq <= reach_sq
         if not np.any(mask):

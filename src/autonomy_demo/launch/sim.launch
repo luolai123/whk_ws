@@ -3,7 +3,7 @@
   <arg name="hardware_device" default="cuda" />
   <node pkg="autonomy_demo" type="world_generator.py" name="world_generator" output="screen">
     <param name="world_size" value="[160.0, 160.0, 14.0]" />
-    <param name="obstacle_density" value="0.045" />
+    <param name="obstacle_density" value="0.015" />
     <param name="obstacle_count" value="80" />
     <param name="size_range" value="[1.2, 4.8]" />
     <param name="height_range" value="[1.5, 8.5]" />
