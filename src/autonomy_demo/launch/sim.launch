@@ -17,6 +17,8 @@
   <node pkg="autonomy_demo" type="drone_simulator.py" name="drone_simulator" output="screen">
     <param name="max_speed" value="1.5" />
     <param name="altitude" value="1.5" />
+    <param name="primitive_dt" value="0.25" />
+    <param name="attitude_gain" value="4.0" />
   </node>
 
   <node pkg="autonomy_demo" type="camera_simulator.py" name="camera_simulator" output="screen">

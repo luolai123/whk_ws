@@ -3,7 +3,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import rospy
 import tf2_ros
@@ -20,6 +20,7 @@ class DroneState:
     orientation: tuple
     yaw: float
     pitch: float
+    roll: float = 0.0
 
 
 class DroneSimulator:
@@ -30,6 +31,10 @@ class DroneSimulator:
         self.max_speed = rospy.get_param("~max_speed", 2.0)
         self.goal_tolerance = rospy.get_param("~goal_tolerance", 0.1)
         self.default_altitude = rospy.get_param("~altitude", 1.5)
+        self.primitive_dt = rospy.get_param("~primitive_dt", 0.25)
+        self.attitude_gain = rospy.get_param("~attitude_gain", 4.0)
+        self.max_yaw_rate = math.radians(rospy.get_param("~max_yaw_rate_deg", 90.0))
+        self.max_pitch_rate = math.radians(rospy.get_param("~max_pitch_rate_deg", 60.0))
 
         self.state = DroneState(
             position=[0.0, 0.0, self.default_altitude],
@@ -40,8 +45,12 @@ class DroneSimulator:
         )
         self.goal: Optional[list] = None
         self.path_points: List[List[float]] = []
+        self.path_orientations: List[Tuple[float, float]] = []
         self.path_index = 0
         self.follow_path = False
+        self.segment_time_remaining = 0.0
+        self.desired_yaw = 0.0
+        self.desired_pitch = 0.0
 
         self.pose_pub = rospy.Publisher("drone/pose", PoseStamped, queue_size=1)
         self.odom_pub = rospy.Publisher("drone/odometry", Odometry, queue_size=1)
@@ -65,6 +74,7 @@ class DroneSimulator:
         if not msg.poses:
             return
         points: List[List[float]] = []
+        orientations: List[Tuple[float, float]] = []
         for pose in msg.poses:
             points.append(
                 [
@@ -73,7 +83,16 @@ class DroneSimulator:
                     pose.pose.position.z if pose.pose.position.z > 0.0 else self.default_altitude,
                 ]
             )
+            quat = (
+                pose.pose.orientation.x,
+                pose.pose.orientation.y,
+                pose.pose.orientation.z,
+                pose.pose.orientation.w,
+            )
+            roll, pitch, yaw = transformations.euler_from_quaternion(quat)
+            orientations.append((pitch, yaw))
         self.path_points = points
+        self.path_orientations = orientations
         self.path_index = 1 if len(points) > 1 else 0
         if self.path_points:
             current = self.state.position
@@ -92,37 +111,16 @@ class DroneSimulator:
         self.follow_path = len(self.path_points) > 1
         if self.path_points:
             self.goal = self.path_points[-1][:]
+            self.segment_time_remaining = self.primitive_dt
+            if self.path_orientations:
+                idx = min(self.path_index, len(self.path_orientations) - 1)
+                pitch, yaw = self.path_orientations[idx]
+                self.desired_pitch = pitch
+                self.desired_yaw = yaw
 
     def step(self, dt: float) -> None:
         if self.follow_path and self.path_points and self.path_index < len(self.path_points):
-            target = self.path_points[self.path_index]
-            direction = [
-                target[0] - self.state.position[0],
-                target[1] - self.state.position[1],
-                target[2] - self.state.position[2],
-            ]
-            distance = math.sqrt(sum(d * d for d in direction))
-            if distance < self.goal_tolerance:
-                self.path_index += 1
-                if self.path_index >= len(self.path_points):
-                    self.follow_path = False
-                    self.goal = None
-                    direction = [0.0, 0.0, 0.0]
-                    distance = 0.0
-                else:
-                    target = self.path_points[self.path_index]
-                    direction = [
-                        target[0] - self.state.position[0],
-                        target[1] - self.state.position[1],
-                        target[2] - self.state.position[2],
-                    ]
-                    distance = math.sqrt(sum(d * d for d in direction))
-            if not self.follow_path or distance < 1e-6:
-                self.state.velocity = [0.0, 0.0, 0.0]
-            else:
-                direction = [d / distance for d in direction]
-                speed = self.max_speed
-                self.state.velocity = [direction[0] * speed, direction[1] * speed, direction[2] * speed]
+            self._follow_primitive(dt)
         elif self.goal is not None:
             direction = [self.goal[0] - self.state.position[0],
                          self.goal[1] - self.state.position[1],
@@ -137,23 +135,78 @@ class DroneSimulator:
                 self.state.velocity = [direction[0] * speed,
                                        direction[1] * speed,
                                        direction[2] * speed]
+            if distance > 1e-6:
+                self.desired_yaw = math.atan2(direction[1], direction[0])
+                horizontal = math.hypot(direction[0], direction[1])
+                self.desired_pitch = math.atan2(-direction[2], max(horizontal, 1e-4))
         else:
             self.state.velocity = [0.0, 0.0, 0.0]
 
         for i in range(3):
             self.state.position[i] += self.state.velocity[i] * dt
 
-        self.update_orientation()
+        self._track_attitude(dt)
 
-    def update_orientation(self) -> None:
-        speed = math.sqrt(sum(v * v for v in self.state.velocity))
-        if speed > 1e-4:
-            horizontal = math.hypot(self.state.velocity[0], self.state.velocity[1])
-            if horizontal > 1e-4:
-                self.state.yaw = math.atan2(self.state.velocity[1], self.state.velocity[0])
-            # Pitch the drone in the direction of travel; negative pitch means nose down when moving forward.
-            self.state.pitch = math.atan2(-self.state.velocity[2], max(horizontal, 1e-4))
-        quat = transformations.quaternion_from_euler(0.0, self.state.pitch, self.state.yaw)
+    def _follow_primitive(self, dt: float) -> None:
+        target = self.path_points[self.path_index]
+        direction = [
+            target[0] - self.state.position[0],
+            target[1] - self.state.position[1],
+            target[2] - self.state.position[2],
+        ]
+        distance = math.sqrt(sum(d * d for d in direction))
+        if distance < self.goal_tolerance or self.segment_time_remaining <= 0.0:
+            self.path_index += 1
+            if self.path_index >= len(self.path_points):
+                self.follow_path = False
+                self.goal = None
+                self.state.velocity = [0.0, 0.0, 0.0]
+                return
+            target = self.path_points[self.path_index]
+            direction = [
+                target[0] - self.state.position[0],
+                target[1] - self.state.position[1],
+                target[2] - self.state.position[2],
+            ]
+            distance = math.sqrt(sum(d * d for d in direction))
+            self.segment_time_remaining = self.primitive_dt
+
+        if distance < 1e-6:
+            self.state.velocity = [0.0, 0.0, 0.0]
+            return
+
+        direction = [d / distance for d in direction]
+        if self.segment_time_remaining > 1e-6:
+            target_speed = min(self.max_speed, distance / self.segment_time_remaining)
+        else:
+            target_speed = min(self.max_speed, distance / max(dt, 1e-3))
+        self.state.velocity = [direction[0] * target_speed, direction[1] * target_speed, direction[2] * target_speed]
+        self.segment_time_remaining = max(0.0, self.segment_time_remaining - dt)
+
+        if self.path_orientations and self.path_index < len(self.path_orientations):
+            pitch, yaw = self.path_orientations[self.path_index]
+            self.desired_pitch = pitch
+            self.desired_yaw = yaw
+
+    def _track_attitude(self, dt: float) -> None:
+        if not self.follow_path:
+            speed = math.sqrt(sum(v * v for v in self.state.velocity))
+            if speed > 1e-4:
+                horizontal = math.hypot(self.state.velocity[0], self.state.velocity[1])
+                if horizontal > 1e-4:
+                    self.desired_yaw = math.atan2(self.state.velocity[1], self.state.velocity[0])
+                self.desired_pitch = math.atan2(-self.state.velocity[2], max(horizontal, 1e-4))
+
+        yaw_error = math.atan2(math.sin(self.desired_yaw - self.state.yaw), math.cos(self.desired_yaw - self.state.yaw))
+        pitch_error = self.desired_pitch - self.state.pitch
+
+        yaw_rate = max(-self.max_yaw_rate, min(self.max_yaw_rate, self.attitude_gain * yaw_error))
+        pitch_rate = max(-self.max_pitch_rate, min(self.max_pitch_rate, self.attitude_gain * pitch_error))
+
+        self.state.yaw += yaw_rate * dt
+        self.state.pitch += pitch_rate * dt
+
+        quat = transformations.quaternion_from_euler(self.state.roll, self.state.pitch, self.state.yaw)
         self.state.orientation = tuple(quat)
 
     def publish_state(self) -> None:

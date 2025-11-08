@@ -27,7 +27,6 @@ from tf_conversions import transformations
 from autonomy_demo.safe_navigation import (
     clamp_normalized,
     compute_direction_from_pixel,
-    cubic_hermite_path,
     find_largest_safe_region,
     is_pixel_safe,
     project_direction_to_pixel,
@@ -180,7 +179,9 @@ class InferenceNode:
         rospy.Subscriber("drone/rgb/image_raw", Image, self.image_callback, queue_size=1)
         rospy.Subscriber("move_base_simple/goal", PoseStamped, self.goal_callback, queue_size=1)
 
-        self.trajectory_steps = int(rospy.get_param("~trajectory_steps", 12))
+        primitive_steps = int(rospy.get_param("~primitive_steps", 4))
+        self.primitive_steps = max(3, min(5, primitive_steps))
+        self.primitive_dt = float(rospy.get_param("~primitive_dt", 0.25))
 
     def camera_info_callback(self, info: CameraInfo) -> None:
         self.camera_info = info
@@ -354,15 +355,9 @@ class InferenceNode:
             origin,
             rotation,
             base_direction,
-            final_direction_local,
-            final_world_direction,
             yaw_offset,
             pitch_offset,
             commanded_speed,
-            safe_mask,
-            width,
-            height,
-            fov_deg,
         )
 
         command_vector_world = final_world_direction * commanded_speed
@@ -505,7 +500,7 @@ class InferenceNode:
             base_direction,
             yaw_offset,
             pitch_offset,
-            max(2, self.trajectory_steps),
+            max(2, self.primitive_steps),
         )
         for direction in directions:
             col, row = project_direction_to_pixel(direction, width, height, fov_deg)
@@ -522,53 +517,23 @@ class InferenceNode:
         pitch_offset: float,
         commanded_speed: float,
     ) -> np.ndarray:
-        steps = max(2, self.trajectory_steps)
+        steps = self.primitive_steps
         directions = sample_yopo_directions(base_direction, yaw_offset, pitch_offset, steps)
         points = [origin.astype(np.float32)]
-        segment_length = commanded_speed / max(1, steps)
+        segment_length = commanded_speed * max(self.primitive_dt, 1e-3)
         for direction_local in directions:
             world_dir = clamp_normalized(rotation.dot(direction_local))
             points.append(points[-1] + world_dir * segment_length)
         return np.asarray(points, dtype=np.float32)
-
-    def _path_is_safe_local(
-        self,
-        points: np.ndarray,
-        rotation: np.ndarray,
-        safe_mask: np.ndarray,
-        width: int,
-        height: int,
-        fov_deg: float,
-    ) -> bool:
-        if safe_mask.size == 0:
-            return False
-        local_basis = rotation.T
-        for idx in range(points.shape[0] - 1):
-            segment = points[idx + 1] - points[idx]
-            norm = float(np.linalg.norm(segment))
-            if norm < 1e-6:
-                continue
-            direction_world = segment / norm
-            direction_local = local_basis.dot(direction_world)
-            col, row = project_direction_to_pixel(direction_local, width, height, fov_deg)
-            if not is_pixel_safe(safe_mask, col, row):
-                return False
-        return True
 
     def _plan_trajectory_points(
         self,
         origin: np.ndarray,
         rotation: np.ndarray,
         base_direction: np.ndarray,
-        final_direction_local: np.ndarray,
-        final_direction_world: np.ndarray,
         yaw_offset: float,
         pitch_offset: float,
         commanded_speed: float,
-        safe_mask: np.ndarray,
-        width: int,
-        height: int,
-        fov_deg: float,
     ) -> np.ndarray:
         primitive = self._primitive_points(
             origin,
@@ -578,34 +543,6 @@ class InferenceNode:
             pitch_offset,
             commanded_speed,
         )
-
-        if self.goal_world is None or self.odom is None:
-            return primitive
-
-        odom_frame = self.odom.header.frame_id or "map"
-        if self.goal_frame and self.goal_frame not in ("", odom_frame):
-            rospy.logwarn_throttle(
-                5.0,
-                "Goal frame %s does not match odometry frame %s; following primitive path",
-                self.goal_frame,
-                odom_frame,
-            )
-            return primitive
-
-        goal_vector = self.goal_world - origin
-        distance_to_goal = float(np.linalg.norm(goal_vector))
-        if distance_to_goal <= self.goal_tolerance:
-            self.goal_world = None
-            return primitive
-        if distance_to_goal < 1e-3:
-            return primitive
-
-        steps = max(2, self.trajectory_steps)
-        tangent_start = final_direction_world * min(distance_to_goal, commanded_speed)
-        tangent_end = clamp_normalized(goal_vector) * min(distance_to_goal, commanded_speed * 0.5)
-        hermite_points = cubic_hermite_path(origin, self.goal_world, tangent_start, tangent_end, steps)
-        if self._path_is_safe_local(hermite_points, rotation, safe_mask, width, height, fov_deg):
-            return hermite_points.astype(np.float32)
         return primitive
 
     def _publish_trajectory(self, header, points: np.ndarray) -> None:
@@ -652,7 +589,7 @@ class InferenceNode:
             self._publish_empty_trajectory(stamp)
             return
         unit_vector = unit_vector / norm
-        steps = max(2, self.trajectory_steps)
+        steps = max(2, self.primitive_steps)
         step_length = self.default_speed / steps
 
         origin = np.array(

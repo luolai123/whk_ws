@@ -12,5 +12,7 @@
   <node pkg="autonomy_demo" type="inference_node.py" name="distance_inference" output="screen">
     <param name="model_path" value="$(arg model_path)" />
     <param name="policy_path" value="$(arg policy_path)" />
+    <param name="primitive_steps" value="4" />
+    <param name="primitive_dt" value="0.25" />
   </node>
 </launch>
