@@ -3,13 +3,13 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import rospy
 import tf2_ros
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from tf_conversions import transformations
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -39,11 +39,15 @@ class DroneSimulator:
             pitch=0.0,
         )
         self.goal: Optional[list] = None
+        self.path_points: List[List[float]] = []
+        self.path_index = 0
+        self.follow_path = False
 
         self.pose_pub = rospy.Publisher("drone/pose", PoseStamped, queue_size=1)
         self.odom_pub = rospy.Publisher("drone/odometry", Odometry, queue_size=1)
         self.goal_sub = rospy.Subscriber("move_base_simple/goal", PoseStamped, self.goal_callback)
         self.marker_pub = rospy.Publisher("drone/visualization", MarkerArray, queue_size=1)
+        self.path_sub = rospy.Subscriber("drone/safe_trajectory", Path, self.trajectory_callback, queue_size=1)
 
         self.tf_broadcaster = tf2_ros.TransformBroadcaster()
         rospy.loginfo("Drone simulator initialized")
@@ -53,9 +57,73 @@ class DroneSimulator:
         if self.goal[2] <= 0.1:
             self.goal[2] = self.default_altitude
         rospy.loginfo("Received new goal: %s", self.goal)
+        self.follow_path = False
+        self.path_points = []
+        self.path_index = 0
+
+    def trajectory_callback(self, msg: Path) -> None:
+        if not msg.poses:
+            return
+        points: List[List[float]] = []
+        for pose in msg.poses:
+            points.append(
+                [
+                    pose.pose.position.x,
+                    pose.pose.position.y,
+                    pose.pose.position.z if pose.pose.position.z > 0.0 else self.default_altitude,
+                ]
+            )
+        self.path_points = points
+        self.path_index = 1 if len(points) > 1 else 0
+        if self.path_points:
+            current = self.state.position
+            best_idx = self.path_index
+            best_dist = float("inf")
+            for idx, point in enumerate(self.path_points[1:], start=1):
+                dist = math.sqrt(
+                    (point[0] - current[0]) ** 2
+                    + (point[1] - current[1]) ** 2
+                    + (point[2] - current[2]) ** 2
+                )
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            self.path_index = best_idx
+        self.follow_path = len(self.path_points) > 1
+        if self.path_points:
+            self.goal = self.path_points[-1][:]
 
     def step(self, dt: float) -> None:
-        if self.goal is not None:
+        if self.follow_path and self.path_points and self.path_index < len(self.path_points):
+            target = self.path_points[self.path_index]
+            direction = [
+                target[0] - self.state.position[0],
+                target[1] - self.state.position[1],
+                target[2] - self.state.position[2],
+            ]
+            distance = math.sqrt(sum(d * d for d in direction))
+            if distance < self.goal_tolerance:
+                self.path_index += 1
+                if self.path_index >= len(self.path_points):
+                    self.follow_path = False
+                    self.goal = None
+                    direction = [0.0, 0.0, 0.0]
+                    distance = 0.0
+                else:
+                    target = self.path_points[self.path_index]
+                    direction = [
+                        target[0] - self.state.position[0],
+                        target[1] - self.state.position[1],
+                        target[2] - self.state.position[2],
+                    ]
+                    distance = math.sqrt(sum(d * d for d in direction))
+            if not self.follow_path or distance < 1e-6:
+                self.state.velocity = [0.0, 0.0, 0.0]
+            else:
+                direction = [d / distance for d in direction]
+                speed = self.max_speed
+                self.state.velocity = [direction[0] * speed, direction[1] * speed, direction[2] * speed]
+        elif self.goal is not None:
             direction = [self.goal[0] - self.state.position[0],
                          self.goal[1] - self.state.position[1],
                          self.goal[2] - self.state.position[2]]

@@ -10,58 +10,138 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Subset, random_split
+from torch.utils.data import DataLoader, Dataset
 
 from autonomy_demo.safe_navigation import (
     compute_direction_from_pixel,
-    find_largest_safe_region
+    find_largest_safe_region,
+    path_smoothness,
+    sample_yopo_directions,
 )
+
+
+class ConvBlock(torch.nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.block = torch.nn.Sequential(
+            torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(out_channels),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(out_channels),
+            torch.nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class UpBlock(torch.nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.up = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.conv = ConvBlock(in_channels, out_channels)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        diff_y = skip.size(2) - x.size(2)
+        diff_x = skip.size(3) - x.size(3)
+        if diff_y != 0 or diff_x != 0:
+            x = F.pad(
+                x,
+                [diff_x // 2, diff_x - diff_x // 2, diff_y // 2, diff_y - diff_y // 2],
+            )
+        x = torch.cat([skip, x], dim=1)
+        return self.conv(x)
 
 
 class DistanceClassifier(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.encoder = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 16, kernel_size=3, padding=1),
-            torch.nn.BatchNorm2d(16),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Conv2d(16, 32, kernel_size=3, padding=1, stride=2),
-            torch.nn.BatchNorm2d(32),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2),
-            torch.nn.BatchNorm2d(64),
-            torch.nn.ReLU(inplace=True),
-        )
-        self.decoder = torch.nn.Sequential(
-            torch.nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Conv2d(16, 2, kernel_size=1),
-        )
+        self.enc1 = ConvBlock(3, 32)
+        self.enc2 = ConvBlock(32, 64)
+        self.enc3 = ConvBlock(64, 128)
+        self.pool = torch.nn.MaxPool2d(2)
+        self.bottleneck = ConvBlock(128, 256)
+        self.up3 = UpBlock(256, 128)
+        self.up2 = UpBlock(128, 64)
+        self.up1 = UpBlock(64, 32)
+        self.classifier = torch.nn.Conv2d(32, 2, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.encoder(x)
-        x = self.decoder(x)
-        return x
+        x1 = self.enc1(x)
+        x2 = self.enc2(self.pool(x1))
+        x3 = self.enc3(self.pool(x2))
+        bottleneck = self.bottleneck(self.pool(x3))
+        x = self.up3(bottleneck, x3)
+        x = self.up2(x, x2)
+        x = self.up1(x, x1)
+        return self.classifier(x)
 
 
 class ObstacleDataset(Dataset):
-    def __init__(self, data_dir: pathlib.Path) -> None:
+    def __init__(
+        self,
+        data_dir: pathlib.Path,
+        indices: Optional[List[int]] = None,
+        augment: bool = False,
+    ) -> None:
         self.files: List[pathlib.Path] = sorted(data_dir.glob("*.npz"))
         if not self.files:
             raise FileNotFoundError(f"No samples found in {data_dir}")
+        if indices is None:
+            self.indices = list(range(len(self.files)))
+        else:
+            self.indices = list(indices)
+        self.augment = augment
 
     def __len__(self) -> int:
-        return len(self.files)
+        return len(self.indices)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        sample = np.load(self.files[idx])
+        file_path = self.files[self.indices[idx]]
+        sample = np.load(file_path)
         image = sample["image"].astype(np.float32) / 255.0
         label = sample["label"].astype(np.int64)
+
+        if self.augment:
+            if random.random() < 0.5:
+                image = np.flip(image, axis=1).copy()
+                label = np.flip(label, axis=1).copy()
+            if random.random() < 0.25:
+                brightness = 0.1 * (random.random() - 0.5)
+                image = np.clip(image + brightness, 0.0, 1.0).astype(np.float32)
+            if random.random() < 0.2:
+                noise = np.random.normal(0.0, 0.02, size=image.shape).astype(np.float32)
+                image = np.clip(image + noise, 0.0, 1.0).astype(np.float32)
+
         image_tensor = torch.from_numpy(image).permute(2, 0, 1)
         label_tensor = torch.from_numpy(label)
         return image_tensor, label_tensor
+
+    def estimate_class_weights(self, sample_limit: int = 256) -> torch.Tensor:
+        safe_pixels = 0
+        obstacle_pixels = 0
+        sample_indices = self.indices
+        if len(sample_indices) > sample_limit:
+            sample_indices = random.sample(sample_indices, sample_limit)
+        for idx in sample_indices:
+            sample = np.load(self.files[idx])
+            label = sample["label"].astype(np.int64)
+            safe_pixels += int(np.count_nonzero(label == 0))
+            obstacle_pixels += int(np.count_nonzero(label == 1))
+
+        total = safe_pixels + obstacle_pixels
+        if total == 0:
+            return torch.ones(2, dtype=torch.float32)
+
+        freq_safe = safe_pixels / total
+        freq_obstacle = obstacle_pixels / total
+        weights = torch.tensor(
+            [1.0 / max(freq_safe, 1e-6), 1.0 / max(freq_obstacle, 1e-6)], dtype=torch.float32
+        )
+        weights = weights / weights.sum() * 2.0
+        return weights
 
 
 class NavigationDataset(Dataset):
@@ -125,6 +205,29 @@ class SafeNavigationPolicy(torch.nn.Module):
         return output
 
 
+class SegmentationLoss(torch.nn.Module):
+    def __init__(
+        self, class_weights: Optional[torch.Tensor] = None, dice_weight: float = 1.0
+    ) -> None:
+        super().__init__()
+        if class_weights is not None:
+            self.register_buffer("class_weights", class_weights.view(-1))
+        else:
+            self.class_weights = None  # type: ignore[assignment]
+        self.dice_weight = float(dice_weight)
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(logits, labels, weight=self.class_weights)
+        probs = torch.softmax(logits, dim=1)
+        labels_one_hot = F.one_hot(labels, num_classes=probs.shape[1]).permute(0, 3, 1, 2)
+        labels_one_hot = labels_one_hot.to(dtype=probs.dtype)
+        dims = (0, 2, 3)
+        intersection = torch.sum(probs * labels_one_hot, dim=dims)
+        cardinality = torch.sum(probs + labels_one_hot, dim=dims)
+        dice = 1.0 - (2.0 * intersection + 1e-6) / (cardinality + 1e-6)
+        return ce + self.dice_weight * dice.mean()
+
+
 def quaternion_to_matrix(quat: np.ndarray) -> np.ndarray:
     x, y, z, w = quat
     norm = math.sqrt(x * x + y * y + z * z + w * w)
@@ -181,6 +284,49 @@ def add_noise(mask: np.ndarray, noise_rate: float) -> np.ndarray:
     return noisy
 
 
+def evaluate_classifier(
+    model: DistanceClassifier,
+    loader: DataLoader,
+    device: torch.device,
+) -> Optional[Dict[str, float]]:
+    if len(loader.dataset) == 0:
+        return None
+
+    model.eval()
+    safe_tp = 0
+    safe_fp = 0
+    safe_fn = 0
+    total_correct = 0
+    total_pixels = 0
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            logits = model(images)
+            preds = torch.argmax(logits, dim=1)
+
+            safe_pred = preds == 0
+            safe_true = labels == 0
+            safe_tp += int(torch.logical_and(safe_pred, safe_true).sum().item())
+            safe_fp += int(torch.logical_and(safe_pred, ~safe_true).sum().item())
+            safe_fn += int(torch.logical_and(~safe_pred, safe_true).sum().item())
+            total_correct += int((preds == labels).sum().item())
+            total_pixels += labels.numel()
+
+    union = safe_tp + safe_fp + safe_fn
+    iou = safe_tp / union if union > 0 else 0.0
+    precision = safe_tp / (safe_tp + safe_fp) if (safe_tp + safe_fp) > 0 else 0.0
+    recall = safe_tp / (safe_tp + safe_fn) if (safe_tp + safe_fn) > 0 else 0.0
+    accuracy = total_correct / total_pixels if total_pixels > 0 else 0.0
+    return {
+        "iou": iou,
+        "precision": precision,
+        "recall": recall,
+        "accuracy": accuracy,
+    }
+
+
 def train(
     model: DistanceClassifier,
     train_loader: DataLoader,
@@ -189,7 +335,18 @@ def train(
     epochs: int,
     lr: float,
 ) -> Tuple[List[float], List[float]]:
-    criterion = torch.nn.CrossEntropyLoss()
+    class_weights: Optional[torch.Tensor] = None
+    if isinstance(train_loader.dataset, ObstacleDataset):
+        class_weights = train_loader.dataset.estimate_class_weights()
+    elif isinstance(train_loader.dataset, Dataset) and hasattr(train_loader.dataset, "dataset"):
+        base = getattr(train_loader.dataset, "dataset")
+        if isinstance(base, ObstacleDataset):
+            class_weights = base.estimate_class_weights()
+
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
+
+    criterion = SegmentationLoss(class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     train_losses: List[float] = []
     val_losses: List[float] = []
@@ -221,7 +378,24 @@ def train(
         avg_val_loss = running_val / max(1, len(val_loader))
         val_losses.append(avg_val_loss)
 
-        print(f"Epoch {epoch + 1}/{epochs} - train loss: {avg_train_loss:.4f}, val loss: {avg_val_loss:.4f}")
+        metrics = evaluate_classifier(model, val_loader, device)
+        if metrics is None:
+            print(
+                f"Epoch {epoch + 1}/{epochs} - train loss: {avg_train_loss:.4f}, val loss: {avg_val_loss:.4f}"
+            )
+        else:
+            print(
+                "Epoch {}/{} - train loss: {:.4f}, val loss: {:.4f}, IoU: {:.3f}, Acc: {:.3f}, Prec: {:.3f}, Rec: {:.3f}".format(
+                    epoch + 1,
+                    epochs,
+                    avg_train_loss,
+                    avg_val_loss,
+                    metrics["iou"],
+                    metrics["accuracy"],
+                    metrics["precision"],
+                    metrics["recall"],
+                )
+            )
     return train_losses, val_losses
 
 
@@ -267,6 +441,8 @@ def train_navigation_policy(
     tan_half_v_t = torch.tensor(tan_half_v, device=device)
     pitch_limit = torch.tensor(math.radians(15.0), device=device)
     yaw_limit = torch.tensor(math.radians(15.0), device=device)
+    diag = math.sqrt(dataset.width ** 2 + dataset.height ** 2)
+    diag_t = torch.tensor(diag, device=device)
 
     indices = list(range(len(dataset)))
 
@@ -275,6 +451,13 @@ def train_navigation_policy(
         epoch_loss = 0.0
         epoch_count = 0
         policy.train()
+        metrics_accumulator = {
+            "safety": 0.0,
+            "goal": 0.0,
+            "stability": 0.0,
+            "smoothness": 0.0,
+            "speed": 0.0,
+        }
 
         for start in range(0, len(indices), batch_size):
             batch = indices[start : start + batch_size]
@@ -363,9 +546,10 @@ def train_navigation_policy(
 
                 center_col_t = torch.tensor(center_col, device=device, dtype=torch.float32)
                 center_row_t = torch.tensor(center_row, device=device, dtype=torch.float32)
-                accuracy_col = torch.exp(-((col - center_col_t) / dataset.width) ** 2)
-                accuracy_row = torch.exp(-((row - center_row_t) / dataset.height) ** 2)
-                accuracy_score = 0.5 * (accuracy_col + accuracy_row)
+                goal_distance = torch.sqrt(
+                    (col - center_col_t) ** 2 + (row - center_row_t) ** 2
+                )
+                goal_score = torch.exp(-(goal_distance / diag_t))
 
                 stability_penalty = (
                     torch.abs(length_scale - 1.0) / 0.2
@@ -374,10 +558,43 @@ def train_navigation_policy(
                 ) / 3.0
                 stability_score = torch.exp(-stability_penalty)
 
-                reward = 0.5 * safety_score + 0.3 * accuracy_score + 0.2 * stability_score
+                smoothness_penalty = torch.sqrt(
+                    (yaw_offset / yaw_limit) ** 2 + (pitch_offset / pitch_limit) ** 2
+                )
+                smoothness_score = torch.exp(-smoothness_penalty)
+
+                commanded_speed = speed * length_scale
+                speed_penalty = torch.abs(commanded_speed - speed) / torch.clamp(speed, min=1.0)
+                speed_score = torch.exp(-speed_penalty)
+
+                reward = (
+                    0.35 * safety_score
+                    + 0.25 * goal_score
+                    + 0.15 * stability_score
+                    + 0.15 * smoothness_score
+                    + 0.10 * speed_score
+                )
                 loss = -reward
                 batch_loss += loss
                 valid_samples += 1
+
+                metrics_accumulator["safety"] += float(safety_score.detach().cpu())
+                metrics_accumulator["goal"] += float(goal_score.detach().cpu())
+                metrics_accumulator["stability"] += float(stability_score.detach().cpu())
+                metrics_accumulator["speed"] += float(speed_score.detach().cpu())
+
+                dirs = sample_yopo_directions(
+                    base_direction_np,
+                    float(yaw_offset.detach().cpu().numpy()),
+                    float(pitch_offset.detach().cpu().numpy()),
+                    6,
+                )
+                points = [np.zeros(3, dtype=np.float32)]
+                for direction in dirs:
+                    points.append(points[-1] + direction)
+                trajectory_smooth = path_smoothness(points)
+                metrics_accumulator["smoothness"] += trajectory_smooth
+                epoch_count += 1
 
             if valid_samples == 0:
                 continue
@@ -386,13 +603,29 @@ def train_navigation_policy(
             optimizer.step()
 
             epoch_loss += batch_loss.item() * valid_samples
-            epoch_count += valid_samples
 
         if epoch_count:
             avg_loss = epoch_loss / epoch_count
         else:
             avg_loss = float("nan")
-        print(f"Policy epoch {epoch + 1}/{epochs} - avg loss: {avg_loss:.4f}")
+        if epoch_count:
+            averaged_metrics = {
+                key: value / epoch_count for key, value in metrics_accumulator.items()
+            }
+            print(
+                "Policy epoch {}/{} - avg loss: {:.4f}, safety: {:.3f}, goal: {:.3f}, stability: {:.3f}, speed: {:.3f}, smoothness: {:.3f}".format(
+                    epoch + 1,
+                    epochs,
+                    avg_loss,
+                    averaged_metrics["safety"],
+                    averaged_metrics["goal"],
+                    averaged_metrics["stability"],
+                    averaged_metrics["speed"],
+                    averaged_metrics["smoothness"],
+                )
+            )
+        else:
+            print(f"Policy epoch {epoch + 1}/{epochs} - avg loss: {avg_loss:.4f}")
 
     policy_output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(policy.state_dict(), policy_output)
@@ -423,20 +656,28 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset = ObstacleDataset(args.dataset)
-    if len(dataset) < 2:
-        train_set = Subset(dataset, list(range(len(dataset))))
-        val_set = Subset(dataset, [])
+    full_dataset = ObstacleDataset(args.dataset)
+    total_len = len(full_dataset)
+    all_indices = list(range(total_len))
+    random.shuffle(all_indices)
+
+    if total_len < 2:
+        train_indices = all_indices
+        val_indices: List[int] = []
     else:
-        val_len = max(1, int(len(dataset) * args.val_split))
-        train_len = len(dataset) - val_len
+        val_len = max(1, int(total_len * args.val_split))
+        train_len = total_len - val_len
         if train_len <= 0:
             train_len = 1
-            val_len = len(dataset) - train_len
-        train_set, val_set = random_split(dataset, [train_len, val_len])
+            val_len = total_len - train_len
+        val_indices = all_indices[:val_len]
+        train_indices = all_indices[val_len:]
 
-    train_loader = DataLoader(train_set, batch_size=args.batch, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch)
+    train_dataset = ObstacleDataset(args.dataset, indices=train_indices, augment=True)
+    val_dataset = ObstacleDataset(args.dataset, indices=val_indices, augment=False)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch)
 
     model = DistanceClassifier().to(device)
     train(model, train_loader, val_loader, device, args.epochs, args.lr)

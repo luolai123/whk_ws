@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -215,3 +215,73 @@ def sample_yopo_directions(
             )
         )
     return directions
+
+
+def cubic_hermite_path(
+    start: np.ndarray,
+    goal: np.ndarray,
+    tangent_start: np.ndarray,
+    tangent_end: np.ndarray,
+    steps: int,
+) -> np.ndarray:
+    """Generate a cubic Hermite path blending a primitive into a goal."""
+
+    start = np.asarray(start, dtype=np.float32)
+    goal = np.asarray(goal, dtype=np.float32)
+    tangent_start = np.asarray(tangent_start, dtype=np.float32)
+    tangent_end = np.asarray(tangent_end, dtype=np.float32)
+    steps = max(1, int(steps))
+
+    points = np.zeros((steps + 1, 3), dtype=np.float32)
+    for idx in range(steps + 1):
+        t = idx / float(steps)
+        t2 = t * t
+        t3 = t2 * t
+        h00 = 2 * t3 - 3 * t2 + 1
+        h10 = t3 - 2 * t2 + t
+        h01 = -2 * t3 + 3 * t2
+        h11 = t3 - t2
+        points[idx] = (
+            h00 * start
+            + h10 * tangent_start
+            + h01 * goal
+            + h11 * tangent_end
+        )
+    return points
+
+
+def path_smoothness(points: Iterable[np.ndarray]) -> float:
+    """Return a smoothness score based on successive direction changes."""
+
+    vectors: List[np.ndarray] = []
+    previous: Optional[np.ndarray] = None
+    for pt in points:
+        current = np.asarray(pt, dtype=np.float32)
+        if previous is not None:
+            delta = current - previous
+            norm = float(np.linalg.norm(delta))
+            if norm > 1e-6:
+                vectors.append(delta / norm)
+        previous = current
+
+    if len(vectors) < 2:
+        return 1.0
+
+    total_angle = 0.0
+    for idx in range(1, len(vectors)):
+        dot = float(np.dot(vectors[idx - 1], vectors[idx]))
+        dot = max(-1.0, min(1.0, dot))
+        total_angle += abs(math.acos(dot))
+
+    avg_angle = total_angle / max(1, len(vectors) - 1)
+    return math.exp(-avg_angle)
+
+
+def clamp_normalized(vec: np.ndarray) -> np.ndarray:
+    """Return ``vec`` normalized to unit length with safe fallback."""
+
+    vec = np.asarray(vec, dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if norm < 1e-6:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    return vec / norm

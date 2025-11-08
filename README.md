@@ -6,11 +6,11 @@ This workspace contains a complete ROS1 (Noetic) simulation for a UAV navigating
 
 - **Random obstacle world** featuring a mix of colorful boxes and spheres published as `visualization_msgs/MarkerArray` and `nav_msgs/OccupancyGrid`, ready for RViz visualization and programmatic access.
 - **Configurable environment scale** with tunable obstacle density, size ranges, and shape ratios.
-- **Kinematic UAV simulator** that responds to RViz 2D Nav Goal inputs and publishes pose/odometry data.
+- **Kinematic UAV simulator** that consumes YOPO motion primitives from the inference stack (when available), otherwise falling back to direct goal chasing, while publishing pose/odometry data.
 - **Synthetic RGB camera** that renders obstacle distances into color-coded imagery with optional torch-powered acceleration.
 - **Automated data collection** pipeline that records RGB frames with near/far obstacle labels using analytic distance computation, reusing the same accelerated ray casting path as the camera.
-- **PyTorch training utilities** for a two-class distance classifier and an inference node that streams classification maps in real time.
-- **Binary-image-driven safe navigation** that extracts dominant safe zones, emits YOPO-style motion primitives with full trajectory visualization, and evaluates torch-trained offset policies in under 2 ms per frame.
+- **PyTorch training utilities** featuring a UNet-style distance classifier trained with class-balanced augmentation plus cross-entropy + dice loss, along with detailed IoU/precision/recall reporting.
+- **Binary-image-driven safe navigation** that extracts dominant safe zones, emits YOPO-style motion primitives with full trajectory visualization, optimizes differentiable policies for 3–7 m/s flight, and evaluates offsets in under 2 ms per frame.
 
 ## Prerequisites
 
@@ -48,7 +48,7 @@ roslaunch autonomy_demo sim.launch
 ```
 
 - RViz loads with the preconfigured view (`config/world.rviz`).
-- Use the **2D Nav Goal** tool in RViz to command the drone. The `drone_simulator` node will move toward the clicked goal at a fixed altitude.
+- Use the **2D Nav Goal** tool in RViz to command the drone. When the inference node is running the UAV will follow the published safe trajectory all the way to the goal; otherwise it flies the straight-line fallback at a fixed altitude.
 - Obstacle markers and the occupancy grid appear in RViz under the `/world/obstacles` and `/world/occupancy` topics.
 - The synthetic RGB stream is visible on `/drone/rgb/image_raw`.
 
@@ -119,7 +119,8 @@ python3 src/autonomy_demo/training/train_classifier.py \
 ```
 
 - The script still splits the dataset for validation and saves the classifier weights to `model.pt`.
-- A second differentiable reinforcement-learning loop optimizes the safe-navigation policy across 3–7 m/s speeds using the stored obstacle geometry; the learned offsets are written to `navigation_policy.pt`.
+- The classifier stage applies horizontal flips, brightness/noise augmentation, and class-balanced weighting; each epoch reports training/validation loss together with safe-class IoU, precision, recall, and accuracy.
+- A second differentiable reinforcement-learning loop optimizes the safe-navigation policy across 3–7 m/s speeds using the stored obstacle geometry; the learned offsets are written to `navigation_policy.pt`. The reward blends safety, goal alignment, smoothness, speed regulation, and stability, and the console summarizes the averaged metrics every epoch.
 - Use `--no_policy` to skip the policy stage when you only need the segmentation network.
 - Adjust hyperparameters as needed. GPU acceleration is used automatically when CUDA is available.
 
@@ -134,15 +135,17 @@ roslaunch autonomy_demo inference.launch \
 ```
 
 - The `distance_inference` node subscribes to the RGB stream, produces the binary classification overlay on `/drone/rgb/distance_class`, and extracts the largest contiguous safe zone (default minimum area 5%).
-- A differentiable policy evaluates the noisy safe mask and current airspeed to emit motion primitives, YOPO-inspired trajectories, and offset recommendations. Outputs are published on:
+- The classifier output is smoothed with a probability threshold (`~safe_probability_threshold`, default 0.55) and morphological cleanup before region extraction, which helps the downstream policy maintain crisp masks.
+- A differentiable policy evaluates the noisy safe mask and current airspeed to emit motion primitives, YOPO-inspired trajectories that terminate at the active goal, and offset recommendations. Outputs are published on:
   - `/drone/safe_center` (`geometry_msgs/PointStamped`): normalized safe-zone centroid and area fraction.
   - `/drone/movement_primitive` (`geometry_msgs/Vector3Stamped`): base vector toward the safe centroid with current-speed magnitude.
   - `/drone/movement_command` (`geometry_msgs/Vector3Stamped`): final command after applying length/angle offsets.
   - `/drone/movement_offsets` (`std_msgs/Float32MultiArray`): `[length_scale, pitch_deg, yaw_deg]` adjustments chosen by the policy.
   - `/drone/fallback_primitives` (`geometry_msgs/PoseArray`): rear/side slip options that remain available when no safe region is detected.
-  - `/drone/safe_trajectory` (`nav_msgs/Path`): YOPO-blended path for the selected safe primitive, suitable for RViz overlays.
+  - `/drone/safe_trajectory` (`nav_msgs/Path`): YOPO-blended path for the selected safe primitive that finishes at the requested goal and is tracked directly by the simulator.
 - End-to-end processing is throttled to under 2 ms per frame; the node logs a warning if runtime exceeds the budget.
 - RViz continues to display the RGB feed, the classification overlay, and the drone model. Use the 2D Nav Goal tool to validate how the navigation cues react to new viewpoints.
+- Tune `~goal_tolerance` (default 0.3 m) to adjust how close the drone must get before a goal is considered complete.
 
 ## File Overview
 

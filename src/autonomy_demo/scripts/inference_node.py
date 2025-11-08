@@ -9,6 +9,8 @@ from typing import List, Optional, Tuple
 import numpy as np
 import rospy
 import torch
+import torch.nn.functional as F
+import cv2
 from cv_bridge import CvBridge
 from geometry_msgs.msg import (
     PointStamped,
@@ -19,11 +21,13 @@ from geometry_msgs.msg import (
 )
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Header
 from tf_conversions import transformations
 
 from autonomy_demo.safe_navigation import (
+    clamp_normalized,
     compute_direction_from_pixel,
+    cubic_hermite_path,
     find_largest_safe_region,
     is_pixel_safe,
     project_direction_to_pixel,
@@ -32,32 +36,63 @@ from autonomy_demo.safe_navigation import (
 )
 
 
-class DistanceClassifier(torch.nn.Module):
-    def __init__(self) -> None:
+class ConvBlock(torch.nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
-        self.encoder = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 16, kernel_size=3, padding=1),
-            torch.nn.BatchNorm2d(16),
+        self.block = torch.nn.Sequential(
+            torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(out_channels),
             torch.nn.ReLU(inplace=True),
-            torch.nn.Conv2d(16, 32, kernel_size=3, padding=1, stride=2),
-            torch.nn.BatchNorm2d(32),
+            torch.nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(out_channels),
             torch.nn.ReLU(inplace=True),
-            torch.nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2),
-            torch.nn.BatchNorm2d(64),
-            torch.nn.ReLU(inplace=True),
-        )
-        self.decoder = torch.nn.Sequential(
-            torch.nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Conv2d(16, 2, kernel_size=1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.encoder(x)
-        x = self.decoder(x)
-        return x
+        return self.block(x)
+
+
+class UpBlock(torch.nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.up = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.conv = ConvBlock(in_channels, out_channels)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        diff_y = skip.size(2) - x.size(2)
+        diff_x = skip.size(3) - x.size(3)
+        if diff_y != 0 or diff_x != 0:
+            x = F.pad(
+                x,
+                [diff_x // 2, diff_x - diff_x // 2, diff_y // 2, diff_y - diff_y // 2],
+            )
+        x = torch.cat([skip, x], dim=1)
+        return self.conv(x)
+
+
+class DistanceClassifier(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.enc1 = ConvBlock(3, 32)
+        self.enc2 = ConvBlock(32, 64)
+        self.enc3 = ConvBlock(64, 128)
+        self.pool = torch.nn.MaxPool2d(2)
+        self.bottleneck = ConvBlock(128, 256)
+        self.up3 = UpBlock(256, 128)
+        self.up2 = UpBlock(128, 64)
+        self.up1 = UpBlock(64, 32)
+        self.classifier = torch.nn.Conv2d(32, 2, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = self.enc1(x)
+        x2 = self.enc2(self.pool(x1))
+        x3 = self.enc3(self.pool(x2))
+        bottleneck = self.bottleneck(self.pool(x3))
+        x = self.up3(bottleneck, x3)
+        x = self.up2(x, x2)
+        x = self.up1(x, x1)
+        return self.classifier(x)
 
 
 class SafeNavigationPolicy(torch.nn.Module):
@@ -121,12 +156,16 @@ class InferenceNode:
 
         self.min_safe_fraction = float(rospy.get_param("~min_safe_fraction", 0.05))
         self.default_speed = float(rospy.get_param("~default_speed", 3.0))
+        self.safe_threshold = float(rospy.get_param("~safe_probability_threshold", 0.55))
+        self.goal_tolerance = float(rospy.get_param("~goal_tolerance", 0.3))
 
         self.camera_info: Optional[CameraInfo] = None
         self.odom: Optional[Odometry] = None
         self.tan_half_h: Optional[float] = None
         self.tan_half_v: Optional[float] = None
         self.image_shape: Optional[Tuple[int, int]] = None
+        self.goal_world: Optional[np.ndarray] = None
+        self.goal_frame: Optional[str] = None
 
         self.label_pub = rospy.Publisher("drone/rgb/distance_class", Image, queue_size=1)
         self.safe_center_pub = rospy.Publisher("drone/safe_center", PointStamped, queue_size=1)
@@ -139,6 +178,7 @@ class InferenceNode:
         rospy.Subscriber("drone/rgb/camera_info", CameraInfo, self.camera_info_callback, queue_size=1)
         rospy.Subscriber("drone/odometry", Odometry, self.odom_callback, queue_size=1)
         rospy.Subscriber("drone/rgb/image_raw", Image, self.image_callback, queue_size=1)
+        rospy.Subscriber("move_base_simple/goal", PoseStamped, self.goal_callback, queue_size=1)
 
         self.trajectory_steps = int(rospy.get_param("~trajectory_steps", 12))
 
@@ -156,6 +196,14 @@ class InferenceNode:
 
     def odom_callback(self, msg: Odometry) -> None:
         self.odom = msg
+
+    def goal_callback(self, msg: PoseStamped) -> None:
+        self.goal_world = np.array(
+            [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z], dtype=np.float32
+        )
+        self.goal_frame = msg.header.frame_id or "map"
+        if self.odom is not None and abs(self.goal_world[2]) < 1e-3:
+            self.goal_world[2] = float(self.odom.pose.pose.position.z)
 
     def _ensure_policy(self) -> None:
         if self.policy is not None:
@@ -186,12 +234,21 @@ class InferenceNode:
         with torch.no_grad():
             logits = self.model(tensor)
             probs = self.softmax(logits)
-        classes = torch.argmax(probs, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
-        safe_mask = classes == 0
 
-        color_map = np.zeros((*classes.shape, 3), dtype=np.uint8)
-        color_map[:, :, 1] = np.where(classes == 0, 200, 0)
-        color_map[:, :, 0] = np.where(classes == 1, 200, 0)
+        safe_prob = probs[:, 0, :, :].squeeze(0).cpu().numpy()
+        obstacle_prob = probs[:, 1, :, :].squeeze(0).cpu().numpy()
+        safe_prob = cv2.GaussianBlur(safe_prob, (5, 5), 0)
+        obstacle_prob = cv2.GaussianBlur(obstacle_prob, (5, 5), 0)
+        safe_mask = safe_prob >= self.safe_threshold
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        cleaned = cv2.morphologyEx(safe_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+        safe_mask = cleaned.astype(bool)
+
+        color_map = np.zeros((height, width, 3), dtype=np.uint8)
+        color_map[:, :, 1] = np.clip(safe_prob * 255.0, 0, 255).astype(np.uint8)
+        color_map[:, :, 0] = np.clip(obstacle_prob * 255.0, 0, 255).astype(np.uint8)
+        color_map[:, :, 2] = np.clip((1.0 - safe_prob) * 80.0, 0, 255).astype(np.uint8)
         label_msg = self.bridge.cv2_to_imgmsg(color_map, encoding="rgb8")
         label_msg.header = msg.header
         label_msg.header.frame_id = rospy.get_param("~output_frame", msg.header.frame_id)
@@ -216,6 +273,14 @@ class InferenceNode:
 
         fov_deg = math.degrees(2.0 * math.atan(self.tan_half_h))
         base_direction = compute_direction_from_pixel(center_col, center_row, width, height, fov_deg)
+        origin = np.array(
+            [
+                self.odom.pose.pose.position.x,
+                self.odom.pose.pose.position.y,
+                self.odom.pose.pose.position.z,
+            ],
+            dtype=np.float32,
+        )
         rotation = transformations.quaternion_matrix(
             [
                 self.odom.pose.pose.orientation.x,
@@ -224,8 +289,7 @@ class InferenceNode:
                 self.odom.pose.pose.orientation.w,
             ]
         )[0:3, 0:3]
-        base_world_direction = rotation.dot(base_direction)
-        base_world_direction /= np.linalg.norm(base_world_direction)
+        base_world_direction = clamp_normalized(rotation.dot(base_direction))
 
         velocity = self.odom.twist.twist.linear
         speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
@@ -284,9 +348,29 @@ class InferenceNode:
         )
         final_direction_local = rotate_direction(base_direction, yaw_offset, pitch_offset)
 
-        final_world_direction = rotation.dot(final_direction_local)
-        final_world_direction /= np.linalg.norm(final_world_direction)
-        final_vector_world = final_world_direction * (speed * length_scale)
+        final_world_direction = clamp_normalized(rotation.dot(final_direction_local))
+        commanded_speed = speed * length_scale
+        path_points = self._plan_trajectory_points(
+            origin,
+            rotation,
+            base_direction,
+            final_direction_local,
+            final_world_direction,
+            yaw_offset,
+            pitch_offset,
+            commanded_speed,
+            safe_mask,
+            width,
+            height,
+            fov_deg,
+        )
+
+        command_vector_world = final_world_direction * commanded_speed
+        if path_points.shape[0] >= 2:
+            initial_segment = path_points[1] - path_points[0]
+            seg_norm = float(np.linalg.norm(initial_segment))
+            if seg_norm > 1e-6:
+                command_vector_world = initial_segment / seg_norm * commanded_speed
 
         primitive_msg = Vector3Stamped()
         primitive_msg.header = msg.header
@@ -297,24 +381,16 @@ class InferenceNode:
 
         command_msg = Vector3Stamped()
         command_msg.header = msg.header
-        command_msg.vector.x = final_vector_world[0]
-        command_msg.vector.y = final_vector_world[1]
-        command_msg.vector.z = final_vector_world[2]
+        command_msg.vector.x = command_vector_world[0]
+        command_msg.vector.y = command_vector_world[1]
+        command_msg.vector.z = command_vector_world[2]
         self.command_pub.publish(command_msg)
 
         offsets_msg = Float32MultiArray()
         offsets_msg.data = [length_scale, math.degrees(pitch_offset), math.degrees(yaw_offset)]
         self.offset_pub.publish(offsets_msg)
 
-        self._publish_trajectory(
-            msg.header,
-            rotation,
-            base_direction,
-            yaw_offset,
-            pitch_offset,
-            length_scale,
-            speed,
-        )
+        self._publish_trajectory(msg.header, path_points)
 
         self._publish_fallback(msg.header.stamp, include_default=False)
         self._log_timing(start_time)
@@ -437,58 +513,128 @@ class InferenceNode:
                 return False
         return True
 
-    def _publish_trajectory(
+    def _primitive_points(
         self,
-        header,
+        origin: np.ndarray,
         rotation: np.ndarray,
         base_direction: np.ndarray,
         yaw_offset: float,
         pitch_offset: float,
-        length_scale: float,
-        speed: float,
-    ) -> None:
+        commanded_speed: float,
+    ) -> np.ndarray:
+        steps = max(2, self.trajectory_steps)
+        directions = sample_yopo_directions(base_direction, yaw_offset, pitch_offset, steps)
+        points = [origin.astype(np.float32)]
+        segment_length = commanded_speed / max(1, steps)
+        for direction_local in directions:
+            world_dir = clamp_normalized(rotation.dot(direction_local))
+            points.append(points[-1] + world_dir * segment_length)
+        return np.asarray(points, dtype=np.float32)
+
+    def _path_is_safe_local(
+        self,
+        points: np.ndarray,
+        rotation: np.ndarray,
+        safe_mask: np.ndarray,
+        width: int,
+        height: int,
+        fov_deg: float,
+    ) -> bool:
+        if safe_mask.size == 0:
+            return False
+        local_basis = rotation.T
+        for idx in range(points.shape[0] - 1):
+            segment = points[idx + 1] - points[idx]
+            norm = float(np.linalg.norm(segment))
+            if norm < 1e-6:
+                continue
+            direction_world = segment / norm
+            direction_local = local_basis.dot(direction_world)
+            col, row = project_direction_to_pixel(direction_local, width, height, fov_deg)
+            if not is_pixel_safe(safe_mask, col, row):
+                return False
+        return True
+
+    def _plan_trajectory_points(
+        self,
+        origin: np.ndarray,
+        rotation: np.ndarray,
+        base_direction: np.ndarray,
+        final_direction_local: np.ndarray,
+        final_direction_world: np.ndarray,
+        yaw_offset: float,
+        pitch_offset: float,
+        commanded_speed: float,
+        safe_mask: np.ndarray,
+        width: int,
+        height: int,
+        fov_deg: float,
+    ) -> np.ndarray:
+        primitive = self._primitive_points(
+            origin,
+            rotation,
+            base_direction,
+            yaw_offset,
+            pitch_offset,
+            commanded_speed,
+        )
+
+        if self.goal_world is None or self.odom is None:
+            return primitive
+
+        odom_frame = self.odom.header.frame_id or "map"
+        if self.goal_frame and self.goal_frame not in ("", odom_frame):
+            rospy.logwarn_throttle(
+                5.0,
+                "Goal frame %s does not match odometry frame %s; following primitive path",
+                self.goal_frame,
+                odom_frame,
+            )
+            return primitive
+
+        goal_vector = self.goal_world - origin
+        distance_to_goal = float(np.linalg.norm(goal_vector))
+        if distance_to_goal <= self.goal_tolerance:
+            self.goal_world = None
+            return primitive
+        if distance_to_goal < 1e-3:
+            return primitive
+
+        steps = max(2, self.trajectory_steps)
+        tangent_start = final_direction_world * min(distance_to_goal, commanded_speed)
+        tangent_end = clamp_normalized(goal_vector) * min(distance_to_goal, commanded_speed * 0.5)
+        hermite_points = cubic_hermite_path(origin, self.goal_world, tangent_start, tangent_end, steps)
+        if self._path_is_safe_local(hermite_points, rotation, safe_mask, width, height, fov_deg):
+            return hermite_points.astype(np.float32)
+        return primitive
+
+    def _publish_trajectory(self, header, points: np.ndarray) -> None:
         if self.odom is None:
             return
         path_msg = Path()
         path_msg.header.stamp = header.stamp
         path_msg.header.frame_id = self.odom.header.frame_id or "map"
 
-        origin = np.array(
-            [
-                self.odom.pose.pose.position.x,
-                self.odom.pose.pose.position.y,
-                self.odom.pose.pose.position.z,
-            ],
-            dtype=np.float32,
-        )
-        start_pose = PoseStamped()
-        start_pose.header = path_msg.header
-        start_pose.pose.position.x = float(origin[0])
-        start_pose.pose.position.y = float(origin[1])
-        start_pose.pose.position.z = float(origin[2])
-        start_pose.pose.orientation = self.odom.pose.pose.orientation
-        path_msg.poses.append(start_pose)
+        points = np.asarray(points, dtype=np.float32)
+        if points.size == 0:
+            self._publish_empty_trajectory(header.stamp)
+            return
 
-        steps = max(2, self.trajectory_steps)
-        segment_length = (speed * length_scale) / steps
-        current = origin.copy()
-        directions = sample_yopo_directions(base_direction, yaw_offset, pitch_offset, steps)
-
-        for direction_local in directions:
-            world_dir = rotation.dot(direction_local)
-            norm = float(np.linalg.norm(world_dir))
-            if norm < 1e-6:
-                continue
-            step_vec = world_dir / norm * segment_length
-            current = current + step_vec
-
+        for idx, point in enumerate(points):
             pose = PoseStamped()
             pose.header = path_msg.header
-            pose.pose.position.x = float(current[0])
-            pose.pose.position.y = float(current[1])
-            pose.pose.position.z = float(current[2])
-            yaw = math.atan2(world_dir[1], world_dir[0])
-            pitch = math.atan2(world_dir[2], math.sqrt(world_dir[0] ** 2 + world_dir[1] ** 2))
+            pose.pose.position.x = float(point[0])
+            pose.pose.position.y = float(point[1])
+            pose.pose.position.z = float(point[2])
+            if idx < points.shape[0] - 1:
+                direction = points[idx + 1] - point
+            elif idx > 0:
+                direction = point - points[idx - 1]
+            else:
+                direction = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            direction = clamp_normalized(direction)
+            yaw = math.atan2(direction[1], direction[0])
+            pitch = math.atan2(direction[2], math.sqrt(direction[0] ** 2 + direction[1] ** 2))
             quat = transformations.quaternion_from_euler(0.0, pitch, yaw)
             pose.pose.orientation.x = quat[0]
             pose.pose.orientation.y = quat[1]
@@ -509,10 +655,6 @@ class InferenceNode:
         steps = max(2, self.trajectory_steps)
         step_length = self.default_speed / steps
 
-        path_msg = Path()
-        path_msg.header.stamp = stamp
-        path_msg.header.frame_id = self.odom.header.frame_id or "map"
-
         origin = np.array(
             [
                 self.odom.pose.pose.position.x,
@@ -521,33 +663,16 @@ class InferenceNode:
             ],
             dtype=np.float32,
         )
-
-        start_pose = PoseStamped()
-        start_pose.header = path_msg.header
-        start_pose.pose.position.x = float(origin[0])
-        start_pose.pose.position.y = float(origin[1])
-        start_pose.pose.position.z = float(origin[2])
-        start_pose.pose.orientation = self.odom.pose.pose.orientation
-        path_msg.poses.append(start_pose)
-
+        points = [origin]
         current = origin.copy()
         for _ in range(steps):
             current = current + unit_vector * step_length
-            pose = PoseStamped()
-            pose.header = path_msg.header
-            pose.pose.position.x = float(current[0])
-            pose.pose.position.y = float(current[1])
-            pose.pose.position.z = float(current[2])
-            yaw = math.atan2(unit_vector[1], unit_vector[0])
-            pitch = math.atan2(unit_vector[2], math.sqrt(unit_vector[0] ** 2 + unit_vector[1] ** 2))
-            quat = transformations.quaternion_from_euler(0.0, pitch, yaw)
-            pose.pose.orientation.x = quat[0]
-            pose.pose.orientation.y = quat[1]
-            pose.pose.orientation.z = quat[2]
-            pose.pose.orientation.w = quat[3]
-            path_msg.poses.append(pose)
+            points.append(current.copy())
 
-        self.trajectory_pub.publish(path_msg)
+        header = Header()
+        header.stamp = stamp
+        header.frame_id = self.odom.header.frame_id or "map"
+        self._publish_trajectory(header, np.asarray(points, dtype=np.float32))
 
     def _publish_empty_trajectory(self, stamp: rospy.Time) -> None:
         if self.odom is None:
