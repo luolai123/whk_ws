@@ -645,6 +645,57 @@ class ObstacleField:
         hit_mask = torch.isfinite(distances)
         return distances, indices, hit_mask
 
+
+
+
+
+    def snapshot(self) -> dict:
+        """Return a serializable dictionary describing the current obstacle state."""
+
+        return {
+            "sphere_centers": self.sphere_centers.copy(),
+            "sphere_radii": self.sphere_radii.copy(),
+            "box_centers": self.box_centers.copy(),
+            "box_half_extents": self.box_half_extents.copy(),
+            "box_rotations": self.box_rotations.copy(),
+        }
+
+    def load_snapshot(self, snapshot: dict) -> None:
+        """Populate the field from a snapshot dictionary."""
+
+        def _maybe(name: str, fallback: np.ndarray) -> np.ndarray:
+            value = snapshot.get(name)
+            if value is None:
+                return fallback.copy()
+            arr = np.asarray(value, dtype=np.float32)
+            return arr.copy()
+
+        self.sphere_centers = _maybe("sphere_centers", np.empty((0, 3), dtype=np.float32))
+        self.sphere_radii = _maybe("sphere_radii", np.empty((0,), dtype=np.float32))
+        self.sphere_bounds = (
+            self.sphere_radii.copy() if self.sphere_radii.size else np.empty((0,), dtype=np.float32)
+        )
+        self.box_centers = _maybe("box_centers", np.empty((0, 3), dtype=np.float32))
+        self.box_half_extents = _maybe("box_half_extents", np.empty((0, 3), dtype=np.float32))
+        self.box_rotations = _maybe("box_rotations", np.empty((0, 3, 3), dtype=np.float32))
+        if self.box_rotations.size:
+            self.box_inv_rotations = np.transpose(self.box_rotations, (0, 2, 1))
+        else:
+            self.box_inv_rotations = np.empty((0, 3, 3), dtype=np.float32)
+        self.box_bounding_radii = (
+            np.linalg.norm(self.box_half_extents, axis=1)
+            if self.box_half_extents.size
+            else np.empty((0,), dtype=np.float32)
+        )
+        self._torch = None
+        self._device = None
+        self.sphere_centers_t = None
+        self.sphere_radii_t = None
+        self.box_centers_t = None
+        self.box_half_extents_t = None
+        self.box_rotations_t = None
+        self.box_inv_rotations_t = None
+
     @staticmethod
     def _normalize_rows(vectors: np.ndarray, eps: float = 1e-8) -> np.ndarray:
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
@@ -663,4 +714,5 @@ class ObstacleField:
             return np.identity(3, dtype=np.float32)
         matrix = transformations.quaternion_matrix(quat)
         return matrix[0:3, 0:3].astype(np.float32)
+
 

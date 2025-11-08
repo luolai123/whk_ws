@@ -1,6 +1,8 @@
 <launch>
   <arg name="hardware_accel" default="false" />
   <arg name="hardware_device" default="cuda" />
+  <arg name="model_path" default="$(env HOME)/autonomy_demo/model.pt" />
+  <arg name="policy_path" default="$(env HOME)/autonomy_demo/navigation_policy.pt" />
 
   <include file="$(find autonomy_demo)/launch/sim.launch">
     <arg name="hardware_accel" value="$(arg hardware_accel)" />
@@ -8,6 +10,7 @@
   </include>
 
   <node pkg="autonomy_demo" type="inference_node.py" name="distance_inference" output="screen">
-    <param name="model_path" value="$(env HOME)/autonomy_demo/model.pt" />
+    <param name="model_path" value="$(arg model_path)" />
+    <param name="policy_path" value="$(arg policy_path)" />
   </node>
 </launch>

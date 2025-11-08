@@ -10,6 +10,7 @@ This workspace contains a complete ROS1 (Noetic) simulation for a UAV navigating
 - **Synthetic RGB camera** that renders obstacle distances into color-coded imagery with optional torch-powered acceleration.
 - **Automated data collection** pipeline that records RGB frames with near/far obstacle labels using analytic distance computation, reusing the same accelerated ray casting path as the camera.
 - **PyTorch training utilities** for a two-class distance classifier and an inference node that streams classification maps in real time.
+- **Binary-image-driven safe navigation** that extracts dominant safe zones, emits goal-aligned motion primitives, and evaluates torch-trained offset policies in under 2 ms per frame.
 
 ## Prerequisites
 
@@ -72,7 +73,7 @@ Start the simulator together with the data collector:
 roslaunch autonomy_demo data_collection.launch output_dir:=/your/dataset/path
 ```
 
-- Samples are stored as compressed `.npz` files containing the RGB image, the 2-class label map (near obstacle vs. safe), per-column distance estimates, and the ROS header metadata.
+- Samples are stored as compressed `.npz` files containing the RGB image, the 2-class label map (near obstacle vs. safe), per-column distance estimates, the capturing pose/orientation, camera offset, and the obstacle geometry snapshot used during labeling.
 - The default near/far threshold is 4 meters; override with the `near_threshold` parameter if required.
 
 > Tip: move the UAV around using RViz goals while data collection is running to diversify the dataset. You can also call the regenerate service to change obstacle layouts between runs.
@@ -99,9 +100,9 @@ roslaunch autonomy_demo data_collection.launch output_dir:=/your/dataset/path
 
 - Use `max_obstacle_candidates` (default `512`) to cap how many nearby objects each ray considers. Lower values improve frame rate at the cost of ignoring far obstacles; `0` keeps the full set. The parameter is exposed on `sim.launch` and `data_collection.launch` for both the camera simulator and the dataset recorder.
 
-## Training the Distance Classifier
+## Training the Classifier and Safe-Navigation Policy
 
-After gathering data, train the neural network:
+After gathering data, train both the segmentation network and the differentiable navigation policy:
 
 ```bash
 python3 src/autonomy_demo/training/train_classifier.py \
@@ -109,22 +110,38 @@ python3 src/autonomy_demo/training/train_classifier.py \
   --epochs 15 \
   --batch 8 \
   --lr 5e-4 \
-  --output ~/autonomy_demo/model.pt
+  --policy_epochs 40 \
+  --policy_batch 8 \
+  --policy_lr 5e-4 \
+  --policy_noise 0.03 \
+  --output ~/autonomy_demo/model.pt \
+  --policy_output ~/autonomy_demo/navigation_policy.pt
 ```
 
-- The script automatically creates a validation split and saves the trained weights.
+- The script still splits the dataset for validation and saves the classifier weights to `model.pt`.
+- A second differentiable reinforcement-learning loop optimizes the safe-navigation policy across 3–7 m/s speeds using the stored obstacle geometry; the learned offsets are written to `navigation_policy.pt`.
+- Use `--no_policy` to skip the policy stage when you only need the segmentation network.
 - Adjust hyperparameters as needed. GPU acceleration is used automatically when CUDA is available.
 
 ## Real-Time Inference
 
-With a trained model saved to `~/autonomy_demo/model.pt`, launch the inference stack:
+With classifier and policy weights stored under `~/autonomy_demo`, launch the full inference stack:
 
 ```bash
-roslaunch autonomy_demo inference.launch model_path:=/absolute/path/to/model.pt
+roslaunch autonomy_demo inference.launch \
+  model_path:=/absolute/path/to/model.pt \
+  policy_path:=/absolute/path/to/navigation_policy.pt
 ```
 
-- The `distance_inference` node subscribes to the RGB feed, performs the two-class segmentation, and publishes a color-coded result on `/drone/rgb/distance_class` (green = safe, red = near obstacle).
-- RViz displays both the raw camera stream and the classification overlay. Continue using the 2D Nav Goal tool to steer the drone while observing the live predictions.
+- The `distance_inference` node subscribes to the RGB stream, produces the binary classification overlay on `/drone/rgb/distance_class`, and extracts the largest contiguous safe zone (default minimum area 5%).
+- A differentiable policy evaluates the noisy safe mask and current airspeed to emit motion primitives and offset recommendations. Outputs are published on:
+  - `/drone/safe_center` (`geometry_msgs/PointStamped`): normalized safe-zone centroid and area fraction.
+  - `/drone/movement_primitive` (`geometry_msgs/Vector3Stamped`): base vector toward the safe centroid with current-speed magnitude.
+  - `/drone/movement_command` (`geometry_msgs/Vector3Stamped`): final command after applying length/angle offsets.
+  - `/drone/movement_offsets` (`std_msgs/Float32MultiArray`): `[length_scale, pitch_deg, yaw_deg]` adjustments chosen by the policy.
+  - `/drone/fallback_primitives` (`geometry_msgs/PoseArray`): rear/side slip options that remain available when no safe region is detected.
+- End-to-end processing is throttled to under 2 ms per frame; the node logs a warning if runtime exceeds the budget.
+- RViz continues to display the RGB feed, the classification overlay, and the drone model. Use the 2D Nav Goal tool to validate how the navigation cues react to new viewpoints.
 
 ## File Overview
 

@@ -178,17 +178,35 @@ class DataCollector:
         labels = (distances < self.near_threshold).astype(np.uint8)
         label_map = np.repeat(labels[np.newaxis, :], height, axis=0)
 
+
         output_path = self.output_dir / f"sample_{self.sample_count:06d}.npz"
+        pose = self.pose.pose
+        pose_position = np.array(
+            [pose.position.x, pose.position.y, pose.position.z], dtype=np.float32
+        )
+        pose_orientation = np.array(
+            [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w],
+            dtype=np.float32,
+        )
+        snapshot = self.obstacle_field.snapshot()
         np.savez_compressed(
             output_path,
             image=cv_image,
             label=label_map,
             distances=distances,
             header=self._header_to_dict(msg.header),
+            pose_position=pose_position,
+            pose_orientation=pose_orientation,
+            camera_offset=self.camera_offset.astype(np.float32),
+            sphere_centers=snapshot["sphere_centers"],
+            sphere_radii=snapshot["sphere_radii"],
+            box_centers=snapshot["box_centers"],
+            box_half_extents=snapshot["box_half_extents"],
+            box_rotations=snapshot["box_rotations"],
         )
         self.sample_count += 1
         rospy.loginfo_throttle(5.0, "Captured %d samples", self.sample_count)
-
+        
     @staticmethod
     def _header_to_dict(header: Header) -> dict:
         return {
