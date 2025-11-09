@@ -114,9 +114,9 @@ class DataCollector:
             device=self._device,
         )
 
-    def compute_distances(self, width: int) -> np.ndarray:
+    def compute_distances(self, width: int, height: int) -> np.ndarray:
         if self.pose is None:
-            return np.full(width, self.max_range, dtype=np.float32)
+            return np.full((height, width), self.max_range, dtype=np.float32)
 
         pose = self.pose.pose
         base_position = np.array(
@@ -128,17 +128,30 @@ class DataCollector:
         basis = rotation[0:3, 0:3].astype(np.float32)
         camera_position = base_position + basis.dot(self.camera_offset)
 
-        forward = basis[:, 0]
-        right = basis[:, 1]
+        # The local ray grid is built directly in the camera frame.
 
         fov = math.radians(self.fov_deg)
         tan_half_h = math.tan(fov / 2.0)
-        u = (np.arange(width, dtype=np.float32) + 0.5) / float(width)
+        aspect = height / float(max(width, 1))
+        tan_half_v = tan_half_h * aspect
+
+        u = (np.arange(width, dtype=np.float32) + 0.5) / float(max(width, 1))
+        v = (np.arange(height, dtype=np.float32) + 0.5) / float(max(height, 1))
         u_ndc = (u * 2.0) - 1.0
-        directions = forward[np.newaxis, :] + (u_ndc[:, np.newaxis] * tan_half_h * right[np.newaxis, :])
-        norms = np.linalg.norm(directions, axis=1, keepdims=True)
+        v_ndc = 1.0 - (v * 2.0)
+
+        x_components = u_ndc * tan_half_h
+        y_components = v_ndc[:, np.newaxis] * tan_half_v
+
+        ones = np.ones((height, width), dtype=np.float32)
+        x_grid = np.broadcast_to(x_components, (height, width))
+        y_grid = np.broadcast_to(y_components, (height, width))
+        local_dirs = np.stack((ones, x_grid, y_grid), axis=-1)
+        norms = np.linalg.norm(local_dirs, axis=-1, keepdims=True)
         norms = np.clip(norms, 1e-6, None)
-        directions = directions / norms
+        local_dirs = local_dirs / norms
+        directions = local_dirs.reshape(-1, 3)
+        directions = directions.dot(basis.T)
 
         if self._use_torch and self.obstacle_field.supports_torch:
             torch = self._torch
@@ -162,7 +175,7 @@ class DataCollector:
             np.isfinite(distances), distances.astype(np.float32), float(self.max_range)
         )
         distances = np.clip(distances, 0.0, float(self.max_range))
-        return distances
+        return distances.reshape(height, width)
 
     def image_callback(self, msg: Image) -> None:
         if self.pose is None:
@@ -174,9 +187,9 @@ class DataCollector:
             return
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
         height, width, _ = cv_image.shape
-        distances = self.compute_distances(width)
+        distances = self.compute_distances(width, height)
         labels = (distances < self.near_threshold).astype(np.uint8)
-        label_map = np.repeat(labels[np.newaxis, :], height, axis=0)
+        label_map = labels
 
 
         output_path = self.output_dir / f"sample_{self.sample_count:06d}.npz"

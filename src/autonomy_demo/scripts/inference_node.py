@@ -4,7 +4,7 @@
 import math
 import pathlib
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Set
 
 import numpy as np
 import rospy
@@ -28,9 +28,10 @@ from autonomy_demo.safe_navigation import (
     clamp_normalized,
     compute_direction_from_pixel,
     find_largest_safe_region,
-    is_pixel_safe,
+    jerk_score,
+    orientation_rate_score,
+    path_smoothness,
     project_direction_to_pixel,
-    rotate_direction,
     sample_yopo_directions,
 )
 
@@ -245,11 +246,14 @@ class InferenceNode:
         cleaned = cv2.morphologyEx(safe_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
         safe_mask = cleaned.astype(bool)
+        distance_field = cv2.distanceTransform(
+            safe_mask.astype(np.uint8), cv2.DIST_L2, 5
+        ).astype(np.float32)
 
         color_map = np.zeros((height, width, 3), dtype=np.uint8)
-        color_map[:, :, 1] = np.clip(safe_prob * 255.0, 0, 255).astype(np.uint8)
-        color_map[:, :, 0] = np.clip(obstacle_prob * 255.0, 0, 255).astype(np.uint8)
-        color_map[:, :, 2] = np.clip((1.0 - safe_prob) * 80.0, 0, 255).astype(np.uint8)
+        color_map[:, :, 0] = 255  # default to red for obstacle/unknown
+        color_map[safe_mask, 0] = 0
+        color_map[safe_mask, 1] = 255
         label_msg = self.bridge.cv2_to_imgmsg(color_map, encoding="rgb8")
         label_msg.header = msg.header
         label_msg.header.frame_id = rospy.get_param("~output_frame", msg.header.frame_id)
@@ -298,67 +302,54 @@ class InferenceNode:
             speed = self.default_speed
         base_vector_world = base_world_direction * speed
 
-        yaw_offset = 0.0
-        pitch_offset = 0.0
-        length_scale = 1.0
-        final_direction_local = base_direction
-
+        policy_offsets: Optional[Tuple[float, float, float]] = None
         if self.policy is not None:
-            mask_tensor = torch.from_numpy(safe_mask.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(self.device)
+            mask_tensor = (
+                torch.from_numpy(safe_mask.astype(np.float32))
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .to(self.device)
+            )
             speed_norm = torch.tensor([(speed - 3.0) / 4.0], device=self.device, dtype=torch.float32)
             with torch.no_grad():
                 offsets = self.policy(mask_tensor, speed_norm)
             length_delta, pitch_delta, yaw_delta = offsets.squeeze(0).cpu().numpy()
-            length_scale = float(np.clip(1.0 + 0.2 * length_delta, 0.5, 1.5))
-            pitch_offset = float(np.clip(math.radians(15.0) * pitch_delta, -math.radians(15.0), math.radians(15.0)))
-            yaw_offset = float(np.clip(math.radians(15.0) * yaw_delta, -math.radians(15.0), math.radians(15.0)))
-            final_direction_local = rotate_direction(base_direction, yaw_offset, pitch_offset)
-            col_pred, row_pred = project_direction_to_pixel(final_direction_local, width, height, fov_deg)
-            if not is_pixel_safe(safe_mask, col_pred, row_pred):
-                for scale in (0.5, 0.25, 0.0):
-                    test_yaw = yaw_offset * scale
-                    test_pitch = pitch_offset * scale
-                    test_length = 1.0 + (length_scale - 1.0) * scale
-                    direction_candidate = rotate_direction(base_direction, test_yaw, test_pitch)
-                    col_candidate, row_candidate = project_direction_to_pixel(
-                        direction_candidate, width, height, fov_deg
-                    )
-                    if is_pixel_safe(safe_mask, col_candidate, row_candidate):
-                        yaw_offset = test_yaw
-                        pitch_offset = test_pitch
-                        length_scale = float(np.clip(test_length, 0.5, 1.5))
-                        final_direction_local = direction_candidate
-                        break
-                else:
-                    yaw_offset = 0.0
-                    pitch_offset = 0.0
-                    length_scale = 1.0
-                    final_direction_local = base_direction
-        else:
-            final_direction_local = base_direction
+            length_est = float(np.clip(1.0 + 0.2 * length_delta, 0.5, 1.5))
+            pitch_est = float(
+                np.clip(math.radians(15.0) * pitch_delta, -math.radians(15.0), math.radians(15.0))
+            )
+            yaw_est = float(
+                np.clip(math.radians(15.0) * yaw_delta, -math.radians(15.0), math.radians(15.0))
+            )
+            policy_offsets = (length_est, pitch_est, yaw_est)
 
-        yaw_offset, pitch_offset, length_scale = self._evaluate_offsets(
+        candidate = self._select_candidate(
             base_direction,
-            yaw_offset,
-            pitch_offset,
-            length_scale,
+            policy_offsets,
             safe_mask,
+            safe_prob,
+            distance_field,
             width,
             height,
             fov_deg,
+            rotation,
+            origin,
+            speed,
         )
-        final_direction_local = rotate_direction(base_direction, yaw_offset, pitch_offset)
+
+        if candidate is None:
+            self._publish_fallback(msg.header.stamp)
+            self._log_timing(start_time)
+            return
+
+        length_scale = candidate["length_scale"]
+        pitch_offset = candidate["pitch_offset"]
+        yaw_offset = candidate["yaw_offset"]
+        final_direction_local = candidate["final_direction_local"]
+        path_points = candidate["path_points"]
 
         final_world_direction = clamp_normalized(rotation.dot(final_direction_local))
         commanded_speed = speed * length_scale
-        path_points = self._plan_trajectory_points(
-            origin,
-            rotation,
-            base_direction,
-            yaw_offset,
-            pitch_offset,
-            commanded_speed,
-        )
 
         command_vector_world = final_world_direction * commanded_speed
         if path_points.shape[0] >= 2:
@@ -455,58 +446,206 @@ class InferenceNode:
         if elapsed_ms > 2.0:
             rospy.logwarn_throttle(1.0, "Navigation inference exceeded 2 ms: %.3f ms", elapsed_ms)
 
-    def _evaluate_offsets(
+    def _normalize_offsets(
+        self, length_scale: float, pitch_offset: float, yaw_offset: float
+    ) -> Tuple[float, float, float]:
+        pitch_limit = math.radians(15.0)
+        yaw_limit = math.radians(15.0)
+        length = float(np.clip(length_scale, 0.8, 1.2))
+        pitch = float(np.clip(pitch_offset, -pitch_limit, pitch_limit))
+        yaw = float(np.clip(yaw_offset, -yaw_limit, yaw_limit))
+        return length, pitch, yaw
+
+    def _select_candidate(
         self,
         base_direction: np.ndarray,
-        yaw_offset: float,
-        pitch_offset: float,
-        length_scale: float,
+        policy_offsets: Optional[Tuple[float, float, float]],
         safe_mask: np.ndarray,
+        safe_prob: np.ndarray,
+        distance_field: np.ndarray,
         width: int,
         height: int,
         fov_deg: float,
-    ) -> Tuple[float, float, float]:
-        target_scale = float(length_scale)
-        for scale in (1.0, 0.75, 0.5, 0.25, 0.0):
-            yaw_candidate = yaw_offset * scale
-            pitch_candidate = pitch_offset * scale
-            length_candidate = 1.0 + (target_scale - 1.0) * scale
-            length_candidate = float(np.clip(length_candidate, 0.5, 1.5))
-            if self._trajectory_is_safe(
+        rotation: np.ndarray,
+        origin: np.ndarray,
+        speed: float,
+    ) -> Optional[dict]:
+        candidates: List[Tuple[float, float, float, str]] = []
+        seen: Set[Tuple[int, int, int]] = set()
+
+        def add_candidate(length: float, pitch: float, yaw: float, tag: str) -> None:
+            normalized = self._normalize_offsets(length, pitch, yaw)
+            key = (
+                int(round(normalized[0] * 1000)),
+                int(round(normalized[1] * 1000)),
+                int(round(normalized[2] * 1000)),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append((*normalized, tag))
+
+        add_candidate(1.0, 0.0, 0.0, "base")
+
+        yaw_step = math.radians(8.0)
+        pitch_step = math.radians(6.0)
+        add_candidate(1.0, 0.0, yaw_step, "base_yaw")
+        add_candidate(1.0, 0.0, -yaw_step, "base_yaw")
+        add_candidate(1.0, pitch_step, 0.0, "base_pitch")
+        add_candidate(1.0, -pitch_step, 0.0, "base_pitch")
+        add_candidate(1.1, 0.0, yaw_step * 0.5, "base_len")
+        add_candidate(0.9, 0.0, -yaw_step * 0.5, "base_len")
+
+        if policy_offsets is not None:
+            length_est, pitch_est, yaw_est = policy_offsets
+            add_candidate(length_est, pitch_est, yaw_est, "policy")
+            add_candidate(length_est + 0.1, pitch_est, yaw_est, "policy_len")
+            add_candidate(length_est - 0.1, pitch_est, yaw_est, "policy_len")
+            add_candidate(length_est, pitch_est + pitch_step, yaw_est, "policy_pitch")
+            add_candidate(length_est, pitch_est - pitch_step, yaw_est, "policy_pitch")
+            add_candidate(length_est, pitch_est, yaw_est + yaw_step, "policy_yaw")
+            add_candidate(length_est, pitch_est, yaw_est - yaw_step, "policy_yaw")
+
+        max_clearance = float(distance_field.max()) if distance_field.size else 0.0
+        best: Optional[dict] = None
+        for length_scale, pitch_offset, yaw_offset, _ in candidates:
+            result = self._score_candidate(
                 base_direction,
-                yaw_candidate,
-                pitch_candidate,
-                length_candidate,
+                length_scale,
+                pitch_offset,
+                yaw_offset,
                 safe_mask,
+                safe_prob,
+                distance_field,
                 width,
                 height,
                 fov_deg,
-            ):
-                return yaw_candidate, pitch_candidate, length_candidate
-        return 0.0, 0.0, 1.0
+                rotation,
+                origin,
+                speed,
+                max_clearance,
+            )
+            if result is None:
+                continue
+            if best is None or result["score"] > best["score"]:
+                best = result
+        return best
 
-    def _trajectory_is_safe(
+    def _score_candidate(
         self,
         base_direction: np.ndarray,
-        yaw_offset: float,
-        pitch_offset: float,
         length_scale: float,
+        pitch_offset: float,
+        yaw_offset: float,
         safe_mask: np.ndarray,
+        safe_prob: np.ndarray,
+        distance_field: np.ndarray,
         width: int,
         height: int,
         fov_deg: float,
-    ) -> bool:
-        directions = sample_yopo_directions(
+        rotation: np.ndarray,
+        origin: np.ndarray,
+        speed: float,
+        max_clearance: float,
+    ) -> Optional[dict]:
+        steps = max(2, self.primitive_steps)
+        directions = sample_yopo_directions(base_direction, yaw_offset, pitch_offset, steps)
+        if not directions:
+            return None
+
+        min_prob = 1.0
+        min_clearance = max_clearance if max_clearance > 0.0 else 0.0
+        for direction in directions:
+            col, row = project_direction_to_pixel(direction, width, height, fov_deg)
+            if not (0.0 <= col < width and 0.0 <= row < height):
+                return None
+            col_idx = int(round(col))
+            row_idx = int(round(row))
+            if not (0 <= col_idx < width and 0 <= row_idx < height):
+                return None
+            if not safe_mask[row_idx, col_idx]:
+                return None
+            prob = float(safe_prob[row_idx, col_idx])
+            min_prob = min(min_prob, prob)
+            if max_clearance > 0.0:
+                clearance = float(distance_field[row_idx, col_idx])
+                min_clearance = min(min_clearance, clearance)
+
+        prob_threshold = max(self.safe_threshold, 0.55)
+        if min_prob < prob_threshold:
+            return None
+
+        clearance_norm = 0.0
+        if max_clearance > 1e-6:
+            clearance_norm = min_clearance / max(max_clearance, 1e-6)
+            if min_clearance < 1.0:
+                return None
+
+        commanded_speed = speed * length_scale
+        points = self._primitive_points(
+            origin,
+            rotation,
             base_direction,
             yaw_offset,
             pitch_offset,
-            max(2, self.primitive_steps),
+            commanded_speed,
+            directions,
         )
-        for direction in directions:
-            col, row = project_direction_to_pixel(direction, width, height, fov_deg)
-            if not is_pixel_safe(safe_mask, col, row):
-                return False
-        return True
+        if points.shape[0] < 2:
+            return None
+
+        displacement = float(np.linalg.norm(points[-1] - points[0]))
+        expected = commanded_speed * max(self.primitive_dt, 1e-3) * len(directions)
+        if expected > 1e-3 and displacement < expected * 0.35:
+            return None
+
+        smooth_metric = path_smoothness(points)
+        jerk_metric = jerk_score(points, self.primitive_dt)
+        orientation_metric = orientation_rate_score(directions)
+
+        pitch_limit = math.radians(15.0)
+        yaw_limit = math.radians(15.0)
+        stability_penalty = (
+            abs(length_scale - 1.0) / 0.2
+            + abs(pitch_offset) / pitch_limit
+            + abs(yaw_offset) / yaw_limit
+        ) / 3.0
+        stability_score = math.exp(-max(0.0, stability_penalty))
+
+        goal_score = 0.0
+        if self.goal_world is not None and self.goal_frame == (self.odom.header.frame_id or "map"):
+            goal_vec = self.goal_world - origin
+            goal_dist = float(np.linalg.norm(goal_vec))
+            if goal_dist > 1e-3:
+                end_vec = points[-1] - origin
+                end_norm = float(np.linalg.norm(end_vec))
+                alignment = 0.0
+                if end_norm > 1e-6:
+                    alignment = max(0.0, float(np.dot(goal_vec, end_vec)) / (goal_dist * end_norm))
+                remaining = self.goal_world - points[-1]
+                progress = max(0.0, (goal_dist - float(np.linalg.norm(remaining))) / goal_dist)
+                goal_score = 0.6 * alignment + 0.4 * progress
+            else:
+                goal_score = 1.0
+
+        total_score = (
+            6.0 * min_prob
+            + 4.0 * clearance_norm
+            + 3.0 * goal_score
+            + 2.0 * smooth_metric
+            + 2.0 * jerk_metric
+            + 1.5 * orientation_metric
+            + 1.0 * stability_score
+        )
+
+        return {
+            "score": float(total_score),
+            "length_scale": float(length_scale),
+            "pitch_offset": float(pitch_offset),
+            "yaw_offset": float(yaw_offset),
+            "final_direction_local": directions[-1],
+            "path_points": points,
+        }
 
     def _primitive_points(
         self,
@@ -516,34 +655,19 @@ class InferenceNode:
         yaw_offset: float,
         pitch_offset: float,
         commanded_speed: float,
+        directions: Optional[List[np.ndarray]] = None,
     ) -> np.ndarray:
         steps = self.primitive_steps
-        directions = sample_yopo_directions(base_direction, yaw_offset, pitch_offset, steps)
+        if directions is None:
+            directions = sample_yopo_directions(base_direction, yaw_offset, pitch_offset, steps)
+        else:
+            directions = list(directions)
         points = [origin.astype(np.float32)]
         segment_length = commanded_speed * max(self.primitive_dt, 1e-3)
         for direction_local in directions:
             world_dir = clamp_normalized(rotation.dot(direction_local))
             points.append(points[-1] + world_dir * segment_length)
         return np.asarray(points, dtype=np.float32)
-
-    def _plan_trajectory_points(
-        self,
-        origin: np.ndarray,
-        rotation: np.ndarray,
-        base_direction: np.ndarray,
-        yaw_offset: float,
-        pitch_offset: float,
-        commanded_speed: float,
-    ) -> np.ndarray:
-        primitive = self._primitive_points(
-            origin,
-            rotation,
-            base_direction,
-            yaw_offset,
-            pitch_offset,
-            commanded_speed,
-        )
-        return primitive
 
     def _publish_trajectory(self, header, points: np.ndarray) -> None:
         if self.odom is None:

@@ -134,7 +134,7 @@ python3 src/autonomy_demo/training/train_classifier.py \
 
 - The script still splits the dataset for validation and saves the classifier weights to `model.pt`.
 - The classifier stage applies horizontal flips, brightness/noise augmentation, and class-balanced weighting; each epoch reports training/validation loss together with safe-class IoU, precision, recall, and accuracy.
-- A second differentiable reinforcement-learning loop optimizes the safe-navigation policy across 3–7 m/s speeds using the stored obstacle geometry; the learned offsets are written to `navigation_policy.pt`. The reward blends safety, goal alignment, smoothness, speed regulation, and stability, and the console summarizes the averaged metrics every epoch.
+- A second differentiable reinforcement-learning loop optimizes the safe-navigation policy across 3–7 m/s speeds using the stored obstacle geometry; the learned offsets are written to `navigation_policy.pt`. The reward now enforces safety and clearance as first-class (one-strike) objectives while also tracking goal alignment, trajectory smoothness, jerk, orientation change rate, and speed regulation; the console summarizes the averaged metrics every epoch.
 - Use `--no_policy` to skip the policy stage when you only need the segmentation network.
 - Adjust hyperparameters as needed. GPU acceleration is used automatically when CUDA is available.
 
@@ -148,7 +148,7 @@ roslaunch autonomy_demo inference.launch \
   policy_path:=/absolute/path/to/navigation_policy.pt
 ```
 
-- The `distance_inference` node subscribes to the RGB stream, produces the binary classification overlay on `/drone/rgb/distance_class`, and extracts the largest contiguous safe zone (default minimum area 5%).
+- The `distance_inference` node subscribes to the RGB stream, produces the binary classification overlay on `/drone/rgb/distance_class` (rendered as red obstacles and green safe regions), and extracts the largest contiguous safe zone (default minimum area 5%).
 - The classifier output is smoothed with a probability threshold (`~safe_probability_threshold`, default 0.55) and morphological cleanup before region extraction, which helps the downstream policy maintain crisp masks.
 - A differentiable policy evaluates the noisy safe mask and current airspeed to emit motion primitives and YOPO-inspired trajectories (3–5 discrete steps with explicit yaw/pitch offsets) while also proposing fallback commands. Outputs are published on:
   - `/drone/safe_center` (`geometry_msgs/PointStamped`): normalized safe-zone centroid and area fraction.
@@ -157,6 +157,7 @@ roslaunch autonomy_demo inference.launch \
   - `/drone/movement_offsets` (`std_msgs/Float32MultiArray`): `[length_scale, pitch_deg, yaw_deg]` adjustments chosen by the policy.
   - `/drone/fallback_primitives` (`geometry_msgs/PoseArray`): rear/side slip options that remain available when no safe region is detected.
   - `/drone/safe_trajectory` (`nav_msgs/Path`): YOPO-blended primitive covering 3–5 × `primitive_dt` seconds. Each pose encodes the commanded yaw/pitch so the simulator’s attitude controller can track the offsets while marching toward the goal over successive replans.
+- Candidate primitives are scored in real time with the same safety-first metrics used for training (minimum classification probability, clearance distance, jerk, orientation rate, and goal progress), which prevents spinning in place and keeps offsets from clipping obstacles.
 - End-to-end processing is throttled to under 2 ms per frame; the node logs a warning if runtime exceeds the budget.
 - RViz continues to display the RGB feed, the classification overlay, and the drone model. Use the 2D Nav Goal tool to validate how the navigation cues react to new viewpoints.
 - Tune `~goal_tolerance` (default 0.3 m) to adjust how close the drone must get before a goal is considered complete.

@@ -277,6 +277,52 @@ def path_smoothness(points: Iterable[np.ndarray]) -> float:
     return math.exp(-avg_angle)
 
 
+def jerk_score(points: Iterable[np.ndarray], dt: float) -> float:
+    """Return a smoothness score penalising large jerk magnitudes."""
+
+    samples = [np.asarray(pt, dtype=np.float32) for pt in points]
+    if len(samples) < 4:
+        return 1.0
+
+    dt = max(float(dt), 1e-3)
+    velocities = np.diff(samples, axis=0) / dt
+    if velocities.shape[0] < 3:
+        return 1.0
+    accelerations = np.diff(velocities, axis=0) / dt
+    if accelerations.shape[0] < 2:
+        return 1.0
+    jerks = np.diff(accelerations, axis=0) / dt
+    if jerks.size == 0:
+        return 1.0
+
+    norms = np.linalg.norm(jerks, axis=1)
+    max_jerk = float(np.max(norms))
+    return math.exp(-max_jerk)
+
+
+def orientation_rate_score(directions: Iterable[np.ndarray]) -> float:
+    """Return a penalty for rapid heading changes between primitive steps."""
+
+    unit_vectors: List[np.ndarray] = []
+    for direction in directions:
+        vec = np.asarray(direction, dtype=np.float32)
+        norm = float(np.linalg.norm(vec))
+        if norm < 1e-6:
+            continue
+        unit_vectors.append(vec / norm)
+
+    if len(unit_vectors) < 2:
+        return 1.0
+
+    max_angle = 0.0
+    for idx in range(1, len(unit_vectors)):
+        dot = float(np.dot(unit_vectors[idx - 1], unit_vectors[idx]))
+        dot = max(-1.0, min(1.0, dot))
+        max_angle = max(max_angle, abs(math.acos(dot)))
+
+    return math.exp(-max_angle)
+
+
 def clamp_normalized(vec: np.ndarray) -> np.ndarray:
     """Return ``vec`` normalized to unit length with safe fallback."""
 
