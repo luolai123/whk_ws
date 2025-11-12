@@ -1,500 +1,494 @@
-"""Utility helpers for parsing obstacles and performing ray intersections."""
+#!/usr/bin/env python3
+"""Random obstacle world generator for RViz visualization and occupancy data."""
 
-from __future__ import annotations
-
+import ast
+import math
+import random
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Tuple
 
-import numpy as np
-from tf_conversions import transformations
-
-
-@dataclass
-class RaycastResult:
-    """Container describing CPU raycast outputs."""
-
-    distances: np.ndarray
-    normals: np.ndarray
-    hit_mask: np.ndarray
-    hit_types: np.ndarray
-    hit_indices: np.ndarray
+import rospy
+from nav_msgs.msg import MapMetaData, OccupancyGrid
+from std_srvs.srv import Trigger, TriggerResponse
+from visualization_msgs.msg import Marker, MarkerArray
 
 
 @dataclass
-class TorchRaycastResult:
-    """Container describing torch-based raycast outputs."""
-
-    distances: "torch.Tensor"
-    normals: "torch.Tensor"
-    hit_mask: "torch.Tensor"
-    hit_types: "torch.Tensor"
-    hit_indices: "torch.Tensor"
+class Obstacle:
+    position: Tuple[float, float, float]
+    size: Tuple[float, float, float]
+    shape: str
+    category: str = "obstacle"
+    yaw: float = 0.0
 
 
-class ObstacleField:
-    """Stores obstacle geometry and accelerates ray intersection queries."""
+class WorldGenerator:
+    """Generates a random set of box and sphere obstacles for visualization."""
 
     def __init__(self) -> None:
-        self.sphere_centers: np.ndarray = np.empty((0, 3), dtype=np.float32)
-        self.sphere_radii: np.ndarray = np.empty((0,), dtype=np.float32)
-        self.box_centers: np.ndarray = np.empty((0, 3), dtype=np.float32)
-        self.box_half_extents: np.ndarray = np.empty((0, 3), dtype=np.float32)
-        self.box_rotations: np.ndarray = np.empty((0, 3, 3), dtype=np.float32)
-        self.box_inv_rotations: np.ndarray = np.empty((0, 3, 3), dtype=np.float32)
-
-        self._torch = None
-        self._device = None
-        self.sphere_centers_t = None
-        self.sphere_radii_t = None
-        self.box_centers_t = None
-        self.box_half_extents_t = None
-        self.box_rotations_t = None
-        self.box_inv_rotations_t = None
-
-    @property
-    def supports_torch(self) -> bool:
-        return (
-            self._torch is not None
-            and self.sphere_centers_t is not None
-            and self.sphere_radii_t is not None
-            and self.box_centers_t is not None
-            and self.box_half_extents_t is not None
-            and self.box_rotations_t is not None
-            and self.box_inv_rotations_t is not None
+        self.world_size = self._ensure_float_tuple(
+            self._get_float_tuple("~world_size", [120.0, 120.0, 12.0], 3),
+            "~world_size",
+            fallback=(120.0, 120.0, 12.0),
         )
+        self.obstacle_count = self._get_int("~obstacle_count", 70)
+        self.obstacle_density = max(0.0, self._get_float("~obstacle_density", 0.0))
+        self.height_range = self._ensure_float_tuple(
+            self._get_float_tuple("~height_range", [1.2, 7.5], 2),
+            "~height_range",
+            fallback=(1.2, 7.5),
+        )
+        self.size_range = self._ensure_float_tuple(
+            self._get_float_tuple("~size_range", [1.0, 4.5], 2),
+            "~size_range",
+            fallback=(1.0, 4.5),
+        )
+        self.occupancy_resolution = self._get_float("~occupancy_resolution", 0.5)
+        self.frame_id = rospy.get_param("~frame_id", "map")
+        self.sphere_ratio = max(0.0, min(1.0, self._get_float("~sphere_ratio", 0.3)))
+        raw_gate_ratio = self._get_float("~gate_ratio", 0.2)
+        self.gate_ratio = max(0.0, min(1.0 - self.sphere_ratio, raw_gate_ratio))
+        self.gate_opening_range = self._ensure_float_tuple(
+            self._get_float_tuple("~gate_opening_range", [3.0, 6.5], 2),
+            "~gate_opening_range",
+            fallback=(3.0, 6.5),
+        )
+        self.gate_height_range = self._ensure_float_tuple(
+            self._get_float_tuple("~gate_height_range", [4.0, 8.5], 2),
+            "~gate_height_range",
+            fallback=(4.0, 8.5),
+        )
+        self.gate_post_thickness_range = self._ensure_float_tuple(
+            self._get_float_tuple("~gate_post_thickness_range", [0.4, 0.9], 2),
+            "~gate_post_thickness_range",
+            fallback=(0.4, 0.9),
+        )
+        self.gate_depth_range = self._ensure_float_tuple(
+            self._get_float_tuple("~gate_depth_range", [0.7, 1.4], 2),
+            "~gate_depth_range",
+            fallback=(0.7, 1.4),
+        )
+        self.gate_top_thickness_range = self._ensure_float_tuple(
+            self._get_float_tuple("~gate_top_thickness_range", [0.3, 0.6], 2),
+            "~gate_top_thickness_range",
+            fallback=(0.3, 0.6),
+        )
+        self.obstacle_color = (0.55, 0.55, 0.55, 0.9)
 
-    def update_from_markers(
-        self,
-        markers: Sequence,
-        use_torch: bool = False,
-        torch_module=None,
-        device=None,
-    ) -> None:
-        """Parse a sequence of visualization markers into cached geometry."""
+        self.marker_pub = rospy.Publisher("world/obstacles", MarkerArray, queue_size=1, latch=True)
+        self.grid_pub = rospy.Publisher("world/occupancy", OccupancyGrid, queue_size=1, latch=True)
 
-        sphere_centers: List[Tuple[float, float, float]] = []
-        sphere_radii: List[float] = []
-        box_centers: List[Tuple[float, float, float]] = []
-        box_sizes: List[Tuple[float, float, float]] = []
-        box_rotations: List[np.ndarray] = []
-        box_inv_rotations: List[np.ndarray] = []
+        self.obstacles: List[Obstacle] = []
 
-        for marker in markers:
-            center = (
-                float(marker.pose.position.x),
-                float(marker.pose.position.y),
-                float(marker.pose.position.z),
-            )
-            size = (
-                max(float(marker.scale.x), 1e-3),
-                max(float(marker.scale.y), 1e-3),
-                max(float(marker.scale.z), 1e-3),
-            )
-            quat = (
-                float(marker.pose.orientation.x),
-                float(marker.pose.orientation.y),
-                float(marker.pose.orientation.z),
-                float(marker.pose.orientation.w),
-            )
-            marker_type = getattr(marker, "type", 0)
-            sphere_type = getattr(marker, "SPHERE", 2)
-            if marker_type == sphere_type:
-                sphere_centers.append(center)
-                sphere_radii.append(size[0] / 2.0)
+        self.regenerate_srv = rospy.Service("~regenerate", Trigger, self.handle_regenerate)
+        rospy.loginfo("world_generator ready - generating initial world")
+        self.generate_world()
+        self.publish_world()
+
+    def handle_regenerate(self, _req: Trigger) -> TriggerResponse:
+        self.generate_world()
+        self.publish_world()
+        return TriggerResponse(success=True, message="World regenerated")
+
+    def generate_world(self) -> None:
+        self.obstacles = []
+        obstacle_total = self._compute_obstacle_total()
+        count = 0
+        half_world_x = self.world_size[0] / 2.0
+        half_world_y = self.world_size[1] / 2.0
+        while count < obstacle_total:
+            x = random.uniform(-self.world_size[0] / 2.0, self.world_size[0] / 2.0)
+            y = random.uniform(-self.world_size[1] / 2.0, self.world_size[1] / 2.0)
+            roll = random.random()
+            if roll < self.sphere_ratio:
+                diameter = random.uniform(self.size_range[0], self.size_range[1])
+                radius = min(diameter / 2.0, self.world_size[2] / 2.0)
+                obstacle = Obstacle(
+                    position=(x, y, radius),
+                    size=(radius * 2.0, radius * 2.0, radius * 2.0),
+                    shape="sphere",
+                )
+                if not self._obstacles_within_world([obstacle], half_world_x, half_world_y):
+                    continue
+                self.obstacles.append(obstacle)
+                count += 1
+            elif roll < self.sphere_ratio + self.gate_ratio:
+                gate_parts = self._create_gate_obstacles(x, y)
+                if gate_parts:
+                    self.obstacles.extend(gate_parts)
+                    count += 1
+                    continue
+                box = self._create_box_obstacle(x, y)
+                if not self._obstacles_within_world([box], half_world_x, half_world_y):
+                    continue
+                self.obstacles.append(box)
+                count += 1
             else:
-                rotation = self._quaternion_to_matrix(quat)
-                box_centers.append(center)
-                box_sizes.append(size)
-                box_rotations.append(rotation)
-                box_inv_rotations.append(rotation.T)
+                box = self._create_box_obstacle(x, y)
+                if not self._obstacles_within_world([box], half_world_x, half_world_y):
+                    continue
+                self.obstacles.append(box)
+                count += 1
+        rospy.loginfo("Generated %d obstacles", len(self.obstacles))
 
-        self.sphere_centers = (
-            np.asarray(sphere_centers, dtype=np.float32)
-            if sphere_centers
-            else np.empty((0, 3), dtype=np.float32)
-        )
-        self.sphere_radii = (
-            np.asarray(sphere_radii, dtype=np.float32)
-            if sphere_radii
-            else np.empty((0,), dtype=np.float32)
-        )
-        self.box_centers = (
-            np.asarray(box_centers, dtype=np.float32)
-            if box_centers
-            else np.empty((0, 3), dtype=np.float32)
-        )
-        if box_sizes:
-            sizes = np.asarray(box_sizes, dtype=np.float32)
-            self.box_half_extents = sizes / 2.0
-        else:
-            self.box_half_extents = np.empty((0, 3), dtype=np.float32)
-        self.box_rotations = (
-            np.asarray(box_rotations, dtype=np.float32)
-            if box_rotations
-            else np.empty((0, 3, 3), dtype=np.float32)
-        )
-        self.box_inv_rotations = (
-            np.asarray(box_inv_rotations, dtype=np.float32)
-            if box_inv_rotations
-            else np.empty((0, 3, 3), dtype=np.float32)
-        )
-
-        if use_torch and torch_module is not None:
-            self._torch = torch_module
-            self._device = device
-            torch_dtype = torch_module.float32
-            if self.sphere_centers.size:
-                self.sphere_centers_t = torch_module.from_numpy(self.sphere_centers).to(
-                    device=device, dtype=torch_dtype
-                )
-                self.sphere_radii_t = torch_module.from_numpy(self.sphere_radii).to(
-                    device=device, dtype=torch_dtype
-                )
+    def publish_world(self) -> None:
+        markers = MarkerArray()
+        timestamp = rospy.Time.now()
+        for idx, obstacle in enumerate(self.obstacles):
+            marker = Marker()
+            marker.header.frame_id = self.frame_id
+            marker.header.stamp = timestamp
+            marker.ns = "obstacles"
+            marker.id = idx
+            marker.type = Marker.SPHERE if obstacle.shape == "sphere" else Marker.CUBE
+            marker.action = Marker.ADD
+            marker.pose.position.x = obstacle.position[0]
+            marker.pose.position.y = obstacle.position[1]
+            marker.pose.position.z = obstacle.position[2]
+            if obstacle.shape == "sphere":
+                marker.pose.orientation.x = 0.0
+                marker.pose.orientation.y = 0.0
+                marker.pose.orientation.z = 0.0
+                marker.pose.orientation.w = 1.0
             else:
-                self.sphere_centers_t = torch_module.empty((0, 3), device=device, dtype=torch_dtype)
-                self.sphere_radii_t = torch_module.empty((0,), device=device, dtype=torch_dtype)
-            if self.box_centers.size:
-                self.box_centers_t = torch_module.from_numpy(self.box_centers).to(
-                    device=device, dtype=torch_dtype
-                )
-                self.box_half_extents_t = torch_module.from_numpy(self.box_half_extents).to(
-                    device=device, dtype=torch_dtype
-                )
-                self.box_rotations_t = torch_module.from_numpy(self.box_rotations).to(
-                    device=device, dtype=torch_dtype
-                )
-                self.box_inv_rotations_t = torch_module.from_numpy(self.box_inv_rotations).to(
-                    device=device, dtype=torch_dtype
-                )
-            else:
-                self.box_centers_t = torch_module.empty((0, 3), device=device, dtype=torch_dtype)
-                self.box_half_extents_t = torch_module.empty((0, 3), device=device, dtype=torch_dtype)
-                self.box_rotations_t = torch_module.empty((0, 3, 3), device=device, dtype=torch_dtype)
-                self.box_inv_rotations_t = torch_module.empty((0, 3, 3), device=device, dtype=torch_dtype)
-        else:
-            self._torch = None
-            self._device = None
-            self.sphere_centers_t = None
-            self.sphere_radii_t = None
-            self.box_centers_t = None
-            self.box_half_extents_t = None
-            self.box_rotations_t = None
-            self.box_inv_rotations_t = None
+                qx, qy, qz, qw = self._yaw_to_quaternion(obstacle.yaw)
+                marker.pose.orientation.x = qx
+                marker.pose.orientation.y = qy
+                marker.pose.orientation.z = qz
+                marker.pose.orientation.w = qw
+            marker.scale.x = obstacle.size[0]
+            marker.scale.y = obstacle.size[1]
+            marker.scale.z = obstacle.size[2]
+            marker.color.r = self.obstacle_color[0]
+            marker.color.g = self.obstacle_color[1]
+            marker.color.b = self.obstacle_color[2]
+            marker.color.a = self.obstacle_color[3]
+            markers.markers.append(marker)
+        self.marker_pub.publish(markers)
+        self.grid_pub.publish(self.create_occupancy_grid(timestamp))
+        rospy.loginfo("Published world markers and occupancy grid")
 
-    def cast_rays_cpu(
-        self, origin: np.ndarray, directions: np.ndarray, max_range: float
-    ) -> RaycastResult:
-        """Intersect a bundle of rays with all stored geometry using NumPy."""
-
-        num_rays = directions.shape[0]
-        best_dist = np.full(num_rays, np.inf, dtype=np.float32)
-        hit_mask = np.zeros(num_rays, dtype=bool)
-        hit_types = np.full(num_rays, -1, dtype=np.int8)
-        hit_indices = np.full(num_rays, -1, dtype=np.int32)
-        normals = np.zeros((num_rays, 3), dtype=np.float32)
-
-        if self.sphere_centers.size:
-            sphere_result = self._intersect_spheres_cpu(origin, directions, max_range)
-            sphere_dist, sphere_idx, sphere_hit_mask = sphere_result
-            update_mask = sphere_hit_mask & (sphere_dist < best_dist)
-            if np.any(update_mask):
-                best_dist[update_mask] = sphere_dist[update_mask]
-                hit_mask[update_mask] = True
-                hit_types[update_mask] = 0
-                hit_indices[update_mask] = sphere_idx[update_mask]
-
-        box_aux = None
-        if self.box_centers.size:
-            box_result = self._intersect_boxes_cpu(origin, directions, max_range)
-            box_dist, box_idx, box_hit_mask, box_aux = box_result
-            update_mask = box_hit_mask & (box_dist < best_dist)
-            if np.any(update_mask):
-                best_dist[update_mask] = box_dist[update_mask]
-                hit_mask[update_mask] = True
-                hit_types[update_mask] = 1
-                hit_indices[update_mask] = box_idx[update_mask]
-
-        if np.any(hit_mask):
-            sphere_hit = hit_mask & (hit_types == 0)
-            if np.any(sphere_hit):
-                idx = hit_indices[sphere_hit]
-                dist = best_dist[sphere_hit]
-                centers = self.sphere_centers[idx]
-                hit_points = origin + directions[sphere_hit] * dist[:, None]
-                normals[sphere_hit] = self._normalize_rows(hit_points - centers)
-
-            box_hit = hit_mask & (hit_types == 1)
-            if np.any(box_hit) and box_aux is not None:
-                local_origin, local_dir = box_aux
-                idx = hit_indices[box_hit]
-                dist = best_dist[box_hit]
-                local_origin_sel = local_origin[idx]
-                # local_dir has shape (num_rays, num_boxes, 3)
-                ld = local_dir[box_hit, idx, :]
-                local_hit = local_origin_sel + ld * dist[:, None]
-                half_extents = self.box_half_extents[idx]
-                abs_diff = np.abs(np.abs(local_hit) - half_extents)
-                axis = np.argmin(abs_diff, axis=1)
-                normal_local = np.zeros_like(local_hit)
-                normal_local[np.arange(normal_local.shape[0]), axis] = np.sign(
-                    local_hit[np.arange(local_hit.shape[0]), axis]
-                )
-                rotations = self.box_rotations[idx]
-                normal_world = np.einsum("mij,mj->mi", rotations, normal_local)
-                normals[box_hit] = self._normalize_rows(normal_world)
-
-        return RaycastResult(best_dist, normals, hit_mask, hit_types, hit_indices)
-
-    def cast_rays_torch(
-        self,
-        torch_module,
-        device,
-        origin: "torch.Tensor",
-        directions: "torch.Tensor",
-        max_range: float,
-    ) -> TorchRaycastResult:
-        """Intersect rays using torch on the requested device."""
-
-        torch = torch_module
-        num_rays = directions.shape[0]
-        dtype = directions.dtype
-        inf = torch.tensor(float("inf"), device=device, dtype=dtype)
-        best_dist = torch.full((num_rays,), float("inf"), device=device, dtype=dtype)
-        hit_mask = torch.zeros(num_rays, dtype=torch.bool, device=device)
-        hit_types = torch.full((num_rays,), -1, dtype=torch.int8, device=device)
-        hit_indices = torch.full((num_rays,), -1, dtype=torch.int64, device=device)
-        normals = torch.zeros((num_rays, 3), device=device, dtype=dtype)
-
-        sphere_data = None
-        if self.sphere_centers_t is not None and self.sphere_centers_t.numel() > 0:
-            sphere_data = self._intersect_spheres_torch(
-                torch, device, origin, directions, max_range
-            )
-            sphere_dist, sphere_idx, sphere_hit_mask = sphere_data
-            update_mask = sphere_hit_mask & (sphere_dist < best_dist)
-            if torch.any(update_mask):
-                best_dist[update_mask] = sphere_dist[update_mask]
-                hit_mask[update_mask] = True
-                hit_types[update_mask] = 0
-                hit_indices[update_mask] = sphere_idx[update_mask]
-
-        box_data = None
-        if self.box_centers_t is not None and self.box_centers_t.numel() > 0:
-            box_data = self._intersect_boxes_torch(
-                torch, device, origin, directions, max_range
-            )
-            box_dist, box_idx, box_hit_mask, box_aux = box_data
-            update_mask = box_hit_mask & (box_dist < best_dist)
-            if torch.any(update_mask):
-                best_dist[update_mask] = box_dist[update_mask]
-                hit_mask[update_mask] = True
-                hit_types[update_mask] = 1
-                hit_indices[update_mask] = box_idx[update_mask]
-
-        if torch.any(hit_mask):
-            if sphere_data is not None:
-                sphere_dist, _, _ = sphere_data
-            if box_data is not None:
-                _, _, _, (local_origin, local_dir) = box_data
-
-            sphere_hit = hit_mask & (hit_types == 0)
-            if torch.any(sphere_hit) and sphere_data is not None:
-                idx = hit_indices[sphere_hit]
-                dist = best_dist[sphere_hit]
-                centers = self.sphere_centers_t[idx]
-                hit_points = origin + directions[sphere_hit] * dist.unsqueeze(1)
-                normals[sphere_hit] = self._normalize_rows_torch(
-                    torch, hit_points - centers
-                )
-
-            box_hit = hit_mask & (hit_types == 1)
-            if torch.any(box_hit) and box_data is not None:
-                idx = hit_indices[box_hit]
-                dist = best_dist[box_hit]
-                local_origin_sel = local_origin[idx]
-                ld = local_dir[box_hit]
-                ld = ld[torch.arange(ld.shape[0], device=device), idx, :]
-                local_hit = local_origin_sel + ld * dist.unsqueeze(1)
-                half_extents = self.box_half_extents_t[idx]
-                abs_diff = torch.abs(torch.abs(local_hit) - half_extents)
-                axis = torch.argmin(abs_diff, dim=1)
-                normal_local = torch.zeros_like(local_hit)
-                row_indices = torch.arange(normal_local.shape[0], device=device)
-                normal_local[row_indices, axis] = torch.sign(local_hit[row_indices, axis])
-                rotations = self.box_rotations_t[idx]
-                normal_world = torch.einsum("mij,mj->mi", rotations, normal_local)
-                normals[box_hit] = self._normalize_rows_torch(torch, normal_world)
-
-        return TorchRaycastResult(best_dist, normals, hit_mask, hit_types, hit_indices)
-
-    # ------------------------------------------------------------------
-    # CPU helpers
-    # ------------------------------------------------------------------
-    def _intersect_spheres_cpu(
-        self, origin: np.ndarray, directions: np.ndarray, max_range: float
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        oc = origin - self.sphere_centers
-        b = 2.0 * directions.dot(oc.T)
-        c = np.sum(oc * oc, axis=1) - self.sphere_radii * self.sphere_radii
-        discriminant = b * b - 4.0 * c
-        mask = discriminant >= 0.0
-        if not np.any(mask):
-            infs = np.full(directions.shape[0], np.inf, dtype=np.float32)
-            idx = np.zeros_like(infs, dtype=np.int32)
-            return infs, idx, np.zeros_like(infs, dtype=bool)
-        sqrt_disc = np.sqrt(np.clip(discriminant, 0.0, None))
-        t1 = (-b - sqrt_disc) / 2.0
-        t2 = (-b + sqrt_disc) / 2.0
-        t_candidate = np.where(t1 > 0.0, t1, t2)
-        hit_matrix = mask & (t_candidate > 0.0)
-        t_candidate = np.where(hit_matrix, t_candidate, np.inf)
-        t_candidate = np.where(t_candidate <= max_range, t_candidate, np.inf)
-        distances = np.min(t_candidate, axis=1)
-        indices = np.argmin(t_candidate, axis=1)
-        hit_mask = np.isfinite(distances)
-        return distances.astype(np.float32), indices.astype(np.int32), hit_mask
-
-    def _intersect_boxes_cpu(
-        self, origin: np.ndarray, directions: np.ndarray, max_range: float
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[np.ndarray, np.ndarray]]:
-        diff = origin - self.box_centers
-        local_origin = np.einsum("bi,bij->bj", diff, self.box_inv_rotations)
-        local_dir = np.einsum("ri,bij->rbj", directions, self.box_inv_rotations)
-        half = self.box_half_extents[np.newaxis, :, :]
-        local_origin_b = local_origin[np.newaxis, :, :]
-
-        abs_dir = np.abs(local_dir)
-        zero_mask = abs_dir <= 1e-6
-        inv_dir = np.empty_like(local_dir)
-        inv_dir[~zero_mask] = 1.0 / local_dir[~zero_mask]
-        inv_dir[zero_mask] = 0.0
-
-        t1 = (-half - local_origin_b) * inv_dir
-        t2 = (half - local_origin_b) * inv_dir
-
-        t1[zero_mask] = -np.inf
-        t2[zero_mask] = np.inf
-
-        outside_mask = zero_mask & (np.abs(local_origin_b) > half)
-        t1[outside_mask] = np.inf
-        t2[outside_mask] = -np.inf
-
-        t_lower = np.minimum(t1, t2)
-        t_upper = np.maximum(t1, t2)
-        t_near = np.max(t_lower, axis=2)
-        t_far = np.min(t_upper, axis=2)
-        t_candidate = np.where(t_near > 0.0, t_near, t_far)
-        valid = (t_far >= t_near) & (t_candidate > 0.0) & (t_candidate <= max_range)
-        t_candidate = np.where(valid, t_candidate, np.inf)
-
-        distances = np.min(t_candidate, axis=1)
-        indices = np.argmin(t_candidate, axis=1)
-        hit_mask = np.isfinite(distances)
-        return (
-            distances.astype(np.float32),
-            indices.astype(np.int32),
-            hit_mask,
-            (local_origin, local_dir),
+    def _create_box_obstacle(self, x: float, y: float) -> Obstacle:
+        height = random.uniform(self.height_range[0], self.height_range[1])
+        max_height = self.world_size[2] * 0.95
+        height = min(height, max_height)
+        sx = random.uniform(self.size_range[0], self.size_range[1])
+        sy = random.uniform(self.size_range[0], self.size_range[1])
+        yaw = random.uniform(-math.pi, math.pi)
+        return Obstacle(
+            position=(x, y, height / 2.0),
+            size=(sx, sy, height),
+            shape="box",
+            yaw=yaw,
         )
 
-    # ------------------------------------------------------------------
-    # Torch helpers
-    # ------------------------------------------------------------------
-    def _intersect_spheres_torch(
-        self,
-        torch,
-        device,
-        origin: "torch.Tensor",
-        directions: "torch.Tensor",
-        max_range: float,
-    ) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
-        oc = origin - self.sphere_centers_t
-        b = 2.0 * directions @ oc.t()
-        c = torch.sum(oc * oc, dim=1) - self.sphere_radii_t * self.sphere_radii_t
-        discriminant = b * b - 4.0 * c
-        mask = discriminant >= 0.0
-        if not torch.any(mask):
-            distances = torch.full(
-                (directions.shape[0],), float("inf"), device=device, dtype=directions.dtype
-            )
-            indices = torch.zeros_like(distances, dtype=torch.int64)
-            return distances, indices, torch.zeros_like(distances, dtype=torch.bool)
-        sqrt_disc = torch.sqrt(torch.clamp(discriminant, min=0.0))
-        t1 = (-b - sqrt_disc) / 2.0
-        t2 = (-b + sqrt_disc) / 2.0
-        t_candidate = torch.where(t1 > 0.0, t1, t2)
-        inf_tensor = torch.full_like(t_candidate, float("inf"))
-        t_candidate = torch.where(mask & (t_candidate > 0.0), t_candidate, inf_tensor)
-        t_candidate = torch.where(t_candidate <= max_range, t_candidate, inf_tensor)
-        distances, indices = torch.min(t_candidate, dim=1)
-        hit_mask = torch.isfinite(distances)
-        return distances, indices, hit_mask
+    def _create_gate_obstacles(self, x: float, y: float) -> List[Obstacle]:
+        half_world_x = self.world_size[0] / 2.0
+        half_world_y = self.world_size[1] / 2.0
+        max_height = self.world_size[2] * 0.95
+        gate_height = random.uniform(self.gate_height_range[0], self.gate_height_range[1])
+        gate_height = min(gate_height, max_height)
+        opening = random.uniform(self.gate_opening_range[0], self.gate_opening_range[1])
+        post_thickness = random.uniform(
+            self.gate_post_thickness_range[0], self.gate_post_thickness_range[1]
+        )
+        depth = random.uniform(self.gate_depth_range[0], self.gate_depth_range[1])
+        top_thickness = random.uniform(
+            self.gate_top_thickness_range[0], self.gate_top_thickness_range[1]
+        )
+        top_thickness = min(top_thickness, max(gate_height * 0.3, self.gate_top_thickness_range[0]))
+        beam_height = gate_height - top_thickness / 2.0
+        if beam_height <= 0.0:
+            return []
 
-    def _intersect_boxes_torch(
-        self,
-        torch,
-        device,
-        origin: "torch.Tensor",
-        directions: "torch.Tensor",
-        max_range: float,
-    ) -> Tuple[
-        "torch.Tensor",
-        "torch.Tensor",
-        "torch.Tensor",
-        Tuple["torch.Tensor", "torch.Tensor"],
-    ]:
-        diff = origin - self.box_centers_t
-        local_origin = torch.einsum("bi,bij->bj", diff, self.box_inv_rotations_t)
-        local_dir = torch.einsum("ri,bij->rbj", directions, self.box_inv_rotations_t)
-        half = self.box_half_extents_t.unsqueeze(0)
-        local_origin_b = local_origin.unsqueeze(0)
+        yaw = random.uniform(-math.pi, math.pi)
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        lateral_offset = opening / 2.0 + post_thickness / 2.0
 
-        abs_dir = torch.abs(local_dir)
-        zero_mask = abs_dir <= 1e-6
-        inv_dir = torch.empty_like(local_dir)
-        inv_dir[~zero_mask] = 1.0 / local_dir[~zero_mask]
-        inv_dir[zero_mask] = 0.0
+        left_center_x = x - lateral_offset * cos_yaw
+        left_center_y = y - lateral_offset * sin_yaw
+        right_center_x = x + lateral_offset * cos_yaw
+        right_center_y = y + lateral_offset * sin_yaw
 
-        t1 = (-half - local_origin_b) * inv_dir
-        t2 = (half - local_origin_b) * inv_dir
+        posts_z = gate_height / 2.0
+        left_post = Obstacle(
+            position=(left_center_x, left_center_y, posts_z),
+            size=(post_thickness, depth, gate_height),
+            shape="box",
+            category="gate",
+            yaw=yaw,
+        )
+        right_post = Obstacle(
+            position=(right_center_x, right_center_y, posts_z),
+            size=(post_thickness, depth, gate_height),
+            shape="box",
+            category="gate",
+            yaw=yaw,
+        )
+        beam = Obstacle(
+            position=(x, y, beam_height),
+            size=(opening + post_thickness * 2.0, depth, top_thickness),
+            shape="box",
+            category="gate",
+            yaw=yaw,
+        )
 
-        neg_inf = torch.full_like(local_dir, float("-inf"))
-        pos_inf = torch.full_like(local_dir, float("inf"))
-        t1 = torch.where(zero_mask, neg_inf, t1)
-        t2 = torch.where(zero_mask, pos_inf, t2)
+        gate_parts = [left_post, right_post, beam]
+        if not self._obstacles_within_world(gate_parts, half_world_x, half_world_y):
+            return []
+        return gate_parts
 
-        outside_mask = zero_mask & (torch.abs(local_origin_b) > half)
-        t1 = torch.where(outside_mask, pos_inf, t1)
-        t2 = torch.where(outside_mask, neg_inf, t2)
+    def create_occupancy_grid(self, timestamp: rospy.Time) -> OccupancyGrid:
+        resolution = float(self.occupancy_resolution)
+        width = int(math.ceil(self.world_size[0] / resolution))
+        height = int(math.ceil(self.world_size[1] / resolution))
+        origin_x = -self.world_size[0] / 2.0
+        origin_y = -self.world_size[1] / 2.0
 
-        t_lower = torch.minimum(t1, t2)
-        t_upper = torch.maximum(t1, t2)
-        t_near = torch.max(t_lower, dim=2).values
-        t_far = torch.min(t_upper, dim=2).values
-        t_candidate = torch.where(t_near > 0.0, t_near, t_far)
-        valid = (t_far >= t_near) & (t_candidate > 0.0) & (t_candidate <= max_range)
-        inf_tensor = torch.full_like(t_candidate, float("inf"))
-        t_candidate = torch.where(valid, t_candidate, inf_tensor)
-        distances, indices = torch.min(t_candidate, dim=1)
-        hit_mask = torch.isfinite(distances)
-        return distances, indices, hit_mask, (local_origin, local_dir)
+        grid = OccupancyGrid()
+        grid.header.frame_id = self.frame_id
+        grid.header.stamp = timestamp
+
+        meta = MapMetaData()
+        meta.resolution = resolution
+        meta.width = width
+        meta.height = height
+        meta.origin.position.x = origin_x
+        meta.origin.position.y = origin_y
+        meta.origin.orientation.w = 1.0
+        grid.info = meta
+
+        data = [0] * (width * height)
+        for obstacle in self.obstacles:
+            if obstacle.shape == "sphere":
+                radius = obstacle.size[0] / 2.0
+                min_x = obstacle.position[0] - radius
+                max_x = obstacle.position[0] + radius
+                min_y = obstacle.position[1] - radius
+                max_y = obstacle.position[1] + radius
+            else:
+                min_x, max_x, min_y, max_y = self._box_bounds(obstacle)
+
+            min_ix = max(0, int((min_x - origin_x) / resolution))
+            max_ix = min(width - 1, int((max_x - origin_x) / resolution))
+            min_iy = max(0, int((min_y - origin_y) / resolution))
+            max_iy = min(height - 1, int((max_y - origin_y) / resolution))
+
+            for iy in range(min_iy, max_iy + 1):
+                for ix in range(min_ix, max_ix + 1):
+                    if obstacle.shape == "sphere":
+                        cell_x = origin_x + (ix + 0.5) * resolution
+                        cell_y = origin_y + (iy + 0.5) * resolution
+                        if (cell_x - obstacle.position[0]) ** 2 + (
+                            cell_y - obstacle.position[1]
+                        ) ** 2 > radius ** 2:
+                            continue
+                    else:
+                        cell_x = origin_x + (ix + 0.5) * resolution
+                        cell_y = origin_y + (iy + 0.5) * resolution
+                        if not self._point_inside_box(cell_x, cell_y, obstacle):
+                            continue
+                    data[iy * width + ix] = 100
+        grid.data = data
+        return grid
+
+    def _compute_obstacle_total(self) -> int:
+        if self.obstacle_density > 0.0:
+            area = self.world_size[0] * self.world_size[1]
+            total = int(area * self.obstacle_density)
+            return max(total, 1)
+        return max(self.obstacle_count, 1)
 
     @staticmethod
-    def _normalize_rows(vectors: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        norms = np.clip(norms, eps, None)
-        return vectors / norms
+    def _yaw_to_quaternion(yaw: float) -> Tuple[float, float, float, float]:
+        half = yaw * 0.5
+        return (0.0, 0.0, math.sin(half), math.cos(half))
 
     @staticmethod
-    def _normalize_rows_torch(torch, vectors: "torch.Tensor", eps: float = 1e-8):
-        norms = torch.linalg.norm(vectors, dim=1, keepdim=True)
-        norms = torch.clamp(norms, min=eps)
-        return vectors / norms
+    def _rotate_point(x: float, y: float, cos_yaw: float, sin_yaw: float) -> Tuple[float, float]:
+        return (x * cos_yaw - y * sin_yaw, x * sin_yaw + y * cos_yaw)
+
+    def _box_corners(self, obstacle: Obstacle) -> List[Tuple[float, float]]:
+        half_x = obstacle.size[0] / 2.0
+        half_y = obstacle.size[1] / 2.0
+        cos_yaw = math.cos(obstacle.yaw)
+        sin_yaw = math.sin(obstacle.yaw)
+        local_corners = [
+            (-half_x, -half_y),
+            (-half_x, half_y),
+            (half_x, -half_y),
+            (half_x, half_y),
+        ]
+        corners: List[Tuple[float, float]] = []
+        for lx, ly in local_corners:
+            rx, ry = self._rotate_point(lx, ly, cos_yaw, sin_yaw)
+            corners.append((obstacle.position[0] + rx, obstacle.position[1] + ry))
+        return corners
+
+    def _box_bounds(self, obstacle: Obstacle) -> Tuple[float, float, float, float]:
+        corners = self._box_corners(obstacle)
+        xs = [pt[0] for pt in corners]
+        ys = [pt[1] for pt in corners]
+        return (min(xs), max(xs), min(ys), max(ys))
+
+    def _point_inside_box(self, x: float, y: float, obstacle: Obstacle) -> bool:
+        rel_x = x - obstacle.position[0]
+        rel_y = y - obstacle.position[1]
+        cos_yaw = math.cos(obstacle.yaw)
+        sin_yaw = math.sin(obstacle.yaw)
+        local_x = rel_x * cos_yaw + rel_y * sin_yaw
+        local_y = -rel_x * sin_yaw + rel_y * cos_yaw
+        half_x = obstacle.size[0] / 2.0
+        half_y = obstacle.size[1] / 2.0
+        return abs(local_x) <= half_x and abs(local_y) <= half_y
+
+    def _obstacles_within_world(
+        self, obstacles: List[Obstacle], half_world_x: float, half_world_y: float
+    ) -> bool:
+        for obstacle in obstacles:
+            if obstacle.shape == "sphere":
+                radius = obstacle.size[0] / 2.0
+                if (
+                    obstacle.position[0] - radius < -half_world_x
+                    or obstacle.position[0] + radius > half_world_x
+                    or obstacle.position[1] - radius < -half_world_y
+                    or obstacle.position[1] + radius > half_world_y
+                ):
+                    return False
+            else:
+                min_x, max_x, min_y, max_y = self._box_bounds(obstacle)
+                if (
+                    min_x < -half_world_x
+                    or max_x > half_world_x
+                    or min_y < -half_world_y
+                    or max_y > half_world_y
+                ):
+                    return False
+        return True
 
     @staticmethod
-    def _quaternion_to_matrix(quat: Iterable[float]) -> np.ndarray:
-        if abs(sum(q * q for q in quat)) <= 1e-12:
-            return np.identity(3, dtype=np.float32)
-        matrix = transformations.quaternion_matrix(quat)
-        return matrix[0:3, 0:3].astype(np.float32)
+    def _maybe_parse_literal(value, name: str = ""):
+        if isinstance(value, str):
+            try:
+                return ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                if name:
+                    rospy.logwarn("Failed to parse parameter %s as literal, using raw string", name)
+                else:
+                    rospy.logwarn("Failed to parse parameter value '%s' as literal", value)
+        return value
 
+    @classmethod
+    def _coerce_sequence(cls, value) -> Iterable:
+        parsed = cls._maybe_parse_literal(value)
+        if isinstance(parsed, (list, tuple)):
+            return parsed
+        if hasattr(parsed, "__iter__") and not isinstance(parsed, (str, bytes)):
+            return list(parsed)
+        return [parsed]
+
+    @classmethod
+    def _get_float_list(cls, name: str, default: List[float], expected_len: int) -> List[float]:
+        raw = rospy.get_param(name, default)
+        sequence = cls._coerce_sequence(cls._maybe_parse_literal(raw, name))
+        values: List[float] = []
+        for item in sequence:
+            try:
+                values.append(float(item))
+            except (TypeError, ValueError):
+                try:
+                    values.append(float(str(item)))
+                except (TypeError, ValueError):
+                    rospy.logwarn(
+                        "Parameter %s contains non-numeric entry %r, using default",
+                        name,
+                        item,
+                    )
+                    return list(default)
+        if len(values) != expected_len:
+            rospy.logwarn(
+                "Parameter %s expected %d values but got %d, falling back to default",
+                name,
+                expected_len,
+                len(values),
+            )
+            return list(default)
+        return values
+
+    @classmethod
+    def _get_float_tuple(
+        cls, name: str, default: List[float], expected_len: int
+    ) -> Tuple[float, ...]:
+        values = cls._get_float_list(name, default, expected_len)
+        sanitized: List[float] = []
+        for idx, item in enumerate(values):
+            try:
+                sanitized.append(float(item))
+            except (TypeError, ValueError):
+                rospy.logwarn(
+                    "Parameter %s entry %d=%r could not be coerced to float, using default",
+                    name,
+                    idx,
+                    item,
+                )
+                return tuple(float(v) for v in default)
+        return tuple(sanitized)
+
+    @staticmethod
+    def _ensure_float_tuple(
+        values: Iterable, name: str, fallback: Iterable
+    ) -> Tuple[float, ...]:
+        coerced: List[float] = []
+        for idx, item in enumerate(values):
+            try:
+                coerced.append(float(item))
+            except (TypeError, ValueError):
+                rospy.logwarn(
+                    "Parameter %s entry %d=%r could not be coerced to float, using fallback",
+                    name,
+                    idx,
+                    item,
+                )
+                return tuple(float(v) for v in fallback)
+        return tuple(coerced)
+
+    @classmethod
+    def _get_float(cls, name: str, default: float) -> float:
+        raw = rospy.get_param(name, default)
+        parsed = cls._maybe_parse_literal(raw, name)
+        try:
+            return float(parsed)
+        except (TypeError, ValueError):
+            try:
+                return float(str(parsed))
+            except (TypeError, ValueError):
+                rospy.logwarn(
+                    "Parameter %s could not be parsed as float, using default", name
+                )
+            return float(default)
+
+    @classmethod
+    def _get_int(cls, name: str, default: int) -> int:
+        raw = rospy.get_param(name, default)
+        parsed = cls._maybe_parse_literal(raw, name)
+        try:
+            return int(parsed)
+        except (TypeError, ValueError):
+            try:
+                return int(float(str(parsed)))
+            except (TypeError, ValueError):
+                rospy.logwarn(
+                    "Parameter %s could not be parsed as int, using default", name
+                )
+            return int(default)
+
+
+def main() -> None:
+    rospy.init_node("world_generator")
+    WorldGenerator()
+    rospy.spin()
+
+
+if __name__ == "__main__":
+    main()
