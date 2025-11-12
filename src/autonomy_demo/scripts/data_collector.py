@@ -68,6 +68,17 @@ class DataCollector:
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.sample_count = 0
+        # Optional exports similar to C++ pipeline
+        self.save_depth_png = bool(rospy.get_param("~save_depth_png", True))
+        self.depth_dir = self.output_dir / "depth"
+        if self.save_depth_png:
+            self.depth_dir.mkdir(parents=True, exist_ok=True)
+        self.save_pose_csv = bool(rospy.get_param("~save_pose_csv", True))
+        self.pose_csv_path = Path(rospy.get_param("~pose_csv_path", str(self.output_dir / "poses.csv")))
+        if self.save_pose_csv and not self.pose_csv_path.exists():
+            self.pose_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.pose_csv_path.open("w") as f:
+                f.write("id,px,py,pz,qw,qx,qy,qz\n")
 
         self.hardware_accel = rospy.get_param("~hardware_accel", False)
         self.hardware_device = rospy.get_param("~hardware_device", "cuda")
@@ -206,6 +217,7 @@ class DataCollector:
             output_path,
             image=cv_image,
             label=label_map,
+            obstacle=label_map.astype(np.float32),  # explicit obstacle channel (1=obstacle)
             distances=distances,
             header=self._header_to_dict(msg.header),
             pose_position=pose_position,
@@ -219,6 +231,27 @@ class DataCollector:
         )
         self.sample_count += 1
         rospy.loginfo_throttle(5.0, "Captured %d samples", self.sample_count)
+        # Optional: save 16-bit depth PNG and append pose CSV
+        if self.save_depth_png:
+            depth_norm = np.clip(distances / float(self.max_range), 0.0, 1.0)
+            depth_u16 = (depth_norm * 65535.0).astype(np.uint16)
+            depth_path = self.depth_dir / f"depth_{self.sample_count - 1:06d}.png"
+            import cv2  # local import to avoid global dependency at module load
+            cv2.imwrite(str(depth_path), depth_u16)
+        if self.save_pose_csv:
+            with self.pose_csv_path.open("a") as f:
+                f.write(
+                    "{:06d},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f}\n".format(
+                        self.sample_count - 1,
+                        pose_position[0],
+                        pose_position[1],
+                        pose_position[2],
+                        pose_orientation[3],  # qw
+                        pose_orientation[0],  # qx
+                        pose_orientation[1],  # qy
+                        pose_orientation[2],  # qz
+                    )
+                )
         
     @staticmethod
     def _header_to_dict(header: Header) -> dict:
