@@ -12,5 +12,8 @@
     <param name="near_threshold" value="4.0" />
     <param name="hardware_accel" value="$(arg hardware_accel)" />
     <param name="hardware_device" value="$(arg hardware_device)" />
+    <param name="save_depth_png" value="true" />
+    <param name="save_pose_csv" value="true" />
+    <param name="pose_csv_path" value="$(env HOME)/autonomy_demo/dataset/poses.csv" />
   </node>
 </launch>
