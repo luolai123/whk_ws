@@ -1,0 +1,32 @@
+<launch>
+  <!-- 分别启动图像分割和导航策略推理节点 -->
+  <arg name="hardware_accel" default="false" />
+  <arg name="hardware_device" default="cuda" />
+  <arg name="segmentation_model_path" default="$(env HOME)/autonomy_demo/segmentation_model.pt" />
+  <arg name="policy_path" default="$(env HOME)/autonomy_demo/navigation_policy.pt" />
+
+  <include file="$(find autonomy_demo)/launch/sim.launch">
+    <arg name="hardware_accel" value="$(arg hardware_accel)" />
+    <arg name="hardware_device" value="$(arg hardware_device)" />
+  </include>
+
+  <!-- 图像分割推理节点 -->
+  <node pkg="autonomy_demo" type="inference_segmentation.py" name="segmentation_inference" output="screen">
+    <param name="model_path" value="$(arg segmentation_model_path)" />
+    <param name="safe_probability_threshold" value="0.55" />
+    <param name="use_dynamic_threshold" value="true" />
+    <param name="dynamic_percentile" value="0.6" />
+  </node>
+
+  <!-- 安全导航策略推理节点 -->
+  <node pkg="autonomy_demo" type="inference_navigation_policy.py" name="navigation_policy_inference" output="screen">
+    <param name="policy_path" value="$(arg policy_path)" />
+    <param name="min_safe_fraction" value="0.05" />
+    <param name="default_speed" value="3.0" />
+    <param name="safe_probability_threshold" value="0.55" />
+    <param name="goal_tolerance" value="0.3" />
+    <param name="primitive_steps" value="4" />
+    <param name="primitive_dt" value="0.25" />
+  </node>
+</launch>
+
