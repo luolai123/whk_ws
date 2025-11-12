@@ -83,6 +83,30 @@ class DistanceClassifier(torch.nn.Module):
         return self.classifier(x)
 
 
+class TeacherDistanceClassifier(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.enc1 = ConvBlock(4, 32)
+        self.enc2 = ConvBlock(32, 64)
+        self.enc3 = ConvBlock(64, 128)
+        self.pool = torch.nn.MaxPool2d(2)
+        self.bottleneck = ConvBlock(128, 256)
+        self.up3 = UpBlock(256, 128)
+        self.up2 = UpBlock(128, 64)
+        self.up1 = UpBlock(64, 32)
+        self.classifier = torch.nn.Conv2d(32, 2, kernel_size=1)
+
+    def forward(self, x_rgb: torch.Tensor, x_obstacle: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([x_rgb, x_obstacle], dim=1)
+        x1 = self.enc1(x)
+        x2 = self.enc2(self.pool(x1))
+        x3 = self.enc3(self.pool(x2))
+        bottleneck = self.bottleneck(self.pool(x3))
+        x = self.up3(bottleneck, x3)
+        x = self.up2(x, x2)
+        x = self.up1(x, x1)
+        return self.classifier(x)
+
 class ObstacleDataset(Dataset):
     def __init__(
         self,
@@ -98,20 +122,39 @@ class ObstacleDataset(Dataset):
         else:
             self.indices = list(indices)
         self.augment = augment
+        probe = np.load(self.files[0])
+        self.has_obstacle = ("obstacle" in probe) or ("obstacle_map" in probe)
 
     def __len__(self) -> int:
         return len(self.indices)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         file_path = self.files[self.indices[idx]]
         sample = np.load(file_path)
         image = sample["image"].astype(np.float32) / 255.0
         label = sample["label"].astype(np.int64)
+        # Robust per-sample check for obstacle channel
+        try:
+            keys = set(sample.files)  # np.lib.npyio.NpzFile
+        except Exception:  # pylint: disable=broad-except
+            try:
+                keys = set(sample.keys())  # type: ignore[attr-defined]
+            except Exception:  # pylint: disable=broad-except
+                keys = set()
+        if "obstacle" in keys:
+            obstacle = sample["obstacle"].astype(np.float32)
+        elif "obstacle_map" in keys:
+            obstacle = sample["obstacle_map"].astype(np.float32)
+        else:
+            obstacle = (label == 1).astype(np.float32)
+        if obstacle.ndim == 3 and obstacle.shape[2] == 1:
+            obstacle = obstacle[..., 0]
 
         if self.augment:
             if random.random() < 0.5:
                 image = np.flip(image, axis=1).copy()
                 label = np.flip(label, axis=1).copy()
+                obstacle = np.flip(obstacle, axis=1).copy()
             if random.random() < 0.25:
                 brightness = 0.1 * (random.random() - 0.5)
                 image = np.clip(image + brightness, 0.0, 1.0).astype(np.float32)
@@ -121,7 +164,8 @@ class ObstacleDataset(Dataset):
 
         image_tensor = torch.from_numpy(image).permute(2, 0, 1)
         label_tensor = torch.from_numpy(label)
-        return image_tensor, label_tensor
+        obstacle_tensor = torch.from_numpy(obstacle).unsqueeze(0)
+        return image_tensor, label_tensor, obstacle_tensor
 
     def estimate_class_weights(self, sample_limit: int = 256) -> torch.Tensor:
         safe_pixels = 0
@@ -304,7 +348,11 @@ def evaluate_classifier(
     total_pixels = 0
 
     with torch.no_grad():
-        for images, labels in loader:
+        for batch in loader:
+            if len(batch) == 3:
+                images, labels, _obstacle = batch
+            else:
+                images, labels = batch  # type: ignore[misc]
             images = images.to(device)
             labels = labels.to(device)
             logits = model(images)
@@ -338,6 +386,10 @@ def train(
     device: torch.device,
     epochs: int,
     lr: float,
+    use_distill: bool = False,
+    modality_dropout_p: float = 0.3,
+    distill_weight: float = 0.5,
+    teacher_weight: float = 0.0,
 ) -> Tuple[List[float], List[float]]:
     class_weights: Optional[torch.Tensor] = None
     if isinstance(train_loader.dataset, ObstacleDataset):
@@ -352,20 +404,65 @@ def train(
 
     criterion = SegmentationLoss(class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    kldiv = torch.nn.KLDivLoss(reduction="batchmean")
+
+    teacher: Optional[TeacherDistanceClassifier] = None
+    if use_distill:
+        teacher = TeacherDistanceClassifier().to(device)
+        with torch.no_grad():
+            student_state = model.state_dict()
+            teacher_state = teacher.state_dict()
+            for name, t_weight in teacher_state.items():
+                if name in student_state and student_state[name].shape == t_weight.shape:
+                    teacher_state[name] = student_state[name]
+            teacher.load_state_dict(teacher_state)
+        teacher.train()
+        teacher_optimizer = torch.optim.Adam(teacher.parameters(), lr=lr)
     train_losses: List[float] = []
     val_losses: List[float] = []
 
     for epoch in range(epochs):
         model.train()
+        if teacher is not None:
+            teacher.train()
         running_loss = 0.0
-        for images, labels in train_loader:
+        for batch in train_loader:
+            if len(batch) == 3:
+                images, labels, obstacle = batch
+            else:
+                images, labels = batch  # type: ignore[misc]
+                obstacle = torch.zeros((images.shape[0], 1, images.shape[2], images.shape[3]), dtype=images.dtype)
             images = images.to(device)
             labels = labels.to(device)
+            obstacle = obstacle.to(device)
             optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            if teacher is not None:
+                teacher_optimizer.zero_grad()
+
+            outputs_student = model(images)
+            loss_student = criterion(outputs_student, labels)
+            loss = loss_student
+
+            if teacher is not None:
+                if modality_dropout_p > 0.0 and teacher.training:
+                    drop_mask = (torch.rand(obstacle.shape[0], device=device) < modality_dropout_p).float().view(-1, 1, 1, 1)
+                    obstacle_in = obstacle * (1.0 - drop_mask)
+                else:
+                    obstacle_in = obstacle
+                outputs_teacher = teacher(images, obstacle_in)
+                loss_teacher = criterion(outputs_teacher, labels)
+                logprob_student = torch.log_softmax(outputs_student, dim=1)
+                prob_teacher = torch.softmax(outputs_teacher.detach(), dim=1)
+                loss_distill = kldiv(logprob_student, prob_teacher)
+                # Important: do NOT include teacher_loss into student's backward to avoid double graph traversal
+                loss = loss_student + distill_weight * loss_distill
+
             loss.backward()
             optimizer.step()
+            if teacher is not None:
+                # Backprop teacher on its supervised loss only
+                loss_teacher.backward()
+                teacher_optimizer.step()
             running_loss += loss.item()
         avg_train_loss = running_loss / max(1, len(train_loader))
         train_losses.append(avg_train_loss)
@@ -373,7 +470,11 @@ def train(
         model.eval()
         running_val = 0.0
         with torch.no_grad():
-            for images, labels in val_loader:
+            for batch in val_loader:
+                if len(batch) == 3:
+                    images, labels, _obstacle = batch
+                else:
+                    images, labels = batch  # type: ignore[misc]
                 images = images.to(device)
                 labels = labels.to(device)
                 outputs = model(images)
@@ -727,6 +828,10 @@ def parse_args() -> argparse.Namespace:
         type=pathlib.Path,
         default=pathlib.Path.home() / "autonomy_demo" / "navigation_policy.pt",
     )
+    parser.add_argument("--distill", action="store_true", help="Enable teacher-student distillation with obstacle channel")
+    parser.add_argument("--distill_weight", type=float, default=0.5, help="Weight for KL distillation loss")
+    parser.add_argument("--teacher_weight", type=float, default=0.0, help="Supervised loss weight on teacher branch")
+    parser.add_argument("--modality_dropout", type=float, default=0.3, help="Probability to drop obstacle channel for teacher input")
     return parser.parse_args()
 
 
@@ -757,7 +862,18 @@ def main() -> None:
     val_loader = DataLoader(val_dataset, batch_size=args.batch)
 
     model = DistanceClassifier().to(device)
-    train(model, train_loader, val_loader, device, args.epochs, args.lr)
+    train(
+        model,
+        train_loader,
+        val_loader,
+        device,
+        args.epochs,
+        args.lr,
+        use_distill=args.distill,
+        modality_dropout_p=max(0.0, min(1.0, args.modality_dropout)),
+        distill_weight=max(0.0, args.distill_weight),
+        teacher_weight=max(0.0, args.teacher_weight),
+    )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), args.output)
