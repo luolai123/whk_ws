@@ -163,6 +163,13 @@ class InferenceNode:
         self.clearance_softening = float(rospy.get_param("~clearance_softening", 0.18))
         self.max_heading_rate = math.radians(rospy.get_param("~max_heading_rate_deg", 110.0))
         self.max_jerk = float(rospy.get_param("~max_jerk_mps3", 35.0))
+        pitch_deg = float(rospy.get_param("~camera_pitch_deg", 10.0))
+        pitch_rad = -math.radians(pitch_deg)
+        self._camera_mount_quat = transformations.quaternion_from_euler(0.0, pitch_rad, 0.0)
+        self._camera_mount_matrix = (
+            transformations.quaternion_matrix(self._camera_mount_quat)[0:3, 0:3]
+        ).astype(np.float32)
+        self._camera_to_body = self._camera_mount_matrix.T
 
         self.camera_info: Optional[CameraInfo] = None
         self.odom: Optional[Odometry] = None
@@ -303,6 +310,7 @@ class InferenceNode:
 
         fov_deg = math.degrees(2.0 * math.atan(self.tan_half_h))
         base_direction = compute_direction_from_pixel(center_col, center_row, width, height, fov_deg)
+        base_direction = clamp_normalized(base_direction.dot(self._camera_to_body))
         origin = np.array(
             [
                 self.odom.pose.pose.position.x,
@@ -607,7 +615,8 @@ class InferenceNode:
         clearances: List[float] = []
         min_dim = max(float(min_dim), 1.0)
         for direction in directions:
-            col, row = project_direction_to_pixel(direction, width, height, fov_deg)
+            camera_dir = clamp_normalized(direction.dot(self._camera_mount_matrix))
+            col, row = project_direction_to_pixel(camera_dir, width, height, fov_deg)
             if not (0.0 <= col < width and 0.0 <= row < height):
                 return None
             col_idx = int(round(col))

@@ -14,6 +14,7 @@
     <param name="policy_path" value="$(arg policy_path)" />
     <param name="primitive_steps" value="4" />
     <param name="primitive_dt" value="0.25" />
+    <param name="camera_pitch_deg" value="10.0" />
     <param name="yopo_yaw_deg" value="[-14.0, -8.0, -4.0, 0.0, 4.0, 8.0, 14.0]" />
     <param name="yopo_pitch_deg" value="[-8.0, -4.0, 0.0, 4.0, 8.0]" />
     <param name="primitive_length_scales" value="[0.85, 1.0, 1.15]" />

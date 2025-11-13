@@ -60,17 +60,21 @@ class CameraSimulator:
         )
         offset_raw = rospy.get_param("~camera_offset", [0.15, 0.0, 0.05])
         offset_parsed = self._maybe_parse_literal(offset_raw, "~camera_offset")
+        default_offset = [0.15, 0.0, 0.05]
+        self.camera_offset = default_offset[:]
         if isinstance(offset_parsed, (list, tuple)) and len(offset_parsed) >= 3:
             try:
-                self.camera_offset = [float(offset_parsed[0]), float(offset_parsed[1]), float(offset_parsed[2])]
+                self.camera_offset = [
+                    float(offset_parsed[0]),
+                    float(offset_parsed[1]),
+                    float(offset_parsed[2]),
+                ]
             except (TypeError, ValueError):
                 rospy.logwarn("Camera offset parameter malformed, using default offset")
-            self.camera_offset = [0.15, 0.0, 0.05]
-        else:
-            self.camera_offset = [0.15, 0.0, 0.05]
+                self.camera_offset = default_offset[:]
 
         pitch_deg = self._get_float_param("~camera_pitch_deg", 10.0)
-        pitch_rad = math.radians(pitch_deg)
+        pitch_rad = -math.radians(pitch_deg)
         self._camera_mount_quat = transformations.quaternion_from_euler(0.0, pitch_rad, 0.0)
         self._camera_mount_matrix = (
             transformations.quaternion_matrix(self._camera_mount_quat)[0:3, 0:3]
