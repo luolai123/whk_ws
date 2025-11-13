@@ -277,31 +277,40 @@ def path_smoothness(points: Iterable[np.ndarray]) -> float:
     return math.exp(-avg_angle)
 
 
-def jerk_score(points: Iterable[np.ndarray], dt: float) -> float:
-    """Return a smoothness score penalising large jerk magnitudes."""
+def jerk_metrics(points: Iterable[np.ndarray], dt: float) -> Tuple[float, float]:
+    """Return a smoothness score and the maximum jerk magnitude."""
 
     samples = [np.asarray(pt, dtype=np.float32) for pt in points]
     if len(samples) < 4:
-        return 1.0
+        return 1.0, 0.0
 
     dt = max(float(dt), 1e-3)
     velocities = np.diff(samples, axis=0) / dt
     if velocities.shape[0] < 3:
-        return 1.0
+        return 1.0, 0.0
     accelerations = np.diff(velocities, axis=0) / dt
     if accelerations.shape[0] < 2:
-        return 1.0
+        return 1.0, 0.0
     jerks = np.diff(accelerations, axis=0) / dt
     if jerks.size == 0:
-        return 1.0
+        return 1.0, 0.0
 
     norms = np.linalg.norm(jerks, axis=1)
     max_jerk = float(np.max(norms))
-    return math.exp(-max_jerk)
+    return math.exp(-max_jerk), max_jerk
 
 
-def orientation_rate_score(directions: Iterable[np.ndarray]) -> float:
-    """Return a penalty for rapid heading changes between primitive steps."""
+def jerk_score(points: Iterable[np.ndarray], dt: float) -> float:
+    """Return the smoothness score associated with ``jerk_metrics``."""
+
+    score, _ = jerk_metrics(points, dt)
+    return score
+
+
+def orientation_rate_stats(
+    directions: Iterable[np.ndarray], dt: float = 1.0
+) -> Tuple[float, float]:
+    """Return an orientation score and the max heading-change rate."""
 
     unit_vectors: List[np.ndarray] = []
     for direction in directions:
@@ -312,7 +321,7 @@ def orientation_rate_score(directions: Iterable[np.ndarray]) -> float:
         unit_vectors.append(vec / norm)
 
     if len(unit_vectors) < 2:
-        return 1.0
+        return 1.0, 0.0
 
     max_angle = 0.0
     for idx in range(1, len(unit_vectors)):
@@ -320,7 +329,16 @@ def orientation_rate_score(directions: Iterable[np.ndarray]) -> float:
         dot = max(-1.0, min(1.0, dot))
         max_angle = max(max_angle, abs(math.acos(dot)))
 
-    return math.exp(-max_angle)
+    dt = max(float(dt), 1e-3)
+    rate = max_angle / dt
+    return math.exp(-max_angle), rate
+
+
+def orientation_rate_score(directions: Iterable[np.ndarray]) -> float:
+    """Return the smoothness score for heading changes."""
+
+    score, _ = orientation_rate_stats(directions)
+    return score
 
 
 def clamp_normalized(vec: np.ndarray) -> np.ndarray:

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Inference node that loads trained models and emits safe navigation primitives."""
 
+import ast
 import math
 import pathlib
 import time
@@ -28,8 +29,8 @@ from autonomy_demo.safe_navigation import (
     clamp_normalized,
     compute_direction_from_pixel,
     find_largest_safe_region,
-    jerk_score,
-    orientation_rate_score,
+    jerk_metrics,
+    orientation_rate_stats,
     path_smoothness,
     project_direction_to_pixel,
     sample_yopo_directions,
@@ -157,9 +158,11 @@ class InferenceNode:
         self.min_safe_fraction = float(rospy.get_param("~min_safe_fraction", 0.05))
         self.default_speed = float(rospy.get_param("~default_speed", 3.0))
         self.safe_threshold = float(rospy.get_param("~safe_probability_threshold", 0.55))
-        self.use_dynamic_threshold = bool(rospy.get_param("~use_dynamic_threshold", True))
-        self.dynamic_percentile = float(rospy.get_param("~dynamic_percentile", 0.6))
         self.goal_tolerance = float(rospy.get_param("~goal_tolerance", 0.3))
+        self.min_clearance_fraction = float(rospy.get_param("~min_clearance_fraction", 0.08))
+        self.clearance_softening = float(rospy.get_param("~clearance_softening", 0.18))
+        self.max_heading_rate = math.radians(rospy.get_param("~max_heading_rate_deg", 110.0))
+        self.max_jerk = float(rospy.get_param("~max_jerk_mps3", 35.0))
 
         self.camera_info: Optional[CameraInfo] = None
         self.odom: Optional[Odometry] = None
@@ -185,18 +188,26 @@ class InferenceNode:
         primitive_steps = int(rospy.get_param("~primitive_steps", 4))
         self.primitive_steps = max(3, min(5, primitive_steps))
         self.primitive_dt = float(rospy.get_param("~primitive_dt", 0.25))
-
-        # 新增的偏移参数读取
-        offset_mode = rospy.get_param('~offset_mode', 'cartesian')  # 'cartesian' or 'polar'
-        self.offset_params = {
-            'x': float(rospy.get_param('~offset_x', 0.0)),
-            'y': float(rospy.get_param('~offset_y', 0.0)),
-            'z': float(rospy.get_param('~offset_z', 0.0)),
-            'yaw': float(rospy.get_param('~offset_yaw', 0.0)),
-            'pitch': float(rospy.get_param('~offset_pitch', 0.0)),
-            'length': float(rospy.get_param('~offset_length', 0.0)),
-            'mode': offset_mode
-        }
+        yaw_defaults = [-14.0, -8.0, -4.0, 0.0, 4.0, 8.0, 14.0]
+        pitch_defaults = [-8.0, -4.0, 0.0, 4.0, 8.0]
+        length_defaults = [0.85, 1.0, 1.15]
+        self._yaw_candidates = [
+            math.radians(val) for val in self._coerce_float_list("~yopo_yaw_deg", yaw_defaults)
+        ]
+        self._yaw_candidates.sort(key=lambda angle: abs(angle))
+        self._pitch_candidates = [
+            math.radians(val)
+            for val in self._coerce_float_list("~yopo_pitch_deg", pitch_defaults)
+        ]
+        self._pitch_candidates.sort(key=lambda angle: abs(angle))
+        self._length_candidates = self._coerce_float_list(
+            "~primitive_length_scales", length_defaults
+        )
+        self._length_candidates.sort(key=lambda value: abs(value - 1.0))
+        if not self._length_candidates:
+            self._length_candidates = [1.0]
+        self._candidate_table = self._build_candidate_table()
+        self.policy_jitter_deg = float(rospy.get_param("~policy_jitter_deg", 4.0))
 
     def camera_info_callback(self, info: CameraInfo) -> None:
         self.camera_info = info
@@ -255,14 +266,7 @@ class InferenceNode:
         obstacle_prob = probs[:, 1, :, :].squeeze(0).cpu().numpy()
         safe_prob = cv2.GaussianBlur(safe_prob, (5, 5), 0)
         obstacle_prob = cv2.GaussianBlur(obstacle_prob, (5, 5), 0)
-        threshold = self.safe_threshold
-        if self.use_dynamic_threshold:
-            # percentile based threshold to avoid "all-safe"/"all-obstacle"
-            flat = safe_prob.reshape(-1)
-            percentile = np.clip(self.dynamic_percentile, 0.2, 0.9)
-            threshold = float(np.percentile(flat, 100.0 * percentile))
-            threshold = max(self.safe_threshold, threshold)
-        safe_mask = safe_prob >= threshold
+        safe_mask = safe_prob >= self.safe_threshold
         kernel = np.ones((3, 3), dtype=np.uint8)
         cleaned = cv2.morphologyEx(safe_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
@@ -280,26 +284,15 @@ class InferenceNode:
         label_msg.header.frame_id = rospy.get_param("~output_frame", msg.header.frame_id)
         self.label_pub.publish(label_msg)
 
-        # find connected components and extract up to K centroids (largest first)
-        num_labels, labels_cc, stats, centroids = cv2.connectedComponentsWithStats(safe_mask.astype(np.uint8), connectivity=4)
-        regions: list = []
-        total_pixels = height * width
-        min_pixels = max(1, int(total_pixels * self.min_safe_fraction))
-        for i in range(1, num_labels):
-            area = int(stats[i, cv2.CC_STAT_AREA])
-            if area < min_pixels:
-                continue
-            cy, cx = centroids[i]
-            regions.append((area, float(cy), float(cx)))
-        regions.sort(key=lambda r: r[0], reverse=True)
-        if not regions:
+        region = find_largest_safe_region(safe_mask, self.min_safe_fraction)
+        if region is None:
             self._publish_fallback(msg.header.stamp)
             self._log_timing(start_time)
             return
-        # Try multiple centroid targets (top-K)
-        K = min(5, len(regions))
-        center_row, center_col = regions[0][1], regions[0][2]
-        safe_fraction = regions[0][0] / float(total_pixels)
+
+        center_row, center_col = region.centroid
+        total_pixels = height * width
+        safe_fraction = region.area / float(total_pixels)
 
         safe_msg = PointStamped()
         safe_msg.header = msg.header
@@ -355,31 +348,25 @@ class InferenceNode:
             )
             policy_offsets = (length_est, pitch_est, yaw_est)
 
-        best_candidate = None
-        for idx in range(K):
-            crow, ccol = regions[idx][1], regions[idx][2]
-            base_dir_k = compute_direction_from_pixel(ccol, crow, width, height, fov_deg)
-            cand = self._select_candidate(
-                base_dir_k,
-                policy_offsets,
-                safe_mask,
-                safe_prob,
-                distance_field,
-                width,
-                height,
-                fov_deg,
-                rotation,
-                origin,
-                speed,
-            )
-            if cand is not None and (best_candidate is None or cand["score"] > best_candidate["score"]):
-                best_candidate = cand
+        candidate = self._select_candidate(
+            base_direction,
+            policy_offsets,
+            safe_mask,
+            safe_prob,
+            distance_field,
+            width,
+            height,
+            fov_deg,
+            rotation,
+            origin,
+            speed,
+        )
 
-        if best_candidate is None:
+        if candidate is None:
             self._publish_fallback(msg.header.stamp)
             self._log_timing(start_time)
             return
-        candidate = best_candidate
+
         length_scale = candidate["length_scale"]
         pitch_offset = candidate["pitch_offset"]
         yaw_offset = candidate["yaw_offset"]
@@ -484,6 +471,35 @@ class InferenceNode:
         if elapsed_ms > 2.0:
             rospy.logwarn_throttle(1.0, "Navigation inference exceeded 2 ms: %.3f ms", elapsed_ms)
 
+    @staticmethod
+    def _coerce_float_list(name: str, default: List[float]) -> List[float]:
+        raw_value = rospy.get_param(name, default)
+        if isinstance(raw_value, str):
+            try:
+                raw_value = ast.literal_eval(raw_value)
+            except (ValueError, SyntaxError):
+                rospy.logwarn("Failed to parse %s as list, using default", name)
+                raw_value = default
+        if not isinstance(raw_value, (list, tuple)):
+            return list(default)
+        result: List[float] = []
+        for item in raw_value:
+            try:
+                result.append(float(item))
+            except (TypeError, ValueError):
+                continue
+        return result or list(default)
+
+    def _build_candidate_table(self) -> List[Tuple[float, float, float]]:
+        table: List[Tuple[float, float, float]] = []
+        for length_scale in self._length_candidates:
+            for pitch_offset in self._pitch_candidates or [0.0]:
+                for yaw_offset in self._yaw_candidates or [0.0]:
+                    table.append((float(length_scale), float(pitch_offset), float(yaw_offset)))
+        if not table:
+            table.append((1.0, 0.0, 0.0))
+        return table
+
     def _normalize_offsets(
         self, length_scale: float, pitch_offset: float, yaw_offset: float
     ) -> Tuple[float, float, float]:
@@ -493,6 +509,21 @@ class InferenceNode:
         pitch = float(np.clip(pitch_offset, -pitch_limit, pitch_limit))
         yaw = float(np.clip(yaw_offset, -yaw_limit, yaw_limit))
         return length, pitch, yaw
+
+    def _policy_candidates(
+        self, offsets: Tuple[float, float, float]
+    ) -> List[Tuple[float, float, float]]:
+        length_est, pitch_est, yaw_est = offsets
+        jitter = math.radians(self.policy_jitter_deg)
+        length_variants = [length_est, length_est + 0.08, length_est - 0.08]
+        pitch_variants = [pitch_est, pitch_est + math.radians(2.0), pitch_est - math.radians(2.0)]
+        yaw_variants = [yaw_est, yaw_est + jitter, yaw_est - jitter]
+        combos: List[Tuple[float, float, float]] = []
+        for length in length_variants:
+            for pitch in pitch_variants:
+                for yaw in yaw_variants:
+                    combos.append((length, pitch, yaw))
+        return combos
 
     def _select_candidate(
         self,
@@ -508,50 +539,31 @@ class InferenceNode:
         origin: np.ndarray,
         speed: float,
     ) -> Optional[dict]:
-        candidates: List[Tuple[float, float, float, str]] = []
         seen: Set[Tuple[int, int, int]] = set()
+        candidate_pool: List[Tuple[float, float, float]] = []
+        if policy_offsets is not None:
+            candidate_pool.extend(self._policy_candidates(policy_offsets))
+        candidate_pool.extend(self._candidate_table)
+        if not candidate_pool:
+            candidate_pool.append((1.0, 0.0, 0.0))
 
-        def add_candidate(length: float, pitch: float, yaw: float, tag: str) -> None:
-            normalized = self._normalize_offsets(length, pitch, yaw)
+        best: Optional[dict] = None
+        min_dim = float(min(max(width, 1), max(height, 1)))
+        for length_scale, pitch_offset, yaw_offset in candidate_pool:
+            normalized = self._normalize_offsets(length_scale, pitch_offset, yaw_offset)
             key = (
                 int(round(normalized[0] * 1000)),
                 int(round(normalized[1] * 1000)),
                 int(round(normalized[2] * 1000)),
             )
             if key in seen:
-                return
+                continue
             seen.add(key)
-            candidates.append((*normalized, tag))
-
-        add_candidate(1.0, 0.0, 0.0, "base")
-
-        yaw_step = math.radians(8.0)
-        pitch_step = math.radians(6.0)
-        add_candidate(1.0, 0.0, yaw_step, "base_yaw")
-        add_candidate(1.0, 0.0, -yaw_step, "base_yaw")
-        add_candidate(1.0, pitch_step, 0.0, "base_pitch")
-        add_candidate(1.0, -pitch_step, 0.0, "base_pitch")
-        add_candidate(1.1, 0.0, yaw_step * 0.5, "base_len")
-        add_candidate(0.9, 0.0, -yaw_step * 0.5, "base_len")
-
-        if policy_offsets is not None:
-            length_est, pitch_est, yaw_est = policy_offsets
-            add_candidate(length_est, pitch_est, yaw_est, "policy")
-            add_candidate(length_est + 0.1, pitch_est, yaw_est, "policy_len")
-            add_candidate(length_est - 0.1, pitch_est, yaw_est, "policy_len")
-            add_candidate(length_est, pitch_est + pitch_step, yaw_est, "policy_pitch")
-            add_candidate(length_est, pitch_est - pitch_step, yaw_est, "policy_pitch")
-            add_candidate(length_est, pitch_est, yaw_est + yaw_step, "policy_yaw")
-            add_candidate(length_est, pitch_est, yaw_est - yaw_step, "policy_yaw")
-
-        max_clearance = float(distance_field.max()) if distance_field.size else 0.0
-        best: Optional[dict] = None
-        for length_scale, pitch_offset, yaw_offset, _ in candidates:
             result = self._score_candidate(
                 base_direction,
-                length_scale,
-                pitch_offset,
-                yaw_offset,
+                normalized[0],
+                normalized[1],
+                normalized[2],
                 safe_mask,
                 safe_prob,
                 distance_field,
@@ -561,7 +573,7 @@ class InferenceNode:
                 rotation,
                 origin,
                 speed,
-                max_clearance,
+                min_dim,
             )
             if result is None:
                 continue
@@ -584,15 +596,16 @@ class InferenceNode:
         rotation: np.ndarray,
         origin: np.ndarray,
         speed: float,
-        max_clearance: float,
+        min_dim: float,
     ) -> Optional[dict]:
         steps = max(2, self.primitive_steps)
         directions = sample_yopo_directions(base_direction, yaw_offset, pitch_offset, steps)
         if not directions:
             return None
 
-        min_prob = 1.0
-        min_clearance = max_clearance if max_clearance > 0.0 else 0.0
+        probabilities: List[float] = []
+        clearances: List[float] = []
+        min_dim = max(float(min_dim), 1.0)
         for direction in directions:
             col, row = project_direction_to_pixel(direction, width, height, fov_deg)
             if not (0.0 <= col < width and 0.0 <= row < height):
@@ -603,21 +616,29 @@ class InferenceNode:
                 return None
             if not safe_mask[row_idx, col_idx]:
                 return None
-            prob = float(safe_prob[row_idx, col_idx])
-            min_prob = min(min_prob, prob)
-            if max_clearance > 0.0:
-                clearance = float(distance_field[row_idx, col_idx])
-                min_clearance = min(min_clearance, clearance)
+            probabilities.append(float(safe_prob[row_idx, col_idx]))
+            if distance_field.size:
+                clearances.append(float(distance_field[row_idx, col_idx]))
+            else:
+                clearances.append(0.0)
 
+        if not probabilities:
+            return None
+
+        min_prob = float(min(probabilities))
+        avg_prob = float(sum(probabilities) / len(probabilities))
         prob_threshold = max(self.safe_threshold, 0.55)
         if min_prob < prob_threshold:
             return None
 
-        clearance_norm = 0.0
-        if max_clearance > 1e-6:
-            clearance_norm = min_clearance / max(max_clearance, 1e-6)
-            if min_clearance < 1.0:
-                return None
+        min_clearance_px = float(min(clearances)) if clearances else 0.0
+        clearance_fraction = min_clearance_px / min_dim
+        if clearance_fraction < self.min_clearance_fraction:
+            return None
+        clearance_score = min(
+            1.0,
+            clearance_fraction / max(self.clearance_softening, 1e-3),
+        )
 
         commanded_speed = speed * length_scale
         points = self._primitive_points(
@@ -638,8 +659,15 @@ class InferenceNode:
             return None
 
         smooth_metric = path_smoothness(points)
-        jerk_metric = jerk_score(points, self.primitive_dt)
-        orientation_metric = orientation_rate_score(directions)
+        jerk_metric, jerk_peak = jerk_metrics(points, self.primitive_dt)
+        if jerk_peak > self.max_jerk:
+            return None
+        orientation_metric, heading_rate = orientation_rate_stats(directions, self.primitive_dt)
+        if heading_rate > self.max_heading_rate:
+            return None
+        heading_rate_score = math.exp(
+            -max(0.0, heading_rate) / max(self.max_heading_rate, 1e-6)
+        )
 
         pitch_limit = math.radians(15.0)
         yaw_limit = math.radians(15.0)
@@ -666,12 +694,14 @@ class InferenceNode:
             else:
                 goal_score = 1.0
 
+        probability_score = 0.7 * min_prob + 0.3 * avg_prob
+        safety_term = 0.6 * probability_score + 0.4 * clearance_score
         total_score = (
-            6.0 * min_prob
-            + 4.0 * clearance_norm
-            + 3.0 * goal_score
-            + 2.0 * smooth_metric
+            9.0 * safety_term
+            + 4.0 * goal_score
+            + 2.5 * smooth_metric
             + 2.0 * jerk_metric
+            + 2.0 * heading_rate_score
             + 1.5 * orientation_metric
             + 1.0 * stability_score
         )
@@ -784,37 +814,6 @@ class InferenceNode:
         start_pose.pose = self.odom.pose.pose
         path_msg.poses.append(start_pose)
         self.trajectory_pub.publish(path_msg)
-
-    # 辅助函数：把机体坐标系的(x,y)偏移旋转到世界坐标系（用当前机器人偏航）
-    def _rotate_xy_in_world(self, dx_body, dy_body, robot_yaw):
-        c = math.cos(robot_yaw)
-        s = math.sin(robot_yaw)
-        dx_world = dx_body * c - dy_body * s
-        dy_world = dx_body * s + dy_body * c
-        return dx_world, dy_world
-
-    # 在生成或应用安全运动基元（primitives）的地方，替换/插入如下逻辑：
-    def apply_offset_to_primitives(self, primitives, robot_pose_yaw) -> None:
-        """
-        primitives: 可变的基元列表/结构，每个基元包含一系列点/位置
-        robot_pose_yaw: 当前机器人偏航（rad）
-        """
-        if self.offset_params['mode'] == 'cartesian':
-            # 将给定的机体坐标偏移（x,y,z）作为纯平移应用到每个基元的所有点上，
-            # 这样不会改变基元朝向/长度，只改变位置，使轨迹保持直线型（更像 YOPO 的偏移）
-            dx_w, dy_w = self._rotate_xy_in_world(self.offset_params['x'], self.offset_params['y'], robot_pose_yaw)
-            dz = self.offset_params['z']
-            for prim in primitives:
-                # 假定 prim.points 是 [[x,y,z], ...] 或 numpy array
-                for p in prim.points:
-                    p[0] += dx_w
-                    p[1] += dy_w
-                    p[2] += dz
-            return primitives
-
-        else:
-            # 保留原有的 polar 偏移逻辑（偏航/俯仰/长度缩放），以兼容历史行为
-            return primitives
 
 
 def main() -> None:

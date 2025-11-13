@@ -26,6 +26,7 @@
     <param name="height" value="72" />
     <param name="fov_deg" value="120.0" />
     <param name="max_range" value="12.0" />
+    <param name="camera_pitch_deg" value="10.0" />
     <param name="hardware_accel" value="$(arg hardware_accel)" />
     <param name="hardware_device" value="$(arg hardware_device)" />
   </node>

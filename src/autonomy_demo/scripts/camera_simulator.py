@@ -65,9 +65,16 @@ class CameraSimulator:
                 self.camera_offset = [float(offset_parsed[0]), float(offset_parsed[1]), float(offset_parsed[2])]
             except (TypeError, ValueError):
                 rospy.logwarn("Camera offset parameter malformed, using default offset")
-                self.camera_offset = [0.15, 0.0, 0.05]
+            self.camera_offset = [0.15, 0.0, 0.05]
         else:
             self.camera_offset = [0.15, 0.0, 0.05]
+
+        pitch_deg = self._get_float_param("~camera_pitch_deg", 10.0)
+        pitch_rad = math.radians(pitch_deg)
+        self._camera_mount_quat = transformations.quaternion_from_euler(0.0, pitch_rad, 0.0)
+        self._camera_mount_matrix = (
+            transformations.quaternion_matrix(self._camera_mount_quat)[0:3, 0:3]
+        ).astype(np.float32)
 
         self.hardware_accel = rospy.get_param("~hardware_accel", False)
         self.hardware_device = rospy.get_param("~hardware_device", "cuda")
@@ -104,9 +111,10 @@ class CameraSimulator:
         self.obstacle_field = ObstacleField()
         self.obstacle_field.max_candidates = self.max_obstacle_candidates
         self._local_rays = self._precompute_rays()
-        self._pixel_count = self._local_rays.shape[0]
+        self._body_rays = self._local_rays.dot(self._camera_mount_matrix.T)
+        self._pixel_count = self._body_rays.shape[0]
         if self._use_torch:
-            self._torch_rays = self._torch.from_numpy(self._local_rays).to(
+            self._torch_rays = self._torch.from_numpy(self._body_rays).to(
                 device=self._device, dtype=self._torch.float32
             )
         else:
@@ -159,7 +167,7 @@ class CameraSimulator:
         if width <= 0 or height <= 0:
             return np.zeros((0, 0, 3), dtype=np.uint8)
 
-        directions_world = self._local_rays.dot(basis.T)
+        directions_world = self._body_rays.dot(basis.T)
 
         if self._use_torch and self.obstacle_field.supports_torch:
             torch = self._torch
@@ -279,10 +287,10 @@ class CameraSimulator:
         transform.transform.translation.x = float(self.camera_offset[0]) if len(self.camera_offset) > 0 else 0.15
         transform.transform.translation.y = float(self.camera_offset[1]) if len(self.camera_offset) > 1 else 0.0
         transform.transform.translation.z = float(self.camera_offset[2]) if len(self.camera_offset) > 2 else 0.05
-        transform.transform.rotation.x = 0.0
-        transform.transform.rotation.y = 0.0
-        transform.transform.rotation.z = 0.0
-        transform.transform.rotation.w = 1.0
+        transform.transform.rotation.x = float(self._camera_mount_quat[0])
+        transform.transform.rotation.y = float(self._camera_mount_quat[1])
+        transform.transform.rotation.z = float(self._camera_mount_quat[2])
+        transform.transform.rotation.w = float(self._camera_mount_quat[3])
         self.static_broadcaster.sendTransform(transform)
 
     @staticmethod

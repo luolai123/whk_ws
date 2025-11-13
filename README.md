@@ -7,7 +7,7 @@ This workspace contains a complete ROS1 (Noetic) simulation for a UAV navigating
 - **Random obstacle world** featuring a mix of colorful boxes and spheres published as `visualization_msgs/MarkerArray` and `nav_msgs/OccupancyGrid`, ready for RViz visualization and programmatic access.
 - **Configurable environment scale** with tunable obstacle density, size ranges, and shape ratios.
 - **Kinematic UAV simulator** that consumes YOPO motion primitives from the inference stack (when available), otherwise falling back to direct goal chasing, while publishing pose/odometry data. The simulator now exposes a lightweight attitude controller that tracks 3–5 step primitives with explicit yaw/pitch offsets.
-- **Synthetic RGB camera** that renders obstacle distances into color-coded imagery with optional torch-powered acceleration.
+- **Synthetic RGB camera** that renders obstacle distances into color-coded imagery with optional torch-powered acceleration. The camera mount is pitched upward by default (10° via `~camera_pitch_deg`) so that forward flight with body pitch still yields a forward-looking view.
 - **Automated data collection** pipeline that records RGB frames with near/far obstacle labels using analytic distance computation, reusing the same accelerated ray casting path as the camera.
 - **PyTorch training utilities** featuring a UNet-style distance classifier trained with class-balanced augmentation plus cross-entropy + dice loss, along with detailed IoU/precision/recall reporting.
 - **Binary-image-driven safe navigation** that extracts dominant safe zones, emits YOPO-style motion primitives spanning only 3–5 discrete `dt` steps (each with commanded offsets), optimizes differentiable policies for 3–7 m/s flight, and evaluates offsets in under 2 ms per frame.
@@ -74,6 +74,7 @@ roslaunch autonomy_demo data_collection.launch output_dir:=/your/dataset/path
 ```
 
 - Samples are stored as compressed `.npz` files containing the RGB image, the 2-class label map (near obstacle vs. safe), per-column distance estimates, the capturing pose/orientation, camera offset, and the obstacle geometry snapshot used during labeling.
+- The collector reuses the same pitched camera mount (`~camera_pitch_deg`) and ray set as the live simulator so the saved labels remain pixel-aligned with the RGB stream.
 - The default near/far threshold is 4 meters; override with the `near_threshold` parameter if required.
 
 > Tip: move the UAV around using RViz goals while data collection is running to diversify the dataset. You can also call the regenerate service to change obstacle layouts between runs.
@@ -161,6 +162,7 @@ roslaunch autonomy_demo inference.launch \
 - End-to-end processing is throttled to under 2 ms per frame; the node logs a warning if runtime exceeds the budget.
 - RViz continues to display the RGB feed, the classification overlay, and the drone model. Use the 2D Nav Goal tool to validate how the navigation cues react to new viewpoints.
 - Tune `~goal_tolerance` (default 0.3 m) to adjust how close the drone must get before a goal is considered complete.
+- Tune the YOPO lattice directly through `~yopo_yaw_deg`, `~yopo_pitch_deg`, and `~primitive_length_scales`; the inference launch file exposes defaults that cover the central fan of headings. Safety vetoes are governed by `~min_clearance_fraction`, `~max_heading_rate_deg`, and `~max_jerk_mps3`, which enforce the required collision margins, heading slew limits, and jerk peaks before a primitive is accepted.
 - Tune `~primitive_steps` (clamped between 3 and 5) and `~primitive_dt` (seconds per step) on the inference node to adjust the horizon, and mirror `primitive_dt`/`attitude_gain` on the drone simulator for consistent tracking dynamics.
 
 ## File Overview

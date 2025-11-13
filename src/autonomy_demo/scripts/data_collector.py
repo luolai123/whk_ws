@@ -3,7 +3,7 @@
 
 import math
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import rospy
@@ -63,22 +63,18 @@ class DataCollector:
         self.near_threshold = rospy.get_param("~near_threshold", 4.0)
         offset_raw = rospy.get_param("~camera_offset", [0.15, 0.0, 0.05])
         self.camera_offset = self._parse_offset(offset_raw)
+        pitch_deg = float(rospy.get_param("~camera_pitch_deg", 10.0))
+        pitch_rad = math.radians(pitch_deg)
+        self._mount_quat = transformations.quaternion_from_euler(0.0, pitch_rad, 0.0)
+        self._mount_matrix = (
+            transformations.quaternion_matrix(self._mount_quat)[0:3, 0:3]
+        ).astype(np.float32)
+        self._ray_cache: dict[Tuple[int, int], np.ndarray] = {}
         self.output_dir = Path(
             rospy.get_param("~output_dir", str(Path.home() / "autonomy_demo" / "dataset"))
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.sample_count = 0
-        # Optional exports similar to C++ pipeline
-        self.save_depth_png = bool(rospy.get_param("~save_depth_png", True))
-        self.depth_dir = self.output_dir / "depth"
-        if self.save_depth_png:
-            self.depth_dir.mkdir(parents=True, exist_ok=True)
-        self.save_pose_csv = bool(rospy.get_param("~save_pose_csv", True))
-        self.pose_csv_path = Path(rospy.get_param("~pose_csv_path", str(self.output_dir / "poses.csv")))
-        if self.save_pose_csv and not self.pose_csv_path.exists():
-            self.pose_csv_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.pose_csv_path.open("w") as f:
-                f.write("id,px,py,pz,qw,qx,qy,qz\n")
 
         self.hardware_accel = rospy.get_param("~hardware_accel", False)
         self.hardware_device = rospy.get_param("~hardware_device", "cuda")
@@ -139,30 +135,9 @@ class DataCollector:
         basis = rotation[0:3, 0:3].astype(np.float32)
         camera_position = base_position + basis.dot(self.camera_offset)
 
-        # The local ray grid is built directly in the camera frame.
-
-        fov = math.radians(self.fov_deg)
-        tan_half_h = math.tan(fov / 2.0)
-        aspect = height / float(max(width, 1))
-        tan_half_v = tan_half_h * aspect
-
-        u = (np.arange(width, dtype=np.float32) + 0.5) / float(max(width, 1))
-        v = (np.arange(height, dtype=np.float32) + 0.5) / float(max(height, 1))
-        u_ndc = (u * 2.0) - 1.0
-        v_ndc = 1.0 - (v * 2.0)
-
-        x_components = u_ndc * tan_half_h
-        y_components = v_ndc[:, np.newaxis] * tan_half_v
-
-        ones = np.ones((height, width), dtype=np.float32)
-        x_grid = np.broadcast_to(x_components, (height, width))
-        y_grid = np.broadcast_to(y_components, (height, width))
-        local_dirs = np.stack((ones, x_grid, y_grid), axis=-1)
-        norms = np.linalg.norm(local_dirs, axis=-1, keepdims=True)
-        norms = np.clip(norms, 1e-6, None)
-        local_dirs = local_dirs / norms
-        directions = local_dirs.reshape(-1, 3)
-        directions = directions.dot(basis.T)
+        local_dirs = self._ray_directions(width, height)
+        body_dirs = local_dirs.dot(self._mount_matrix.T)
+        directions = body_dirs.dot(basis.T)
 
         if self._use_torch and self.obstacle_field.supports_torch:
             torch = self._torch
@@ -187,6 +162,36 @@ class DataCollector:
         )
         distances = np.clip(distances, 0.0, float(self.max_range))
         return distances.reshape(height, width)
+
+    def _ray_directions(self, width: int, height: int) -> np.ndarray:
+        key = (int(width), int(height))
+        cached = self._ray_cache.get(key)
+        if cached is not None:
+            return cached
+
+        fov = math.radians(self.fov_deg)
+        tan_half_h = math.tan(fov / 2.0)
+        aspect = height / float(max(width, 1))
+        tan_half_v = tan_half_h * aspect
+
+        u = (np.arange(width, dtype=np.float32) + 0.5) / float(max(width, 1))
+        v = (np.arange(height, dtype=np.float32) + 0.5) / float(max(height, 1))
+        u_ndc = (u * 2.0) - 1.0
+        v_ndc = 1.0 - (v * 2.0)
+
+        x_components = u_ndc * tan_half_h
+        y_components = v_ndc[:, np.newaxis] * tan_half_v
+
+        ones = np.ones((height, width), dtype=np.float32)
+        x_grid = np.broadcast_to(x_components, (height, width))
+        y_grid = np.broadcast_to(y_components, (height, width))
+        local_dirs = np.stack((ones, x_grid, y_grid), axis=-1)
+        norms = np.linalg.norm(local_dirs, axis=-1, keepdims=True)
+        norms = np.clip(norms, 1e-6, None)
+        local_dirs = local_dirs / norms
+        flattened = local_dirs.reshape(-1, 3)
+        self._ray_cache[key] = flattened
+        return flattened
 
     def image_callback(self, msg: Image) -> None:
         if self.pose is None:
@@ -217,7 +222,6 @@ class DataCollector:
             output_path,
             image=cv_image,
             label=label_map,
-            obstacle=label_map.astype(np.float32),  # explicit obstacle channel (1=obstacle)
             distances=distances,
             header=self._header_to_dict(msg.header),
             pose_position=pose_position,
@@ -231,27 +235,6 @@ class DataCollector:
         )
         self.sample_count += 1
         rospy.loginfo_throttle(5.0, "Captured %d samples", self.sample_count)
-        # Optional: save 16-bit depth PNG and append pose CSV
-        if self.save_depth_png:
-            depth_norm = np.clip(distances / float(self.max_range), 0.0, 1.0)
-            depth_u16 = (depth_norm * 65535.0).astype(np.uint16)
-            depth_path = self.depth_dir / f"depth_{self.sample_count - 1:06d}.png"
-            import cv2  # local import to avoid global dependency at module load
-            cv2.imwrite(str(depth_path), depth_u16)
-        if self.save_pose_csv:
-            with self.pose_csv_path.open("a") as f:
-                f.write(
-                    "{:06d},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f}\n".format(
-                        self.sample_count - 1,
-                        pose_position[0],
-                        pose_position[1],
-                        pose_position[2],
-                        pose_orientation[3],  # qw
-                        pose_orientation[0],  # qx
-                        pose_orientation[1],  # qy
-                        pose_orientation[2],  # qz
-                    )
-                )
         
     @staticmethod
     def _header_to_dict(header: Header) -> dict:
