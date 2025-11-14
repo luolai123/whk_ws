@@ -103,11 +103,36 @@ class ObstacleDataset(Dataset):
     def __len__(self) -> int:
         return len(self.indices)
 
+    @staticmethod
+    def _load_label(sample: np.lib.npyio.NpzFile) -> np.ndarray:
+        if "label" in sample:
+            return sample["label"].astype(np.int64)
+        for key in ("labels", "label_map", "safe_mask"):
+            if key in sample:
+                return sample[key].astype(np.int64)
+
+        distances: Optional[np.ndarray] = None
+        if "distances" in sample:
+            distances = sample["distances"].astype(np.float32)
+        elif "depth" in sample:
+            distances = sample["depth"].astype(np.float32)
+
+        if distances is not None:
+            threshold = 0.0
+            if "near_threshold" in sample:
+                threshold = float(sample["near_threshold"])  # type: ignore[index]
+            if threshold <= 0.0:
+                threshold = 4.0
+            mask = (distances < threshold).astype(np.int64)
+            return mask
+
+        raise KeyError("No label, fallback mask, or distance map found in sample")
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         file_path = self.files[self.indices[idx]]
-        sample = np.load(file_path)
-        image = sample["image"].astype(np.float32) / 255.0
-        label = sample["label"].astype(np.int64)
+        with np.load(file_path) as sample:
+            image = sample["image"].astype(np.float32) / 255.0
+            label = self._load_label(sample)
 
         if self.augment:
             if random.random() < 0.5:
@@ -131,8 +156,8 @@ class ObstacleDataset(Dataset):
         if len(sample_indices) > sample_limit:
             sample_indices = random.sample(sample_indices, sample_limit)
         for idx in sample_indices:
-            sample = np.load(self.files[idx])
-            label = sample["label"].astype(np.int64)
+            with np.load(self.files[idx]) as sample:
+                label = self._load_label(sample)
             safe_pixels += int(np.count_nonzero(label == 0))
             obstacle_pixels += int(np.count_nonzero(label == 1))
 

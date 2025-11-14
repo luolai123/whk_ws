@@ -134,6 +134,7 @@ class DatasetGenerator:
                     image=image,
                     label=label_map,
                     depth=depth_map,
+                    distances=depth_map,
                     pose_position=pose[0].astype(np.float32),
                     pose_orientation=pose[1].astype(np.float32),
                     camera_offset=self.camera_offset.astype(np.float32),
