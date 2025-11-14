@@ -90,7 +90,7 @@ def _infer_image(sample: np.lib.npyio.NpzFile) -> np.ndarray:
     # fall back to any HxWxC array (C>=3)
     for key in sample.files:
         arr = sample[key]
-        if arr.ndim == 3 and arr.shape[2] >= 3:
+        if arr.ndim == 3 and max(arr.shape) >= 8:
             return arr.astype(np.float32)
     raise KeyError("No RGB image found in sample")
 
@@ -137,6 +137,67 @@ def _infer_label_map(
     raise KeyError("No label, fallback mask, or distance map found in sample")
 
 
+def _find_channel_axis(array: np.ndarray) -> int:
+    if array.ndim < 3:
+        return array.ndim - 1
+    for axis, size in enumerate(array.shape):
+        if size <= 4:
+            return axis
+    return array.ndim - 1
+
+
+def _normalize_image_array(
+    image: np.ndarray, target_hw: Optional[Tuple[int, int]]
+) -> np.ndarray:
+    arr = np.asarray(image)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[..., None], 3, axis=2)
+    elif arr.ndim == 3:
+        channel_axis = _find_channel_axis(arr)
+        if channel_axis != 2:
+            arr = np.moveaxis(arr, channel_axis, 2)
+    else:
+        raise ValueError("Unsupported image array dimensions")
+
+    if arr.shape[2] == 1:
+        arr = np.repeat(arr, 3, axis=2)
+    elif arr.shape[2] > 3:
+        arr = arr[..., :3]
+
+    if target_hw is not None and (arr.shape[0], arr.shape[1]) != target_hw:
+        arr = cv2.resize(arr, (target_hw[1], target_hw[0]), interpolation=cv2.INTER_LINEAR)
+    return arr.astype(np.float32)
+
+
+def _normalize_label_array(
+    label: np.ndarray, target_hw: Optional[Tuple[int, int]]
+) -> np.ndarray:
+    arr = np.asarray(label)
+    if arr.ndim == 3:
+        channel_axis = _find_channel_axis(arr)
+        arr = np.take(arr, indices=0, axis=channel_axis)
+    elif arr.ndim != 2:
+        arr = np.squeeze(arr)
+        if arr.ndim != 2:
+            raise ValueError("Unsupported label dimensions")
+    if target_hw is not None and arr.shape != target_hw:
+        arr = cv2.resize(arr, (target_hw[1], target_hw[0]), interpolation=cv2.INTER_NEAREST)
+    return arr.astype(np.int64)
+
+
+def _normalize_distance_array(
+    distances: np.ndarray, target_hw: Optional[Tuple[int, int]]
+) -> np.ndarray:
+    arr = np.asarray(distances)
+    if arr.ndim != 2:
+        arr = np.squeeze(arr)
+        if arr.ndim != 2:
+            raise ValueError("Unsupported distance map dimensions")
+    if target_hw is not None and arr.shape != target_hw:
+        arr = cv2.resize(arr, (target_hw[1], target_hw[0]), interpolation=cv2.INTER_LINEAR)
+    return arr.astype(np.float32)
+
+
 class ObstacleDataset(Dataset):
     def __init__(
         self,
@@ -152,6 +213,9 @@ class ObstacleDataset(Dataset):
         else:
             self.indices = list(indices)
         self.augment = augment
+        with np.load(self.files[self.indices[0]]) as sample:
+            first_image = _normalize_image_array(_infer_image(sample), None)
+        self.target_hw: Tuple[int, int] = (first_image.shape[0], first_image.shape[1])
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -159,8 +223,8 @@ class ObstacleDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         file_path = self.files[self.indices[idx]]
         with np.load(file_path) as sample:
-            image = _infer_image(sample) / 255.0
-            label = _infer_label_map(sample)
+            image = _normalize_image_array(_infer_image(sample), self.target_hw) / 255.0
+            label = _normalize_label_array(_infer_label_map(sample), self.target_hw)
 
         if self.augment:
             if random.random() < 0.5:
@@ -185,7 +249,9 @@ class ObstacleDataset(Dataset):
             sample_indices = random.sample(sample_indices, sample_limit)
         for idx in sample_indices:
             with np.load(self.files[idx]) as sample:
-                label = _infer_label_map(sample)
+                label = _normalize_label_array(
+                    _infer_label_map(sample), self.target_hw
+                )
             safe_pixels += int(np.count_nonzero(label == 0))
             obstacle_pixels += int(np.count_nonzero(label == 1))
 
@@ -208,19 +274,21 @@ class NavigationDataset(Dataset):
         if not self.files:
             raise FileNotFoundError(f"No samples found in {data_dir}")
         with np.load(self.files[0]) as first:
-            label = _infer_label_map(first)
+            label = _normalize_label_array(_infer_label_map(first), None)
         self.height, self.width = label.shape
+        self.target_hw: Tuple[int, int] = (self.height, self.width)
 
     def __len__(self) -> int:
         return len(self.files)
 
     def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         with np.load(self.files[idx]) as sample:
-            label = _infer_label_map(sample).astype(np.uint8)
+            label = _normalize_label_array(_infer_label_map(sample), self.target_hw)
             safe_mask = (label == 0).astype(np.float32)
             distances = _infer_distance_map(sample)
             if distances is None:
                 raise KeyError("Navigation sample is missing a distance/depth map")
+            distances = _normalize_distance_array(distances, self.target_hw)
 
             def _get(name: str, fallback: Optional[np.ndarray]) -> Optional[np.ndarray]:
                 if name in sample:
