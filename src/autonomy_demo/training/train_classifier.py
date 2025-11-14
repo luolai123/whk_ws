@@ -84,6 +84,59 @@ class DistanceClassifier(torch.nn.Module):
         return self.classifier(x)
 
 
+def _infer_image(sample: np.lib.npyio.NpzFile) -> np.ndarray:
+    if "image" in sample:
+        return sample["image"].astype(np.float32)
+    # fall back to any HxWxC array (C>=3)
+    for key in sample.files:
+        arr = sample[key]
+        if arr.ndim == 3 and arr.shape[2] >= 3:
+            return arr.astype(np.float32)
+    raise KeyError("No RGB image found in sample")
+
+
+def _infer_distance_map(sample: np.lib.npyio.NpzFile) -> Optional[np.ndarray]:
+    for key in ("distances", "distance", "depth", "depth_map", "distance_map"):
+        if key in sample:
+            return sample[key].astype(np.float32)
+    # scan for anonymous float maps (arr_X)
+    for key in sample.files:
+        arr = sample[key]
+        if arr.ndim == 2 and arr.dtype.kind == "f" and arr.size > 16:
+            return arr.astype(np.float32)
+    return None
+
+
+def _infer_label_map(
+    sample: np.lib.npyio.NpzFile, near_threshold: float = 4.0
+) -> np.ndarray:
+    for key in ("label", "labels", "label_map", "safe_mask", "mask"):
+        if key in sample:
+            arr = sample[key]
+            if arr.ndim == 2:
+                return arr.astype(np.int64)
+
+    distances = _infer_distance_map(sample)
+    if distances is not None:
+        threshold = near_threshold
+        if "near_threshold" in sample:
+            try:
+                threshold = float(sample["near_threshold"])  # type: ignore[index]
+            except (TypeError, ValueError):
+                threshold = near_threshold
+        if threshold <= 0.0:
+            threshold = near_threshold
+        return (distances < threshold).astype(np.int64)
+
+    # attempt to derive from anonymous integer masks
+    for key in sample.files:
+        arr = sample[key]
+        if arr.ndim == 2 and arr.dtype.kind in ("b", "i", "u") and arr.size > 16:
+            return arr.astype(np.int64)
+
+    raise KeyError("No label, fallback mask, or distance map found in sample")
+
+
 class ObstacleDataset(Dataset):
     def __init__(
         self,
@@ -103,36 +156,11 @@ class ObstacleDataset(Dataset):
     def __len__(self) -> int:
         return len(self.indices)
 
-    @staticmethod
-    def _load_label(sample: np.lib.npyio.NpzFile) -> np.ndarray:
-        if "label" in sample:
-            return sample["label"].astype(np.int64)
-        for key in ("labels", "label_map", "safe_mask"):
-            if key in sample:
-                return sample[key].astype(np.int64)
-
-        distances: Optional[np.ndarray] = None
-        if "distances" in sample:
-            distances = sample["distances"].astype(np.float32)
-        elif "depth" in sample:
-            distances = sample["depth"].astype(np.float32)
-
-        if distances is not None:
-            threshold = 0.0
-            if "near_threshold" in sample:
-                threshold = float(sample["near_threshold"])  # type: ignore[index]
-            if threshold <= 0.0:
-                threshold = 4.0
-            mask = (distances < threshold).astype(np.int64)
-            return mask
-
-        raise KeyError("No label, fallback mask, or distance map found in sample")
-
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         file_path = self.files[self.indices[idx]]
         with np.load(file_path) as sample:
-            image = sample["image"].astype(np.float32) / 255.0
-            label = self._load_label(sample)
+            image = _infer_image(sample) / 255.0
+            label = _infer_label_map(sample)
 
         if self.augment:
             if random.random() < 0.5:
@@ -157,7 +185,7 @@ class ObstacleDataset(Dataset):
             sample_indices = random.sample(sample_indices, sample_limit)
         for idx in sample_indices:
             with np.load(self.files[idx]) as sample:
-                label = self._load_label(sample)
+                label = _infer_label_map(sample)
             safe_pixels += int(np.count_nonzero(label == 0))
             obstacle_pixels += int(np.count_nonzero(label == 1))
 
@@ -179,33 +207,37 @@ class NavigationDataset(Dataset):
         self.files: List[pathlib.Path] = sorted(data_dir.glob("*.npz"))
         if not self.files:
             raise FileNotFoundError(f"No samples found in {data_dir}")
-        first = np.load(self.files[0])
-        label = first["label"]
+        with np.load(self.files[0]) as first:
+            label = _infer_label_map(first)
         self.height, self.width = label.shape
 
     def __len__(self) -> int:
         return len(self.files)
 
     def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-        sample = np.load(self.files[idx])
-        label = sample["label"].astype(np.uint8)
-        safe_mask = (label == 0).astype(np.float32)
-        distances = sample["distances"].astype(np.float32)
+        with np.load(self.files[idx]) as sample:
+            label = _infer_label_map(sample).astype(np.uint8)
+            safe_mask = (label == 0).astype(np.float32)
+            distances = _infer_distance_map(sample)
+            if distances is None:
+                raise KeyError("Navigation sample is missing a distance/depth map")
 
-        def _get(name: str, fallback: Optional[np.ndarray]) -> Optional[np.ndarray]:
-            if name in sample:
-                return sample[name].astype(np.float32)
-            return fallback
+            def _get(name: str, fallback: Optional[np.ndarray]) -> Optional[np.ndarray]:
+                if name in sample:
+                    return sample[name].astype(np.float32)
+                return fallback
 
-        metadata: Dict[str, Any] = {
-            "pose_position": _get("pose_position", None),
-            "pose_orientation": _get("pose_orientation", None),
-            "camera_offset": _get("camera_offset", np.array([0.15, 0.0, 0.05], dtype=np.float32)),
-            "sphere_centers": _get("sphere_centers", np.empty((0, 3), dtype=np.float32)),
-            "sphere_radii": _get("sphere_radii", np.empty((0,), dtype=np.float32)),
-            "box_centers": _get("box_centers", np.empty((0, 3), dtype=np.float32)),
-            "box_half_extents": _get("box_half_extents", np.empty((0, 3), dtype=np.float32)),
-        }
+            metadata: Dict[str, Any] = {
+                "pose_position": _get("pose_position", None),
+                "pose_orientation": _get("pose_orientation", None),
+                "camera_offset": _get(
+                    "camera_offset", np.array([0.15, 0.0, 0.05], dtype=np.float32)
+                ),
+                "sphere_centers": _get("sphere_centers", np.empty((0, 3), dtype=np.float32)),
+                "sphere_radii": _get("sphere_radii", np.empty((0,), dtype=np.float32)),
+                "box_centers": _get("box_centers", np.empty((0, 3), dtype=np.float32)),
+                "box_half_extents": _get("box_half_extents", np.empty((0, 3), dtype=np.float32)),
+            }
         return safe_mask, distances, metadata
 
 
