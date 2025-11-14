@@ -16,6 +16,8 @@ from .safe_navigation import (
     project_direction_to_pixel,
     rotate_direction,
     sample_yopo_directions,
+    quintic_coefficients,
+    sample_quintic,
 )
 
 __all__ = [
@@ -34,4 +36,6 @@ __all__ = [
     "project_direction_to_pixel",
     "rotate_direction",
     "sample_yopo_directions",
+    "quintic_coefficients",
+    "sample_quintic",
 ]

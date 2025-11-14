@@ -349,3 +349,78 @@ def clamp_normalized(vec: np.ndarray) -> np.ndarray:
     if norm < 1e-6:
         return np.array([1.0, 0.0, 0.0], dtype=np.float32)
     return vec / norm
+
+
+def quintic_coefficients(
+    start_pos: np.ndarray,
+    start_vel: np.ndarray,
+    start_acc: np.ndarray,
+    end_pos: np.ndarray,
+    end_vel: np.ndarray,
+    end_acc: np.ndarray,
+    duration: float,
+) -> np.ndarray:
+    """Solve for quintic polynomial coefficients between two states.
+
+    The returned array has shape ``(6, 3)`` corresponding to the coefficients
+    of ``x(t) = a0 + a1 t + ... + a5 t^5`` for each spatial axis.
+    """
+
+    duration = max(float(duration), 1e-3)
+    start_pos = np.asarray(start_pos, dtype=np.float32)
+    start_vel = np.asarray(start_vel, dtype=np.float32)
+    start_acc = np.asarray(start_acc, dtype=np.float32)
+    end_pos = np.asarray(end_pos, dtype=np.float32)
+    end_vel = np.asarray(end_vel, dtype=np.float32)
+    end_acc = np.asarray(end_acc, dtype=np.float32)
+
+    a0 = start_pos
+    a1 = start_vel
+    a2 = start_acc * 0.5
+
+    t1 = duration
+    t2 = duration * duration
+    t3 = t2 * duration
+    t4 = t3 * duration
+    t5 = t4 * duration
+
+    rhs0 = end_pos - (a0 + a1 * t1 + a2 * t2)
+    rhs1 = end_vel - (a1 + 2.0 * a2 * t1)
+    rhs2 = end_acc - (2.0 * a2)
+
+    mat = np.array(
+        [[t3, t4, t5], [3.0 * t2, 4.0 * t3, 5.0 * t4], [6.0 * t1, 12.0 * t2, 20.0 * t3]],
+        dtype=np.float32,
+    )
+    rhs = np.stack([rhs0, rhs1, rhs2], axis=0)
+    high_coeffs = np.linalg.solve(mat, rhs)
+
+    coeffs = np.zeros((6, 3), dtype=np.float32)
+    coeffs[0] = a0
+    coeffs[1] = a1
+    coeffs[2] = a2
+    coeffs[3] = high_coeffs[0]
+    coeffs[4] = high_coeffs[1]
+    coeffs[5] = high_coeffs[2]
+    return coeffs
+
+
+def sample_quintic(
+    coeffs: np.ndarray, duration: float, steps: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Evaluate a quintic polynomial and its first derivative."""
+
+    coeffs = np.asarray(coeffs, dtype=np.float32)
+    steps = max(1, int(steps))
+    duration = max(float(duration), 1e-3)
+
+    times = np.linspace(0.0, duration, steps + 1, dtype=np.float32)
+    points = np.zeros((steps + 1, 3), dtype=np.float32)
+    velocities = np.zeros_like(points)
+
+    for power in range(6):
+        points += coeffs[power] * (times ** power)[:, None]
+    for power in range(1, 6):
+        velocities += power * coeffs[power] * (times ** (power - 1))[:, None]
+
+    return points, velocities

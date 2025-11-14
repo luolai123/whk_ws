@@ -64,7 +64,7 @@ class DataCollector:
         offset_raw = rospy.get_param("~camera_offset", [0.15, 0.0, 0.05])
         self.camera_offset = self._parse_offset(offset_raw)
         pitch_deg = float(rospy.get_param("~camera_pitch_deg", 10.0))
-        pitch_rad = math.radians(pitch_deg)
+        pitch_rad = -math.radians(pitch_deg)
         self._mount_quat = transformations.quaternion_from_euler(0.0, pitch_rad, 0.0)
         self._mount_matrix = (
             transformations.quaternion_matrix(self._mount_quat)[0:3, 0:3]
