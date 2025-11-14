@@ -81,7 +81,10 @@ class DatasetGenerator:
         else:
             self.camera_offset = np.array([0.15, 0.0, 0.05], dtype=np.float32)
 
-        output_dir = output_override or dataset_cfg.get("output_dir")
+        override = output_override
+        if isinstance(override, str) and override.strip() in {"", "__from_config__"}:
+            override = None
+        output_dir = override or dataset_cfg.get("output_dir")
         if output_dir is None:
             output_dir = str(Path.home() / "autonomy_demo" / "dataset_auto")
         self.output_dir = Path(output_dir).expanduser()
@@ -478,11 +481,25 @@ def _get_cli_args() -> List[str]:
         return sys.argv[1:]
 
 
+def _parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    value_str = str(value).strip().lower()
+    if value_str in {"1", "true", "yes", "on"}:
+        return True
+    if value_str in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate a synthetic dataset offline")
     parser.add_argument("config", type=str, help="Path to the dataset YAML configuration")
     parser.add_argument(
-        "--overwrite", action="store_true", help="Remove any existing output directory first"
+        "--overwrite",
+        type=_parse_bool,
+        default=False,
+        help="Remove any existing output directory first (true/false)",
     )
     parser.add_argument("--output", type=str, default=None, help="Override the output directory")
     args = parser.parse_args(_get_cli_args())

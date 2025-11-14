@@ -2,7 +2,7 @@
   <arg name="mode" default="offline" />
   <arg name="dataset_config" default="$(find autonomy_demo)/config/auto_dataset.yaml" />
   <arg name="overwrite" default="true" />
-  <arg name="output_dir" default="" />
+  <arg name="output_dir" default="__from_config__" />
 
   <arg name="hardware_accel" default="false" />
   <arg name="hardware_device" default="cuda" />
@@ -24,6 +24,6 @@
 
   <group unless="$(eval arg('mode') == 'online')">
     <node pkg="autonomy_demo" type="auto_dataset_generator.py" name="auto_dataset_generator" output="screen"
-          args="$(arg dataset_config) $(eval '--output ' + arg('output_dir') if arg('output_dir') else '') $(eval '--overwrite' if arg('overwrite') == 'true' else '')" />
+          args="$(arg dataset_config) --output $(arg output_dir) --overwrite $(arg overwrite)" />
   </group>
 </launch>

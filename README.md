@@ -1,191 +1,115 @@
 # Autonomy Demo Workspace
 
-This workspace contains a complete ROS1 (Noetic) simulation for a UAV navigating a randomly generated obstacle field with an RGB camera, automated dataset collection, PyTorch-based training, and an inference pipeline that can be driven from RViz.
+## 项目概览 / Project Overview
+- **中文**：该工作区面向 Ubuntu 20.04 + ROS Noetic，提供随机障碍世界、四旋翼+RGB 相机仿真、自动数据采集、二分类+安全导航训练以及推理闭环，可直接通过 RViz 进行交互。
+- **English**: Complete ROS1 workspace for a UAV navigating procedurally generated obstacle fields with a pitched RGB camera, automated dataset capture, PyTorch training, and short-horizon safe navigation that can be monitored and directed from RViz.
 
-## Features
+## 功能亮点 / Feature Highlights
+- **随机世界 Randomized world**：支持巨大的可配置空域、盒体/球体/门框等多类障碍，并输出 `MarkerArray` + `OccupancyGrid` 供 RViz 与算法订阅。
+- **统一相机工具链 Unified camera utilities**：摄像头与数据采集器共享射线预计算与安装矩阵（`camera_utils.py`），确保上抬视角、相对机体系偏移完全一致，避免冗余代码与视角错位。
+- **自动采集 + 真实标签 Automated data capture**：`data_collection.launch` 默认调用离线采集器，逐像素光线投射生成 RGB/深度/红绿二分类标签，并保存完整障碍快照供训练使用。
+- **可微训练 Differentiable training**：UNet 二分类器 + 可微安全导航策略同时训练，奖励函数覆盖安全距离、目标导向、平滑与速度指标，适配 3–7 m/s 速度段。
+- **推理与轨迹 Tracking inference**：推理节点提取最大安全区，使用五阶多项式在 3–5×`primitive_dt` 内生成安全运动基元，并由姿态控制器跟踪。
 
-- **Random obstacle world** featuring a mix of colorful boxes and spheres published as `visualization_msgs/MarkerArray` and `nav_msgs/OccupancyGrid`, ready for RViz visualization and programmatic access.
-- **Configurable environment scale** with tunable obstacle density, size ranges, and shape ratios.
-- **Kinematic UAV simulator** that consumes YOPO motion primitives from the inference stack (when available), otherwise falling back to direct goal chasing, while publishing pose/odometry data. The simulator now exposes a lightweight attitude controller that tracks 3–5 step primitives with explicit yaw/pitch offsets.
-- **Synthetic RGB camera** that renders obstacle distances into color-coded imagery with optional torch-powered acceleration. The camera mount is pitched upward by default (10° via `~camera_pitch_deg`) so that forward flight with body pitch still yields a forward-looking view.
-- **Automated data collection** pipeline that records RGB frames with near/far obstacle labels using analytic distance computation, reusing the same accelerated ray casting path as the camera.
-- **PyTorch training utilities** featuring a UNet-style distance classifier trained with class-balanced augmentation plus cross-entropy + dice loss, along with detailed IoU/precision/recall reporting.
-- **Binary-image-driven safe navigation** that extracts dominant safe zones, emits YOPO-style motion primitives spanning only 3–5 discrete `dt` steps (each with commanded offsets), optimizes differentiable policies for 3–7 m/s flight, and evaluates offsets in under 2 ms per frame.
-
-## Prerequisites
-
-- Ubuntu 20.04 with ROS Noetic.
-- Python dependencies (install via pip):
-
+## 环境需求 / Requirements
+- Ubuntu 20.04, ROS Noetic (desktop-full 建议). 需要 `cv_bridge`、`image_transport` 等 ROS 包。
+- Python 依赖 / Python deps:
   ```bash
   pip install numpy torch torchvision pillow
   ```
 
-  `cv_bridge` and `image_transport` are provided by ROS Noetic desktop-full installations.
+## 编译步骤 / Build
+```bash
+source /opt/ros/noetic/setup.bash
+cd /path/to/whk_ws
+catkin_make
+source devel/setup.bash
+```
 
-## Build Instructions
-
-1. Source your ROS environment:
-
-   ```bash
-   source /opt/ros/noetic/setup.bash
-   ```
-
-2. Build the workspace:
-
-   ```bash
-   cd /path/to/whk_ws
-   catkin_make
-   source devel/setup.bash
-   ```
-
-## Simulation and Visualization
-
-Launch the core simulation (world generator, UAV, RGB camera, and RViz):
-
+## 运行仿真 / Run the Simulation
 ```bash
 roslaunch autonomy_demo sim.launch
 ```
+- RViz 会自动加载 `config/world.rviz`。Use the **2D Nav Goal** tool to select the next waypoint.
+- 主题 Topics：`/world/obstacles` (MarkerArray), `/world/occupancy` (OccupancyGrid), `/drone/rgb/image_raw` (RGB feed), `/drone/safe_trajectory` (短期安全轨迹)。
+- 通过 `rosservice call /world_generator/regenerate` 可即时刷新场景。
 
-- RViz loads with the preconfigured view (`config/world.rviz`).
-- Use the **2D Nav Goal** tool in RViz to command the drone. When the inference node is running the UAV repeatedly executes the short-horizon YOPO primitives (3–5 × `primitive_dt`) that the policy publishes; otherwise it flies the straight-line fallback at a fixed altitude.
-- Obstacle markers and the occupancy grid appear in RViz under the `/world/obstacles` and `/world/occupancy` topics.
-- The synthetic RGB stream is visible on `/drone/rgb/image_raw`.
-
-To regenerate obstacles at runtime:
-
-```bash
-rosservice call /world_generator/regenerate
-```
-
-### Customizing the World Layout
-
-- Increase the simulated airspace or avoid seeing beyond the borders by raising `world_size` (the default launch configuration spans `160 x 160 x 14` meters).
-- Control crowding with `obstacle_density` (obstacles per square meter). When the density is zero the system falls back to the legacy `obstacle_count` parameter.
-- Mix shape variety with `sphere_ratio` (0.0–1.0) to choose how many obstacles are rendered as spheres versus boxes.
-- Adjust `size_range` and `height_range` to refine individual obstacle proportions. All parameters can be overridden in `sim.launch` or via ROS command-line arguments when launching.
-
-## Automated Dataset Collection
-
-`data_collection.launch` now defaults to the offline generator so you can capture large datasets without opening RViz or piloting the drone:
-
+## 自动数据采集 / Automated Dataset Collection
+默认离线无界面：
 ```bash
 roslaunch autonomy_demo data_collection.launch \
+  dataset_config:=$(find autonomy_demo)/config/auto_dataset.yaml \
   output_dir:=/your/dataset/path \
-  dataset_config:=$(find autonomy_demo)/config/auto_dataset.yaml
+  overwrite:=true
 ```
+- `output_dir:=__from_config__`（默认值）时使用 YAML 中的 `dataset.output_dir`；显式填写则覆盖。
+- `overwrite` 接收 `true/false` 字符串。
+- YAML 描述环境范围、采样次数、安全距离、相机姿态等，生成的 `env_xxx/sample_xxxxx.npz` 包含 RGB、红/绿二分类标签（红=障碍，绿=安全）、深度、相机偏移与障碍快照。
 
-- The YAML configuration mirrors the reference workflow: camera intrinsics, safe-distance thresholds, sampling ranges, obstacle density, and dataset counts all live in `config/auto_dataset.yaml`.
-- `overwrite:=true` wipes the destination before each run; set it to `false` when you want to append.
-- Leave `output_dir` empty to use the YAML default or override it with any filesystem path.
-- Each environment stores its obstacle snapshot and a batch of compressed `.npz` samples containing RGB images, per-pixel binary labels (red = obstacle, green = safe), depth maps, and the capturing pose/camera offset.
-
-### Interactive (online) capture
-
-To keep the previous behavior (RViz + manual motion), switch the launch back to `mode:=online`:
-
+若需要旧版在线采集（打开 RViz + 手动移动）：
 ```bash
-roslaunch autonomy_demo data_collection.launch \
-  mode:=online \
-  hardware_accel:=true \
-  output_dir:=/tmp/dataset
+roslaunch autonomy_demo data_collection.launch mode:=online hardware_accel:=true
 ```
+此模式会启动模拟器，采集节点实时记录图像/标签。
 
-- This path includes `sim.launch`, so RViz opens and you can issue 2D Nav Goals while the online collector mirrors the live RGB feed.
-- Parameters such as `near_threshold`, `camera_pitch_deg`, and hardware acceleration (`hardware_accel` / `hardware_device`) match the simulator arguments.
+### CLI (Headless) 方式 / Standalone CLI
+```bash
+python3 src/autonomy_demo/training/auto_dataset_generator.py \
+  src/autonomy_demo/config/auto_dataset.yaml \
+  --output /tmp/dataset_run \
+  --overwrite true
+```
+参数支持 `true/false` 字符串，便于脚本或 `roslaunch` 统一调用。
 
-### Standalone CLI
-
-- You can also call the generator directly (ideal for headless servers or CI jobs):
-
-  ```bash
-  python3 src/autonomy_demo/training/auto_dataset_generator.py \
-    src/autonomy_demo/config/auto_dataset.yaml \
-    --overwrite
-  ```
-
-- The CLI accepts `--output` / `--overwrite` flags, and when invoked via `roslaunch` any ROS-specific remapping arguments are automatically stripped so both entry points behave the same.
-
-### Performance Tuning
-
-- Use `max_obstacle_candidates` (default `512`) to cap how many nearby objects each ray considers. Lower values improve frame rate at the cost of ignoring far obstacles; `0` keeps the full set. The parameter is exposed on `sim.launch` and `data_collection.launch` for both the camera simulator and the dataset recorder.
-
-## Training the Classifier and Safe-Navigation Policy
-
-After gathering data, train both the segmentation network and the differentiable navigation policy:
-
+## 训练流程 / Training Pipeline
 ```bash
 python3 src/autonomy_demo/training/train_classifier.py \
   /your/dataset/path \
-  --epochs 15 \
-  --batch 8 \
-  --lr 5e-4 \
-  --policy_epochs 40 \
-  --policy_batch 8 \
-  --policy_lr 5e-4 \
-  --policy_noise 0.03 \
+  --epochs 15 --batch 8 --lr 5e-4 \
+  --policy_epochs 40 --policy_batch 8 --policy_lr 5e-4 \
   --output ~/autonomy_demo/model.pt \
   --policy_output ~/autonomy_demo/navigation_policy.pt
 ```
+- 训练集自动划分验证集，报告 loss、IoU、precision/recall。
+- 二分类标签使用红/绿二值图，损失函数为加权交叉熵 + dice；推理阶段会渲染红色障碍与绿色安全区。
+- 策略阶段以五阶多项式轨迹评估安全性（碰撞率、最小距离）、目标导向度、轨迹 jerk 峰值与姿态变化率。
 
-- The script still splits the dataset for validation and saves the classifier weights to `model.pt`.
-- The classifier stage applies horizontal flips, brightness/noise augmentation, and class-balanced weighting; each epoch reports training/validation loss together with safe-class IoU, precision, recall, and accuracy.
-- A second differentiable reinforcement-learning loop optimizes the safe-navigation policy across 3–7 m/s speeds using the stored obstacle geometry; the learned offsets are written to `navigation_policy.pt`. The reward now enforces safety and clearance as first-class (one-strike) objectives while also tracking goal alignment, trajectory smoothness, jerk, orientation change rate, and speed regulation; the console summarizes the averaged metrics every epoch.
-- Use `--no_policy` to skip the policy stage when you only need the segmentation network.
-- Adjust hyperparameters as needed. GPU acceleration is used automatically when CUDA is available.
-
-## Real-Time Inference
-
-With classifier and policy weights stored under `~/autonomy_demo`, launch the full inference stack:
-
+## 推理部署 / Inference Deployment
 ```bash
 roslaunch autonomy_demo inference.launch \
-  model_path:=/absolute/path/to/model.pt \
-  policy_path:=/absolute/path/to/navigation_policy.pt
+  model_path:=/abs/path/model.pt \
+  policy_path:=/abs/path/navigation_policy.pt
 ```
+- 节点输出：
+  - `/drone/rgb/distance_class`：红/绿叠加图。
+  - `/drone/safe_center`：最大安全斑块中心点。
+  - `/drone/movement_command` / `/drone/movement_offsets`：长度、俯仰、偏航调节。
+  - `/drone/safe_trajectory`：3–5 dt 的五阶多项式安全轨迹，姿态控制器按该轨迹跟踪至下个 goal。
+- `~primitive_steps`、`~primitive_dt`、`~camera_pitch_deg`、`~max_obstacle_candidates` 等参数可在 launch 文件内调整，实现实时性与安全性折中。
 
-- The `distance_inference` node subscribes to the RGB stream, produces the binary classification overlay on `/drone/rgb/distance_class` (rendered as red obstacles and green safe regions), and extracts the largest contiguous safe zone (default minimum area 5%).
-- The classifier output is smoothed with a probability threshold (`~safe_probability_threshold`, default 0.55) and morphological cleanup before region extraction, which helps the downstream policy maintain crisp masks.
-- A differentiable policy evaluates the noisy safe mask and current airspeed to emit motion primitives and YOPO-inspired trajectories (3–5 discrete steps with explicit yaw/pitch offsets) while also proposing fallback commands. Outputs are published on:
-  - `/drone/safe_center` (`geometry_msgs/PointStamped`): normalized safe-zone centroid and area fraction.
-  - `/drone/movement_primitive` (`geometry_msgs/Vector3Stamped`): base vector toward the safe centroid with current-speed magnitude.
-  - `/drone/movement_command` (`geometry_msgs/Vector3Stamped`): final command after applying length/angle offsets.
-  - `/drone/movement_offsets` (`std_msgs/Float32MultiArray`): `[length_scale, pitch_deg, yaw_deg]` adjustments chosen by the policy.
-  - `/drone/fallback_primitives` (`geometry_msgs/PoseArray`): rear/side slip options that remain available when no safe region is detected.
-  - `/drone/safe_trajectory` (`nav_msgs/Path`): YOPO-blended primitive covering 3–5 × `primitive_dt` seconds. Each pose encodes the commanded yaw/pitch so the simulator’s attitude controller can track the offsets while marching toward the goal over successive replans.
-- Candidate primitives are scored in real time with the same safety-first metrics used for training (minimum classification probability, clearance distance, jerk, orientation rate, and goal progress), which prevents spinning in place and keeps offsets from clipping obstacles.
-- End-to-end processing is throttled to under 2 ms per frame; the node logs a warning if runtime exceeds the budget.
-- RViz continues to display the RGB feed, the classification overlay, and the drone model. Use the 2D Nav Goal tool to validate how the navigation cues react to new viewpoints.
-- Tune `~goal_tolerance` (default 0.3 m) to adjust how close the drone must get before a goal is considered complete.
-- Tune the YOPO lattice directly through `~yopo_yaw_deg`, `~yopo_pitch_deg`, and `~primitive_length_scales`; the inference launch file exposes defaults that cover the central fan of headings. Safety vetoes are governed by `~min_clearance_fraction`, `~max_heading_rate_deg`, and `~max_jerk_mps3`, which enforce the required collision margins, heading slew limits, and jerk peaks before a primitive is accepted.
-- Tune `~primitive_steps` (clamped between 3 and 5) and `~primitive_dt` (seconds per step) on the inference node to adjust the horizon, and mirror `primitive_dt`/`attitude_gain` on the drone simulator for consistent tracking dynamics.
+## 性能优化与容错 / Performance & Robustness
+- `camera_utils.py` 在摄像机和数据采集端共享射线与安装矩阵，避免重复计算并保证视角一致。`max_obstacle_candidates` + Torch 加速可控制单帧耗时。
+- 推理阶段对候选轨迹执行安全一票否决：任何低概率或低净空的轨迹会被直接丢弃，并触发后退/侧移备用基元。
+- `data_collection.launch` 的 offline 模式不再启动 RViz，可在服务器/CI 上持续采集；需要图形界面时切换到 `mode:=online`。
 
-## File Overview
+## 常见问题 / Troubleshooting
+- **构建失败 Build issues**：确保执行 `catkin_make` 前已 `source /opt/ros/noetic/setup.bash`。
+- **相机视角错误 Camera pitch**：调整 `camera_pitch_deg`，正值表示向上抬头；摄像机、数据采集器、离线生成器都会共享该偏置。
+- **运行缓慢 Performance**：降低 `max_obstacle_candidates`、减小分辨率，或设置 `hardware_accel:=true hardware_device:=cuda` 以启用 torch。
 
+## 目录结构 / Repository Layout
 ```
-src/autonomy_demo/
-├── config/world.rviz           # RViz configuration
-├── launch/
-│   ├── sim.launch              # Core simulation stack
-│   ├── data_collection.launch  # Simulation + automated data capture
-│   └── inference.launch        # Simulation + trained model inference
-├── package.xml
-├── CMakeLists.txt
-├── scripts/
-│   ├── world_generator.py      # Random obstacle publisher + occupancy grid
-│   ├── drone_simulator.py      # Goal-driven UAV kinematics + TF
-│   ├── camera_simulator.py     # Synthetic RGB distance camera
-│   ├── data_collector.py       # Dataset recording with distance-based labels
-│   └── inference_node.py       # PyTorch inference node for classification
-└── training/train_classifier.py # Offline training entry point
+whk_ws/
+├── README.md
+├── src/autonomy_demo/
+│   ├── config/                # RViz & dataset 配置
+│   ├── launch/                # sim / data_collection / inference 启动文件
+│   ├── scripts/               # world_generator, drone_simulator, camera_simulator, data_collector, inference_node
+│   ├── src/autonomy_demo/     # Python 模块：obstacle_field, safe_navigation, camera_utils
+│   ├── training/              # train_classifier.py, auto_dataset_generator.py
+│   └── setup.py, CMakeLists.txt, package.xml
+└── ...
 ```
-
-## Troubleshooting
-
-- If RViz cannot find topics, ensure the workspace has been built (`catkin_make`) and the `devel/setup.bash` file is sourced in the current shell.
-- The `camera_simulator` assumes the drone yaw is aligned with the positive X-axis. For more advanced dynamics, extend `drone_simulator.py` to track yaw and feed it into the camera rendering logic.
-- To adjust world density or composition, tune `obstacle_density`, `obstacle_count`, `sphere_ratio`, `size_range`, and `height_range` in `sim.launch` or override them on the launch command line.
 
 ## License
-
 MIT License.

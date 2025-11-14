@@ -1,5 +1,6 @@
 """Utility modules for the autonomy_demo package."""
 
+from .camera_utils import camera_mount_from_pitch, parse_camera_offset, precompute_unit_rays
 from .obstacle_field import ObstacleField
 from .safe_navigation import (
     SafeRegion,
@@ -22,6 +23,9 @@ from .safe_navigation import (
 
 __all__ = [
     "ObstacleField",
+    "camera_mount_from_pitch",
+    "parse_camera_offset",
+    "precompute_unit_rays",
     "SafeRegion",
     "clamp_normalized",
     "compute_direction_from_pixel",

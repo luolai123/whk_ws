@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """Automated RGB data collector with distance-based labeling."""
-
-import math
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -15,6 +13,11 @@ from tf_conversions import transformations
 from visualization_msgs.msg import MarkerArray
 
 try:
+    from autonomy_demo.camera_utils import (
+        camera_mount_from_pitch,
+        parse_camera_offset,
+        precompute_unit_rays,
+    )
     from autonomy_demo.obstacle_field import ObstacleField
 except ImportError:
     import os
@@ -40,6 +43,11 @@ except ImportError:
         abs_path = os.path.abspath(path)
         if os.path.isdir(abs_path) and abs_path not in sys.path:
             sys.path.append(abs_path)
+    from autonomy_demo.camera_utils import (
+        camera_mount_from_pitch,
+        parse_camera_offset,
+        precompute_unit_rays,
+    )
     from autonomy_demo.obstacle_field import ObstacleField
 
 
@@ -62,13 +70,9 @@ class DataCollector:
         self.fov_deg = rospy.get_param("~fov_deg", 120.0)
         self.near_threshold = rospy.get_param("~near_threshold", 4.0)
         offset_raw = rospy.get_param("~camera_offset", [0.15, 0.0, 0.05])
-        self.camera_offset = self._parse_offset(offset_raw)
+        self.camera_offset = parse_camera_offset(offset_raw)
         pitch_deg = float(rospy.get_param("~camera_pitch_deg", 10.0))
-        pitch_rad = -math.radians(pitch_deg)
-        self._mount_quat = transformations.quaternion_from_euler(0.0, pitch_rad, 0.0)
-        self._mount_matrix = (
-            transformations.quaternion_matrix(self._mount_quat)[0:3, 0:3]
-        ).astype(np.float32)
+        self._mount_quat, self._mount_matrix = camera_mount_from_pitch(pitch_deg)
         self._ray_cache: dict[Tuple[int, int], np.ndarray] = {}
         self.output_dir = Path(
             rospy.get_param("~output_dir", str(Path.home() / "autonomy_demo" / "dataset"))
@@ -169,29 +173,9 @@ class DataCollector:
         if cached is not None:
             return cached
 
-        fov = math.radians(self.fov_deg)
-        tan_half_h = math.tan(fov / 2.0)
-        aspect = height / float(max(width, 1))
-        tan_half_v = tan_half_h * aspect
-
-        u = (np.arange(width, dtype=np.float32) + 0.5) / float(max(width, 1))
-        v = (np.arange(height, dtype=np.float32) + 0.5) / float(max(height, 1))
-        u_ndc = (u * 2.0) - 1.0
-        v_ndc = 1.0 - (v * 2.0)
-
-        x_components = u_ndc * tan_half_h
-        y_components = v_ndc[:, np.newaxis] * tan_half_v
-
-        ones = np.ones((height, width), dtype=np.float32)
-        x_grid = np.broadcast_to(x_components, (height, width))
-        y_grid = np.broadcast_to(y_components, (height, width))
-        local_dirs = np.stack((ones, x_grid, y_grid), axis=-1)
-        norms = np.linalg.norm(local_dirs, axis=-1, keepdims=True)
-        norms = np.clip(norms, 1e-6, None)
-        local_dirs = local_dirs / norms
-        flattened = local_dirs.reshape(-1, 3)
-        self._ray_cache[key] = flattened
-        return flattened
+        rays = precompute_unit_rays(width, height, self.fov_deg)
+        self._ray_cache[key] = rays
+        return rays
 
     def image_callback(self, msg: Image) -> None:
         if self.pose is None:
@@ -243,16 +227,6 @@ class DataCollector:
             "frame_id": header.frame_id,
             "seq": header.seq,
         }
-
-    @staticmethod
-    def _parse_offset(value) -> np.ndarray:
-        if isinstance(value, (list, tuple)) and len(value) >= 3:
-            try:
-                return np.array([float(value[0]), float(value[1]), float(value[2])], dtype=np.float32)
-            except (TypeError, ValueError):
-                pass
-        return np.array([0.15, 0.0, 0.05], dtype=np.float32)
-
 
 def main() -> None:
     rospy.init_node("data_collector")

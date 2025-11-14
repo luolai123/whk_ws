@@ -17,6 +17,11 @@ import tf2_ros
 from tf_conversions import transformations
 
 try:
+    from autonomy_demo.camera_utils import (
+        camera_mount_from_pitch,
+        parse_camera_offset,
+        precompute_unit_rays,
+    )
     from autonomy_demo.obstacle_field import ObstacleField
 except ImportError:
     import os
@@ -42,6 +47,11 @@ except ImportError:
         abs_path = os.path.abspath(path)
         if os.path.isdir(abs_path) and abs_path not in sys.path:
             sys.path.append(abs_path)
+    from autonomy_demo.camera_utils import (
+        camera_mount_from_pitch,
+        parse_camera_offset,
+        precompute_unit_rays,
+    )
     from autonomy_demo.obstacle_field import ObstacleField
 
 
@@ -60,25 +70,12 @@ class CameraSimulator:
         )
         offset_raw = rospy.get_param("~camera_offset", [0.15, 0.0, 0.05])
         offset_parsed = self._maybe_parse_literal(offset_raw, "~camera_offset")
-        default_offset = [0.15, 0.0, 0.05]
-        self.camera_offset = default_offset[:]
-        if isinstance(offset_parsed, (list, tuple)) and len(offset_parsed) >= 3:
-            try:
-                self.camera_offset = [
-                    float(offset_parsed[0]),
-                    float(offset_parsed[1]),
-                    float(offset_parsed[2]),
-                ]
-            except (TypeError, ValueError):
-                rospy.logwarn("Camera offset parameter malformed, using default offset")
-                self.camera_offset = default_offset[:]
+        offset_vec = parse_camera_offset(offset_parsed)
+        self.camera_offset = offset_vec.tolist()
+        self._camera_offset_vec = offset_vec.astype(np.float32)
 
         pitch_deg = self._get_float_param("~camera_pitch_deg", 10.0)
-        pitch_rad = -math.radians(pitch_deg)
-        self._camera_mount_quat = transformations.quaternion_from_euler(0.0, pitch_rad, 0.0)
-        self._camera_mount_matrix = (
-            transformations.quaternion_matrix(self._camera_mount_quat)[0:3, 0:3]
-        ).astype(np.float32)
+        self._camera_mount_quat, self._camera_mount_matrix = camera_mount_from_pitch(pitch_deg)
 
         self.hardware_accel = rospy.get_param("~hardware_accel", False)
         self.hardware_device = rospy.get_param("~hardware_device", "cuda")
@@ -114,7 +111,7 @@ class CameraSimulator:
         self.latest_pose: Optional[PoseStamped] = None
         self.obstacle_field = ObstacleField()
         self.obstacle_field.max_candidates = self.max_obstacle_candidates
-        self._local_rays = self._precompute_rays()
+        self._local_rays = precompute_unit_rays(self.image_width, self.image_height, self.fov_deg)
         self._body_rays = self._local_rays.dot(self._camera_mount_matrix.T)
         self._pixel_count = self._body_rays.shape[0]
         if self._use_torch:
@@ -123,7 +120,6 @@ class CameraSimulator:
             )
         else:
             self._torch_rays = None
-        self._camera_offset_vec = np.array(self.camera_offset, dtype=np.float32)
         self._light_dir = self._normalize(np.array([-0.2, -0.4, -1.0], dtype=np.float32))
         self._ground_color = np.array([88, 120, 80], dtype=np.float32)
         self._sky_color_top = np.array([120, 170, 220], dtype=np.float32)
@@ -257,40 +253,14 @@ class CameraSimulator:
                 self.info_pub.publish(info)
             rate.sleep()
 
-    def _precompute_rays(self) -> np.ndarray:
-        width = max(1, int(self.image_width))
-        height = max(1, int(self.image_height))
-        fov_h = math.radians(self.fov_deg)
-        aspect = height / float(width)
-        tan_half_h = math.tan(fov_h / 2.0)
-        tan_half_v = tan_half_h * aspect
-
-        u = (np.arange(width, dtype=np.float32) + 0.5) / float(width)
-        v = (np.arange(height, dtype=np.float32) + 0.5) / float(height)
-        u = (u * 2.0) - 1.0
-        v = 1.0 - (v * 2.0)
-
-        x_components = u * tan_half_h
-        y_components = v[:, np.newaxis] * tan_half_v
-
-        ones = np.ones((height, width), dtype=np.float32)
-        x_grid = np.broadcast_to(x_components, (height, width))
-        y_grid = np.broadcast_to(y_components, (height, width))
-
-        local_dirs = np.stack((ones, x_grid, y_grid), axis=-1)
-        norms = np.linalg.norm(local_dirs, axis=-1, keepdims=True)
-        norms = np.clip(norms, 1e-6, None)
-        local_dirs /= norms
-        return local_dirs.reshape(-1, 3)
-
     def publish_static_transform(self) -> None:
         transform = TransformStamped()
         transform.header.stamp = rospy.Time.now()
         transform.header.frame_id = self.base_frame
         transform.child_frame_id = self.camera_frame
-        transform.transform.translation.x = float(self.camera_offset[0]) if len(self.camera_offset) > 0 else 0.15
-        transform.transform.translation.y = float(self.camera_offset[1]) if len(self.camera_offset) > 1 else 0.0
-        transform.transform.translation.z = float(self.camera_offset[2]) if len(self.camera_offset) > 2 else 0.05
+        transform.transform.translation.x = float(self._camera_offset_vec[0])
+        transform.transform.translation.y = float(self._camera_offset_vec[1])
+        transform.transform.translation.z = float(self._camera_offset_vec[2])
         transform.transform.rotation.x = float(self._camera_mount_quat[0])
         transform.transform.rotation.y = float(self._camera_mount_quat[1])
         transform.transform.rotation.z = float(self._camera_mount_quat[2])
