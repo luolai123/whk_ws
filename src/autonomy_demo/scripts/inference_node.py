@@ -122,12 +122,35 @@ class InferenceNode:
         self.bridge = CvBridge()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = DistanceClassifier()
+        self.model_input_hw: Optional[Tuple[int, int]] = None
+        self.norm_mean: Optional[np.ndarray] = None
+        self.norm_std: Optional[np.ndarray] = None
         model_path = rospy.get_param(
             "~model_path", str(pathlib.Path.home() / "autonomy_demo" / "model.pt")
         )
         model_path = pathlib.Path(model_path)
         if model_path.exists():
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            checkpoint = torch.load(model_path, map_location=self.device)
+            state_dict = checkpoint
+            if isinstance(checkpoint, dict) and "model_state" in checkpoint:
+                state_dict = checkpoint["model_state"]
+                norm_meta = checkpoint.get("normalization")
+                if isinstance(norm_meta, dict):
+                    mean = norm_meta.get("mean")
+                    std = norm_meta.get("std")
+                    if mean is not None and std is not None:
+                        self.norm_mean = np.asarray(mean, dtype=np.float32)
+                        self.norm_std = np.clip(np.asarray(std, dtype=np.float32), 1e-4, None)
+                input_size = checkpoint.get("input_size")
+                if isinstance(input_size, (list, tuple)) and len(input_size) == 2:
+                    try:
+                        height = int(input_size[0])
+                        width = int(input_size[1])
+                        if height > 0 and width > 0:
+                            self.model_input_hw = (height, width)
+                    except (TypeError, ValueError):
+                        self.model_input_hw = None
+            self.model.load_state_dict(state_dict)
             rospy.loginfo("Loaded classifier weights from %s", model_path)
         else:
             rospy.logwarn("Classifier weights %s not found - using random initialization", model_path)
@@ -244,7 +267,20 @@ class InferenceNode:
         self.image_shape = (height, width)
         self._ensure_policy()
 
-        tensor = torch.from_numpy(cv_image.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+        normalized = cv_image.astype(np.float32) / 255.0
+        needs_resize = False
+        if self.model_input_hw is not None and (
+            height != self.model_input_hw[0] or width != self.model_input_hw[1]
+        ):
+            normalized = cv2.resize(
+                normalized,
+                (self.model_input_hw[1], self.model_input_hw[0]),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            needs_resize = True
+        if self.norm_mean is not None and self.norm_std is not None:
+            normalized = (normalized - self.norm_mean) / self.norm_std
+        tensor = torch.from_numpy(normalized).permute(2, 0, 1).unsqueeze(0)
         tensor = tensor.to(self.device)
         with torch.no_grad():
             logits = self.model(tensor)
@@ -252,6 +288,11 @@ class InferenceNode:
 
         safe_prob = probs[:, 0, :, :].squeeze(0).cpu().numpy()
         obstacle_prob = probs[:, 1, :, :].squeeze(0).cpu().numpy()
+        if needs_resize:
+            safe_prob = cv2.resize(safe_prob, (width, height), interpolation=cv2.INTER_LINEAR)
+            obstacle_prob = cv2.resize(
+                obstacle_prob, (width, height), interpolation=cv2.INTER_LINEAR
+            )
         safe_prob = cv2.GaussianBlur(safe_prob, (5, 5), 0)
         obstacle_prob = cv2.GaussianBlur(obstacle_prob, (5, 5), 0)
         safe_mask = safe_prob >= self.safe_threshold

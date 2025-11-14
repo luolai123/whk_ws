@@ -204,6 +204,9 @@ class ObstacleDataset(Dataset):
         data_dir: pathlib.Path,
         indices: Optional[List[int]] = None,
         augment: bool = False,
+        mean: Optional[np.ndarray] = None,
+        std: Optional[np.ndarray] = None,
+        target_hw: Optional[Tuple[int, int]] = None,
     ) -> None:
         self.files: List[pathlib.Path] = sorted(data_dir.glob("*.npz"))
         if not self.files:
@@ -213,9 +216,25 @@ class ObstacleDataset(Dataset):
         else:
             self.indices = list(indices)
         self.augment = augment
-        with np.load(self.files[self.indices[0]]) as sample:
-            first_image = _normalize_image_array(_infer_image(sample), None)
-        self.target_hw: Tuple[int, int] = (first_image.shape[0], first_image.shape[1])
+        if target_hw is not None:
+            self.target_hw = target_hw
+        else:
+            if not self.indices:
+                raise ValueError(
+                    "Cannot determine target size from an empty subset; provide target_hw"
+                )
+            ref_idx = self.indices[0]
+            with np.load(self.files[ref_idx]) as sample:
+                first_image = _normalize_image_array(_infer_image(sample), None)
+            self.target_hw = (first_image.shape[0], first_image.shape[1])
+        self.channel_mean: Optional[np.ndarray] = (
+            np.asarray(mean, dtype=np.float32) if mean is not None else None
+        )
+        self.channel_std: Optional[np.ndarray] = (
+            np.asarray(std, dtype=np.float32) if std is not None else None
+        )
+        if self.channel_std is not None:
+            self.channel_std = np.clip(self.channel_std, 1e-4, None)
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -236,6 +255,9 @@ class ObstacleDataset(Dataset):
             if random.random() < 0.2:
                 noise = np.random.normal(0.0, 0.02, size=image.shape).astype(np.float32)
                 image = np.clip(image + noise, 0.0, 1.0).astype(np.float32)
+
+        if self.channel_mean is not None and self.channel_std is not None:
+            image = (image - self.channel_mean) / self.channel_std
 
         image_tensor = torch.from_numpy(image).permute(2, 0, 1)
         label_tensor = torch.from_numpy(label)
@@ -266,6 +288,29 @@ class ObstacleDataset(Dataset):
         )
         weights = weights / weights.sum() * 2.0
         return weights
+
+    def estimate_mean_std(
+        self, sample_indices: Optional[List[int]] = None, sample_limit: int = 512
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        indices = sample_indices if sample_indices is not None else self.indices
+        if not indices:
+            raise ValueError("Cannot estimate statistics without any samples")
+        if len(indices) > sample_limit:
+            indices = random.sample(indices, sample_limit)
+        channel_sum = np.zeros(3, dtype=np.float64)
+        channel_sq_sum = np.zeros(3, dtype=np.float64)
+        pixel_count = 0
+        for idx in indices:
+            with np.load(self.files[idx]) as sample:
+                image = _normalize_image_array(_infer_image(sample), self.target_hw) / 255.0
+            reshaped = image.reshape(-1, 3)
+            channel_sum += reshaped.sum(axis=0)
+            channel_sq_sum += np.square(reshaped).sum(axis=0)
+            pixel_count += reshaped.shape[0]
+        mean = channel_sum / max(1, pixel_count)
+        variance = channel_sq_sum / max(1, pixel_count) - np.square(mean)
+        std = np.sqrt(np.clip(variance, 1e-8, None))
+        return mean.astype(np.float32), std.astype(np.float32)
 
 
 class NavigationDataset(Dataset):
@@ -774,8 +819,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    full_dataset = ObstacleDataset(args.dataset)
-    total_len = len(full_dataset)
+    base_dataset = ObstacleDataset(args.dataset)
+    total_len = len(base_dataset)
     all_indices = list(range(total_len))
     random.shuffle(all_indices)
 
@@ -791,8 +836,25 @@ def main() -> None:
         val_indices = all_indices[:val_len]
         train_indices = all_indices[val_len:]
 
-    train_dataset = ObstacleDataset(args.dataset, indices=train_indices, augment=True)
-    val_dataset = ObstacleDataset(args.dataset, indices=val_indices, augment=False)
+    channel_mean, channel_std = base_dataset.estimate_mean_std(train_indices)
+    target_hw = base_dataset.target_hw
+
+    train_dataset = ObstacleDataset(
+        args.dataset,
+        indices=train_indices,
+        augment=True,
+        mean=channel_mean,
+        std=channel_std,
+        target_hw=target_hw,
+    )
+    val_dataset = ObstacleDataset(
+        args.dataset,
+        indices=val_indices,
+        augment=False,
+        mean=channel_mean,
+        std=channel_std,
+        target_hw=target_hw,
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch)
@@ -801,7 +863,15 @@ def main() -> None:
     train(model, train_loader, val_loader, device, args.epochs, args.lr)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), args.output)
+    checkpoint = {
+        "model_state": model.state_dict(),
+        "normalization": {
+            "mean": channel_mean.tolist(),
+            "std": channel_std.tolist(),
+        },
+        "input_size": [int(target_hw[0]), int(target_hw[1])],
+    }
+    torch.save(checkpoint, args.output)
     print(f"Saved trained model to {args.output}")
 
     if not args.no_policy:

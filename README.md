@@ -46,6 +46,7 @@ roslaunch autonomy_demo data_collection.launch \
 - `output_dir:=__from_config__`（默认值）时使用 YAML 中的 `dataset.output_dir`；显式填写则覆盖。
 - `overwrite` 接收 `true/false` 字符串。
 - YAML 描述环境范围、采样次数、安全距离、相机姿态等，生成的 `env_xxx/sample_xxxxx.npz` 包含 RGB、红/绿二分类标签（红=障碍，绿=安全）、深度、相机偏移与障碍快照。
+- 默认 `config/auto_dataset.yaml` 将分辨率固定为 128×72，与 `sim.launch` 中的相机参数一致，便于训练-推理对齐；如需更高分辨率，可同步修改 launch 与 YAML 中的宽高。
 
 若需要旧版在线采集（打开 RViz + 手动移动）：
 ```bash
@@ -72,6 +73,8 @@ python3 src/autonomy_demo/training/train_classifier.py \
   --policy_output ~/autonomy_demo/navigation_policy.pt
 ```
 - 训练集自动划分验证集，报告 loss、IoU、precision/recall。
+- 训练脚本会在切分后统计训练集 RGB 通道均值/方差，并写入模型 checkpoint；推理节点会自动按同样的分辨率与标准化重新采样输
+  入帧，避免出现“全部红色”的 domain shift。
 - 二分类标签使用红/绿二值图，损失函数为加权交叉熵 + dice；推理阶段会渲染红色障碍与绿色安全区。
 - 策略阶段以五阶多项式轨迹评估安全性（碰撞率、最小距离）、目标导向度、轨迹 jerk 峰值与姿态变化率。
 
@@ -87,6 +90,7 @@ roslaunch autonomy_demo inference.launch \
   - `/drone/movement_command` / `/drone/movement_offsets`：长度、俯仰、偏航调节。
   - `/drone/safe_trajectory`：3–5 dt 的五阶多项式安全轨迹，姿态控制器按该轨迹跟踪至下个 goal。
 - `~primitive_steps`、`~primitive_dt`、`~camera_pitch_deg`、`~max_obstacle_candidates` 等参数可在 launch 文件内调整，实现实时性与安全性折中。
+- 模型文件保存为包含 `model_state`、`normalization(mean/std)` 以及 `input_size` 的字典；旧版仅含 `state_dict` 的模型仍可加载，但推理节点不会应用额外的标准化或重采样。
 
 ## 性能优化与容错 / Performance & Robustness
 - `camera_utils.py` 在摄像机和数据采集端共享射线与安装矩阵，避免重复计算并保证视角一致。`max_obstacle_candidates` + Torch 加速可控制单帧耗时。
