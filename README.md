@@ -72,6 +72,13 @@ python3 src/autonomy_demo/training/train_classifier.py \
   --output ~/autonomy_demo/model.pt \
   --policy_output ~/autonomy_demo/navigation_policy.pt
 ```
+- 如需专注提升像素级二分类，可运行 `training/train_segmentation.py`：
+  ```bash
+  python3 src/autonomy_demo/training/train_segmentation.py \
+    /your/dataset/path --epochs 20 --batch 16 --lr 1e-3 \
+    --output ~/autonomy_demo/segmentation_model.pt --distill
+  ```
+- For a segmentation-only curriculum run `training/train_segmentation.py` with the same dataset; it reuses the UNet, applies class-balanced losses, and optionally distills from the teacher branch.
 - 训练集自动划分验证集，报告 loss、IoU、precision/recall。
 - 训练脚本会在切分后统计训练集 RGB 通道均值/方差，并写入模型 checkpoint；推理节点会自动按同样的分辨率与标准化重新采样输
   入帧，避免出现“全部红色”的 domain shift。

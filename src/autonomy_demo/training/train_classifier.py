@@ -607,6 +607,8 @@ def train_navigation_policy(
                     clearance_norm = clearance_map
                 clearance_t = torch.from_numpy(clearance_norm).to(device=device)
 
+                row = torch.tensor(center_row, device=device, dtype=torch.float32)
+                col = torch.tensor(center_col, device=device, dtype=torch.float32)
                 row0 = torch.clamp(torch.floor(row), 0, dataset.height - 1)
                 row1 = torch.clamp(row0 + 1, 0, dataset.height - 1)
                 col0 = torch.clamp(torch.floor(col), 0, dataset.width - 1)
