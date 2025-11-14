@@ -1,0 +1,29 @@
+<launch>
+  <arg name="mode" default="offline" />
+  <arg name="dataset_config" default="$(find autonomy_demo)/config/auto_dataset.yaml" />
+  <arg name="overwrite" default="true" />
+  <arg name="output_dir" default="" />
+
+  <arg name="hardware_accel" default="false" />
+  <arg name="hardware_device" default="cuda" />
+
+  <group if="$(eval arg('mode') == 'online')">
+    <include file="$(find autonomy_demo)/launch/sim.launch">
+      <arg name="hardware_accel" value="$(arg hardware_accel)" />
+      <arg name="hardware_device" value="$(arg hardware_device)" />
+    </include>
+
+    <node pkg="autonomy_demo" type="data_collector.py" name="data_collector" output="screen">
+      <param name="output_dir" value="$(env HOME)/autonomy_demo/dataset" />
+      <param name="near_threshold" value="4.0" />
+      <param name="camera_pitch_deg" value="10.0" />
+      <param name="hardware_accel" value="$(arg hardware_accel)" />
+      <param name="hardware_device" value="$(arg hardware_device)" />
+    </node>
+  </group>
+
+  <group unless="$(eval arg('mode') == 'online')">
+    <node pkg="autonomy_demo" type="auto_dataset_generator.py" name="auto_dataset_generator" output="screen"
+          args="$(arg dataset_config) $(eval '--output ' + arg('output_dir') if arg('output_dir') else '') $(eval '--overwrite' if arg('overwrite') == 'true' else '')" />
+  </group>
+</launch>
