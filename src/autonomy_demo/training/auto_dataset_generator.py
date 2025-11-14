@@ -8,6 +8,7 @@ import json
 import math
 import random
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -468,6 +469,15 @@ def load_config(path: Path) -> dict:
         return yaml.safe_load(handle)
 
 
+def _get_cli_args() -> List[str]:
+    try:
+        import rospy  # type: ignore
+
+        return list(rospy.myargv()[1:])
+    except Exception:
+        return sys.argv[1:]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate a synthetic dataset offline")
     parser.add_argument("config", type=str, help="Path to the dataset YAML configuration")
@@ -475,7 +485,7 @@ def main() -> None:
         "--overwrite", action="store_true", help="Remove any existing output directory first"
     )
     parser.add_argument("--output", type=str, default=None, help="Override the output directory")
-    args = parser.parse_args()
+    args = parser.parse_args(_get_cli_args())
 
     config_path = Path(args.config).expanduser()
     if not config_path.exists():

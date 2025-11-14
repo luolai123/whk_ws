@@ -67,39 +67,36 @@ rosservice call /world_generator/regenerate
 
 ## Automated Dataset Collection
 
-Start the simulator together with the data collector:
+`data_collection.launch` now defaults to the offline generator so you can capture large datasets without opening RViz or piloting the drone:
 
 ```bash
-roslaunch autonomy_demo data_collection.launch output_dir:=/your/dataset/path
+roslaunch autonomy_demo data_collection.launch \
+  output_dir:=/your/dataset/path \
+  dataset_config:=$(find autonomy_demo)/config/auto_dataset.yaml
 ```
 
-- Samples are stored as compressed `.npz` files containing the RGB image, the 2-class label map (near obstacle vs. safe), per-column distance estimates, the capturing pose/orientation, camera offset, and the obstacle geometry snapshot used during labeling.
-- The collector reuses the same pitched camera mount (`~camera_pitch_deg`) and ray set as the live simulator so the saved labels remain pixel-aligned with the RGB stream.
-- The default near/far threshold is 4 meters; override with the `near_threshold` parameter if required.
+- The YAML configuration mirrors the reference workflow: camera intrinsics, safe-distance thresholds, sampling ranges, obstacle density, and dataset counts all live in `config/auto_dataset.yaml`.
+- `overwrite:=true` wipes the destination before each run; set it to `false` when you want to append.
+- Leave `output_dir` empty to use the YAML default or override it with any filesystem path.
+- Each environment stores its obstacle snapshot and a batch of compressed `.npz` samples containing RGB images, per-pixel binary labels (red = obstacle, green = safe), depth maps, and the capturing pose/camera offset.
 
-> Tip: move the UAV around using RViz goals while data collection is running to diversify the dataset. You can also call the regenerate service to change obstacle layouts between runs.
+### Interactive (online) capture
 
-### Optional Hardware Acceleration
+To keep the previous behavior (RViz + manual motion), switch the launch back to `mode:=online`:
 
-- Both the RGB camera simulator and the automated data collector can offload ray casting to PyTorch. Enable the GPU-backed code paths (requires a CUDA-capable build of PyTorch) by appending launch arguments, for example:
+```bash
+roslaunch autonomy_demo data_collection.launch \
+  mode:=online \
+  hardware_accel:=true \
+  output_dir:=/tmp/dataset
+```
 
-  ```bash
-  roslaunch autonomy_demo sim.launch hardware_accel:=true hardware_device:=cuda
-  ```
+- This path includes `sim.launch`, so RViz opens and you can issue 2D Nav Goals while the online collector mirrors the live RGB feed.
+- Parameters such as `near_threshold`, `camera_pitch_deg`, and hardware acceleration (`hardware_accel` / `hardware_device`) match the simulator arguments.
 
-  The `hardware_device` parameter accepts any device string understood by `torch.device` (e.g. `cuda:0`, `cuda:1`, or `cpu`).
+### Standalone CLI
 
-- The data collection pipeline inherits the same arguments:
-
-  ```bash
-  roslaunch autonomy_demo data_collection.launch hardware_accel:=true output_dir:=/tmp/dataset
-  ```
-
-- When CUDA is unavailable or PyTorch is not installed, the nodes automatically fall back to the optimized NumPy implementation.
-
-### Offline Batch Dataset Generation
-
-- To procedurally capture large datasets without running ROS, use the standalone generator:
+- You can also call the generator directly (ideal for headless servers or CI jobs):
 
   ```bash
   python3 src/autonomy_demo/training/auto_dataset_generator.py \
@@ -107,9 +104,7 @@ roslaunch autonomy_demo data_collection.launch output_dir:=/your/dataset/path
     --overwrite
   ```
 
-- The script mirrors the live simulator: it samples the same obstacle shapes, reuses the analytic ray caster for RGB rendering and distance labels, and stores each environment (geometry snapshot plus RGB/label/depth triplets) under the configured output directory.
-
-- Customize `src/autonomy_demo/config/auto_dataset.yaml` to tweak world scale, obstacle density, camera intrinsics, altitude/orientation bounds, or dataset counts. Provide `--output` to override the destination directory and `--overwrite` to clear an existing dataset before generation.
+- The CLI accepts `--output` / `--overwrite` flags, and when invoked via `roslaunch` any ROS-specific remapping arguments are automatically stripped so both entry points behave the same.
 
 ### Performance Tuning
 
