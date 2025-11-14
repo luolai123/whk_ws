@@ -197,6 +197,15 @@ class InferenceNode:
         self.image_shape: Optional[Tuple[int, int]] = None
         self.goal_world: Optional[np.ndarray] = None
         self.goal_frame: Optional[str] = None
+        self.goal_direction_blend = float(rospy.get_param("~goal_direction_blend", 0.4))
+        self.goal_bias_distance = float(rospy.get_param("~goal_bias_distance", 10.0))
+        self.plan_hold_time = rospy.Duration.from_sec(
+            float(rospy.get_param("~plan_hold_time", self.primitive_dt * 0.6))
+        )
+        self.plan_similarity_epsilon = float(rospy.get_param("~plan_similarity_epsilon", 0.35))
+        self._last_plan_signature: Optional[Tuple[float, float, float, float]] = None
+        self._last_plan_stamp = rospy.Time(0.0)
+        self._smoothed_command: Optional[np.ndarray] = None
 
         self.label_pub = rospy.Publisher("drone/rgb/distance_class", Image, queue_size=1)
         self.safe_center_pub = rospy.Publisher("drone/safe_center", PointStamped, queue_size=1)
@@ -242,6 +251,15 @@ class InferenceNode:
         self.goal_frame = msg.header.frame_id or "map"
         if self.odom is not None and abs(self.goal_world[2]) < 1e-3:
             self.goal_world[2] = float(self.odom.pose.pose.position.z)
+
+    def _goal_vector(self, origin: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[float]]:
+        if self.goal_world is None:
+            return None, None
+        goal_vec = self.goal_world.astype(np.float32) - origin.astype(np.float32)
+        goal_distance = float(np.linalg.norm(goal_vec))
+        if goal_distance < max(self.goal_tolerance * 0.5, 1e-3):
+            return None, goal_distance
+        return goal_vec / goal_distance, goal_distance
 
     def _ensure_policy(self) -> None:
         if self.policy is not None:
@@ -350,6 +368,20 @@ class InferenceNode:
             ]
         )[0:3, 0:3]
         base_world_direction = clamp_normalized(rotation.dot(base_direction))
+        goal_direction, goal_distance = self._goal_vector(origin)
+        adjusted_direction = base_world_direction
+        if goal_direction is not None:
+            safe_ratio = min(1.0, max(0.0, safe_fraction / max(self.min_safe_fraction, 1e-3)))
+            blend = np.clip(
+                self.goal_direction_blend + 0.35 * safe_ratio,
+                0.0,
+                0.95,
+            )
+            adjusted_direction = clamp_normalized(
+                (1.0 - blend) * base_world_direction + blend * goal_direction
+            )
+        else:
+            goal_distance = None
 
         velocity = self.odom.twist.twist.linear
         speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
@@ -361,10 +393,11 @@ class InferenceNode:
         plan = self._plan_quintic_path(
             origin,
             rotation,
-            base_world_direction,
+            adjusted_direction,
             speed,
             distance_scale,
             duration_scale,
+            goal_distance,
         )
 
         if plan is None:
@@ -377,6 +410,23 @@ class InferenceNode:
         command_vector_world = plan["command_vector"]
         travel_distance = plan["distance"]
         travel_duration = plan["duration"]
+        signature = (
+            round(float(command_vector_world[0]), 3),
+            round(float(command_vector_world[1]), 3),
+            round(float(command_vector_world[2]), 3),
+            round(float(travel_distance), 2),
+        )
+        now_stamp = msg.header.stamp
+        if not self._should_publish_plan(signature, now_stamp):
+            self._log_timing(start_time)
+            return
+        if self._smoothed_command is None:
+            self._smoothed_command = command_vector_world.copy()
+        else:
+            self._smoothed_command = (
+                0.35 * command_vector_world + 0.65 * self._smoothed_command
+            )
+        command_vector_world = self._smoothed_command.copy()
 
         primitive_msg = Vector3Stamped()
         primitive_msg.header = msg.header
@@ -393,7 +443,7 @@ class InferenceNode:
         self.command_pub.publish(command_msg)
 
         offsets_msg = Float32MultiArray()
-        offsets_msg.data = [travel_distance, distance_scale, duration_scale]
+        offsets_msg.data = [travel_distance, distance_scale, duration_scale, travel_duration]
         self.offset_pub.publish(offsets_msg)
 
         self._publish_trajectory(msg.header, path_points, velocities)
@@ -419,6 +469,8 @@ class InferenceNode:
     def _publish_fallback(self, stamp: rospy.Time, include_default: bool = True) -> None:
         if self.odom is None:
             return
+        self._last_plan_signature = None
+        self._smoothed_command = None
         speed = self.default_speed
         vectors = self._generate_fallback_vectors(speed)
         rotation = transformations.quaternion_matrix(
@@ -466,6 +518,25 @@ class InferenceNode:
         if elapsed_ms > 2.0:
             rospy.logwarn_throttle(1.0, "Navigation inference exceeded 2 ms: %.3f ms", elapsed_ms)
 
+    def _should_publish_plan(
+        self, signature: Tuple[float, float, float, float], stamp: rospy.Time
+    ) -> bool:
+        if self._last_plan_signature is None:
+            self._last_plan_signature = signature
+            self._last_plan_stamp = stamp
+            return True
+        age = (stamp - self._last_plan_stamp).to_sec()
+        if age > self.plan_hold_time.to_sec():
+            self._last_plan_signature = signature
+            self._last_plan_stamp = stamp
+            return True
+        delta = sum(abs(a - b) for a, b in zip(signature, self._last_plan_signature))
+        if delta >= self.plan_similarity_epsilon:
+            self._last_plan_signature = signature
+            self._last_plan_stamp = stamp
+            return True
+        return False
+
 
     def _policy_scales(self, safe_mask: np.ndarray, speed: float) -> Tuple[float, float]:
         if self.policy is None:
@@ -492,12 +563,15 @@ class InferenceNode:
         speed: float,
         distance_scale: float,
         duration_scale: float,
+        goal_distance: Optional[float],
     ) -> Optional[dict]:
         if self.odom is None:
             return None
         base_speed = speed if speed > 1e-3 else self.default_speed
         base_distance = base_speed * self.primitive_duration
         target_distance = max(0.5, base_distance * distance_scale)
+        if goal_distance is not None:
+            target_distance = min(target_distance, max(goal_distance - self.goal_tolerance, 0.3))
         duration = max(0.2, self.primitive_duration * duration_scale)
         origin = origin.astype(np.float32)
         world_direction = clamp_normalized(world_direction)

@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from autonomy_demo.safe_navigation import (
+    clamp_normalized,
     compute_direction_from_pixel,
     find_largest_safe_region,
     jerk_score,
@@ -354,6 +355,32 @@ class NavigationDataset(Dataset):
         return safe_mask, distances, metadata
 
 
+def _sample_goal_pixel(region: "SafeRegion", rng: random.Random) -> Tuple[float, float]:
+    min_r, max_r, min_c, max_c = region.bounds
+    mask = region.mask
+    if mask.size == 0:
+        return region.centroid
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return region.centroid
+    local_centroid = np.array([
+        region.centroid[0] - min_r,
+        region.centroid[1] - min_c,
+    ])
+    dists = np.linalg.norm(coords - local_centroid, axis=1)
+    if dists.size == 0:
+        choice = coords[rng.randrange(len(coords))]
+    else:
+        threshold = np.quantile(dists, 0.75)
+        candidates = coords[dists >= threshold]
+        if candidates.size == 0:
+            candidates = coords
+        choice = candidates[rng.randrange(len(candidates))]
+    goal_row = float(choice[0] + min_r)
+    goal_col = float(choice[1] + min_c)
+    return goal_row, goal_col
+
+
 class SafeNavigationPolicy(torch.nn.Module):
     def __init__(self, height: int, width: int) -> None:
         super().__init__()
@@ -551,6 +578,26 @@ def train_navigation_policy(
 
     indices = list(range(len(dataset)))
 
+    def bilinear_sample(sample: torch.Tensor, row_value: torch.Tensor, col_value: torch.Tensor) -> torch.Tensor:
+        h = sample.shape[0]
+        w = sample.shape[1]
+        row0 = torch.clamp(torch.floor(row_value), 0, h - 1)
+        row1 = torch.clamp(row0 + 1, 0, h - 1)
+        col0 = torch.clamp(torch.floor(col_value), 0, w - 1)
+        col1 = torch.clamp(col0 + 1, 0, w - 1)
+        row_frac = row_value - row0
+        col_frac = col_value - col0
+        s00 = sample[row0.long(), col0.long()]
+        s01 = sample[row0.long(), col1.long()]
+        s10 = sample[row1.long(), col0.long()]
+        s11 = sample[row1.long(), col1.long()]
+        return (
+            s00 * (1.0 - row_frac) * (1.0 - col_frac)
+            + s01 * (1.0 - row_frac) * col_frac
+            + s10 * row_frac * (1.0 - col_frac)
+            + s11 * row_frac * col_frac
+        )
+
     for epoch in range(epochs):
         random.shuffle(indices)
         epoch_loss = 0.0
@@ -560,6 +607,7 @@ def train_navigation_policy(
             "safety": 0.0,
             "clearance": 0.0,
             "goal": 0.0,
+            "goal_alignment": 0.0,
             "stability": 0.0,
             "smoothness": 0.0,
             "speed": 0.0,
@@ -581,6 +629,8 @@ def train_navigation_policy(
                     continue
 
                 center_row, center_col = region.centroid
+                goal_row, goal_col = _sample_goal_pixel(region, random)
+                safe_fraction = region.area / float(dataset.height * dataset.width)
                 mask_tensor = torch.from_numpy(noisy_mask).to(device=device, dtype=torch.float32)
                 mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
 
@@ -595,6 +645,13 @@ def train_navigation_policy(
                 base_direction_np = compute_direction_from_pixel(
                     center_col, center_row, dataset.width, dataset.height, 120.0
                 ).astype(np.float32)
+                goal_direction_np = compute_direction_from_pixel(
+                    goal_col, goal_row, dataset.width, dataset.height, 120.0
+                ).astype(np.float32)
+                blend = np.clip(0.25 + 0.5 * safe_fraction, 0.0, 0.9)
+                combined_direction_np = clamp_normalized(
+                    (1.0 - blend) * base_direction_np + blend * goal_direction_np
+                )
 
                 distances_t = torch.from_numpy(distances).to(device=device)
                 clearance_map = cv2.distanceTransform(
@@ -607,31 +664,15 @@ def train_navigation_policy(
                     clearance_norm = clearance_map
                 clearance_t = torch.from_numpy(clearance_norm).to(device=device)
 
-                row = torch.tensor(center_row, device=device, dtype=torch.float32)
-                col = torch.tensor(center_col, device=device, dtype=torch.float32)
-                row0 = torch.clamp(torch.floor(row), 0, dataset.height - 1)
-                row1 = torch.clamp(row0 + 1, 0, dataset.height - 1)
-                col0 = torch.clamp(torch.floor(col), 0, dataset.width - 1)
-                col1 = torch.clamp(col0 + 1, 0, dataset.width - 1)
-                row_frac = row - row0
-                col_frac = col - col0
+                center_row_t = torch.tensor(center_row, device=device, dtype=torch.float32)
+                center_col_t = torch.tensor(center_col, device=device, dtype=torch.float32)
+                goal_row_t = torch.tensor(goal_row, device=device, dtype=torch.float32)
+                goal_col_t = torch.tensor(goal_col, device=device, dtype=torch.float32)
 
-                def bilinear(sample: torch.Tensor) -> torch.Tensor:
-                    s00 = sample[row0.long(), col0.long()]
-                    s01 = sample[row0.long(), col1.long()]
-                    s10 = sample[row1.long(), col0.long()]
-                    s11 = sample[row1.long(), col1.long()]
-                    return (
-                        s00 * (1.0 - row_frac) * (1.0 - col_frac)
-                        + s01 * (1.0 - row_frac) * col_frac
-                        + s10 * row_frac * (1.0 - col_frac)
-                        + s11 * row_frac * col_frac
-                    )
+                clearance_center = bilinear_sample(clearance_t, center_row_t, center_col_t)
+                goal_distance_est = bilinear_sample(distances_t, goal_row_t, goal_col_t)
 
-                interp_dist = bilinear(distances_t)
-                clearance_center = bilinear(clearance_t)
-
-                base_distance = torch.clamp(interp_dist, 1.0, max_range)
+                base_distance = torch.clamp(goal_distance_est, 1.0, max_range)
                 target_distance = base_distance * distance_scale
                 primitive_steps = 4
                 primitive_duration = primitive_dt * primitive_steps
@@ -641,9 +682,9 @@ def train_navigation_policy(
                 target_distance_val = float(target_distance.detach().cpu())
                 duration_val = float(duration_value.detach().cpu())
                 start_pos = np.zeros(3, dtype=np.float32)
-                start_vel = base_direction_np * speed_value
-                end_pos = base_direction_np * target_distance_val
-                end_vel = base_direction_np * speed_value
+                start_vel = combined_direction_np * speed_value
+                end_pos = combined_direction_np * target_distance_val
+                end_vel = combined_direction_np * speed_value
                 coeffs = quintic_coefficients(
                     start_pos,
                     start_vel,
@@ -700,10 +741,18 @@ def train_navigation_policy(
                     min(1.0, min_clearance_val), device=device, dtype=torch.float32
                 )
 
-                goal_error = math.sqrt(
-                    (last_col - center_col) ** 2 + (last_row - center_row) ** 2
+                goal_error = math.sqrt((last_col - goal_col) ** 2 + (last_row - goal_row) ** 2)
+                goal_score = torch.exp(
+                    -torch.tensor(goal_error / diag, device=device, dtype=torch.float32)
                 )
-                goal_score = torch.exp(-torch.tensor(goal_error / diag, device=device, dtype=torch.float32))
+                goal_alignment_val = float(
+                    max(-1.0, min(1.0, np.dot(combined_direction_np, goal_direction_np)))
+                )
+                goal_alignment_score = torch.tensor(
+                    (goal_alignment_val + 1.0) * 0.5,
+                    device=device,
+                    dtype=torch.float32,
+                )
 
                 stability_penalty = (
                     torch.abs(distance_scale - 1.0) / 0.3 + torch.abs(duration_scale - 1.0) / 0.3
@@ -734,12 +783,13 @@ def train_navigation_policy(
                 )
 
                 reward = (
-                    0.5 * safety_score
-                    + 0.18 * clearance_score
+                    0.4 * safety_score
+                    + 0.2 * clearance_score
                     + 0.18 * goal_score
-                    + 0.04 * smoothness_score
+                    + 0.06 * goal_alignment_score
+                    + 0.05 * smoothness_score
                     + 0.04 * jerk_score_t
-                    + 0.02 * orientation_score_t
+                    + 0.03 * orientation_score_t
                     + 0.02 * stability_score
                     + 0.02 * speed_score
                 )
@@ -750,6 +800,7 @@ def train_navigation_policy(
                 metrics_accumulator['safety'] += float(safety_score.detach().cpu())
                 metrics_accumulator['clearance'] += float(clearance_score.detach().cpu())
                 metrics_accumulator['goal'] += float(goal_score.detach().cpu())
+                metrics_accumulator['goal_alignment'] += float(goal_alignment_score.detach().cpu())
                 metrics_accumulator['stability'] += float(stability_score.detach().cpu())
                 metrics_accumulator['speed'] += float(speed_score.detach().cpu())
                 metrics_accumulator['jerk'] += float(jerk_metric_val)
@@ -775,13 +826,14 @@ def train_navigation_policy(
                 key: value / epoch_count for key, value in metrics_accumulator.items()
             }
             print(
-                "Policy epoch {}/{} - avg loss: {:.4f}, safety: {:.3f}, clearance: {:.3f}, goal: {:.3f}, smoothness: {:.3f}, jerk: {:.3f}, orientation: {:.3f}, stability: {:.3f}, speed: {:.3f}".format(
+                "Policy epoch {}/{} - avg loss: {:.4f}, safety: {:.3f}, clearance: {:.3f}, goal: {:.3f}, align: {:.3f}, smoothness: {:.3f}, jerk: {:.3f}, orientation: {:.3f}, stability: {:.3f}, speed: {:.3f}".format(
                     epoch + 1,
                     epochs,
                     avg_loss,
                     averaged_metrics["safety"],
                     averaged_metrics["clearance"],
                     averaged_metrics["goal"],
+                    averaged_metrics["goal_alignment"],
                     averaged_metrics["smoothness"],
                     averaged_metrics["jerk"],
                     averaged_metrics["orientation"],

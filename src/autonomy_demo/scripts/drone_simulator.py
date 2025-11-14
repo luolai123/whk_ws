@@ -10,6 +10,7 @@ import tf2_ros
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from tf_conversions import transformations
 from nav_msgs.msg import Odometry, Path
+from std_msgs.msg import Float32MultiArray
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -32,6 +33,7 @@ class DroneSimulator:
         self.goal_tolerance = rospy.get_param("~goal_tolerance", 0.1)
         self.default_altitude = rospy.get_param("~altitude", 1.5)
         self.primitive_dt = rospy.get_param("~primitive_dt", 0.25)
+        self.primitive_steps = rospy.get_param("~primitive_steps", 4)
         self.attitude_gain = rospy.get_param("~attitude_gain", 4.0)
         self.max_yaw_rate = math.radians(rospy.get_param("~max_yaw_rate_deg", 90.0))
         self.max_pitch_rate = math.radians(rospy.get_param("~max_pitch_rate_deg", 60.0))
@@ -51,12 +53,15 @@ class DroneSimulator:
         self.segment_time_remaining = 0.0
         self.desired_yaw = 0.0
         self.desired_pitch = 0.0
+        self.total_duration_hint = max(self.primitive_dt, self.primitive_dt * self.primitive_steps)
+        self.segment_duration_hint = max(self.primitive_dt, self.total_duration_hint / max(self.primitive_steps, 1))
 
         self.pose_pub = rospy.Publisher("drone/pose", PoseStamped, queue_size=1)
         self.odom_pub = rospy.Publisher("drone/odometry", Odometry, queue_size=1)
         self.goal_sub = rospy.Subscriber("move_base_simple/goal", PoseStamped, self.goal_callback)
         self.marker_pub = rospy.Publisher("drone/visualization", MarkerArray, queue_size=1)
         self.path_sub = rospy.Subscriber("drone/safe_trajectory", Path, self.trajectory_callback, queue_size=1)
+        self.offset_sub = rospy.Subscriber("drone/movement_offsets", Float32MultiArray, self.offset_callback)
 
         self.tf_broadcaster = tf2_ros.TransformBroadcaster()
         rospy.loginfo("Drone simulator initialized")
@@ -111,12 +116,33 @@ class DroneSimulator:
         self.follow_path = len(self.path_points) > 1
         if self.path_points:
             self.goal = self.path_points[-1][:]
-            self.segment_time_remaining = self.primitive_dt
+            self._update_segment_duration()
             if self.path_orientations:
                 idx = min(self.path_index, len(self.path_orientations) - 1)
                 pitch, yaw = self.path_orientations[idx]
                 self.desired_pitch = pitch
                 self.desired_yaw = yaw
+
+    def offset_callback(self, msg: Float32MultiArray) -> None:
+        if not msg.data:
+            return
+        if len(msg.data) >= 4 and msg.data[3] > 0.0:
+            self.total_duration_hint = float(msg.data[3])
+        elif len(msg.data) >= 3 and msg.data[2] > 0.0:
+            self.total_duration_hint = max(
+                self.primitive_dt,
+                self.primitive_dt * self.primitive_steps * float(msg.data[2]),
+            )
+        else:
+            self.total_duration_hint = max(self.primitive_dt, self.primitive_dt * self.primitive_steps)
+        self._update_segment_duration()
+
+    def _update_segment_duration(self) -> None:
+        segments = max(1, len(self.path_points) - 1)
+        self.segment_duration_hint = max(
+            self.primitive_dt * 0.5, self.total_duration_hint / max(segments, 1)
+        )
+        self.segment_time_remaining = self.segment_duration_hint
 
     def step(self, dt: float) -> None:
         if self.follow_path and self.path_points and self.path_index < len(self.path_points):
@@ -169,7 +195,7 @@ class DroneSimulator:
                 target[2] - self.state.position[2],
             ]
             distance = math.sqrt(sum(d * d for d in direction))
-            self.segment_time_remaining = self.primitive_dt
+            self.segment_time_remaining = self.segment_duration_hint
 
         if distance < 1e-6:
             self.state.velocity = [0.0, 0.0, 0.0]
