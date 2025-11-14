@@ -38,10 +38,11 @@ roslaunch autonomy_demo sim.launch
 默认离线无界面：
 ```bash
 roslaunch autonomy_demo data_collection.launch \
-  dataset_config:=$(find autonomy_demo)/config/auto_dataset.yaml \
+  dataset_config:=config/auto_dataset.yaml \
   output_dir:=/your/dataset/path \
   overwrite:=true
 ```
+- `dataset_config` 可写绝对路径、`package://autonomy_demo/...`，或简单地写成 `config/auto_dataset.yaml`（会自动按包路径解析，即使误写成 `/config/...` 也会自动修正）；`dataset_config` accepts absolute paths, `package://autonomy_demo/...` URIs, or short `config/auto_dataset.yaml` strings and will auto-resolve them to the package.
 - `output_dir:=__from_config__`（默认值）时使用 YAML 中的 `dataset.output_dir`；显式填写则覆盖。
 - `overwrite` 接收 `true/false` 字符串。
 - YAML 描述环境范围、采样次数、安全距离、相机姿态等，生成的 `env_xxx/sample_xxxxx.npz` 包含 RGB、红/绿二分类标签（红=障碍，绿=安全）、深度、相机偏移与障碍快照。

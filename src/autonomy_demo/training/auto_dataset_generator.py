@@ -19,6 +19,11 @@ from tf_conversions import transformations
 
 from autonomy_demo.obstacle_field import ObstacleField
 
+try:  # rospkg is optional when running completely offline
+    import rospkg  # type: ignore
+except Exception:  # pragma: no cover - best effort import
+    rospkg = None  # type: ignore
+
 
 @dataclass
 class ObstacleSpec:
@@ -472,6 +477,64 @@ def load_config(path: Path) -> dict:
         return yaml.safe_load(handle)
 
 
+def _get_package_root(pkg: str = "autonomy_demo") -> Path | None:
+    if rospkg is None:
+        return None
+    try:
+        return Path(rospkg.RosPack().get_path(pkg))
+    except Exception:
+        return None
+
+
+def _resolve_package_uri(uri: str) -> Path | None:
+    payload = uri[len("package://") :]
+    if "/" not in payload:
+        return None
+    pkg_name, rel = payload.split("/", 1)
+    root = _get_package_root(pkg_name)
+    if root is None:
+        return None
+    return root / rel
+
+
+def resolve_config_path(raw_path: str) -> Path:
+    cleaned = (raw_path or "").strip()
+    if not cleaned:
+        raise FileNotFoundError("Configuration path is empty")
+
+    if cleaned.startswith("package://"):
+        candidate = _resolve_package_uri(cleaned)
+        if candidate and candidate.exists():
+            return candidate
+        raise FileNotFoundError(f"Configuration file not found: {cleaned}")
+
+    expanded = Path(cleaned).expanduser()
+    if expanded.exists():
+        return expanded
+
+    candidates: List[Path] = []
+
+    if not expanded.is_absolute():
+        candidates.append(Path.cwd() / expanded)
+
+    stripped = cleaned.lstrip("/")
+    if stripped and stripped != cleaned:
+        candidates.append(Path.cwd() / stripped)
+
+    pkg_root = _get_package_root()
+    if pkg_root is not None:
+        if not expanded.is_absolute():
+            candidates.append(pkg_root / expanded)
+        if stripped:
+            candidates.append(pkg_root / stripped)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(f"Configuration file not found: {cleaned}")
+
+
 def _get_cli_args() -> List[str]:
     try:
         import rospy  # type: ignore
@@ -504,10 +567,7 @@ def main() -> None:
     parser.add_argument("--output", type=str, default=None, help="Override the output directory")
     args = parser.parse_args(_get_cli_args())
 
-    config_path = Path(args.config).expanduser()
-    if not config_path.exists():
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
-
+    config_path = resolve_config_path(args.config)
     config = load_config(config_path)
     generator = DatasetGenerator(config, overwrite=args.overwrite, output_override=args.output)
     generator.run()
