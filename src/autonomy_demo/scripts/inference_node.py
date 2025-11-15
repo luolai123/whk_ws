@@ -204,6 +204,8 @@ class InferenceNode:
         self.primitive_steps = max(3, min(5, primitive_steps))
         self.primitive_dt = float(rospy.get_param("~primitive_dt", 0.25))
         self.primitive_duration = self.primitive_steps * self.primitive_dt
+        samples_per_step = int(rospy.get_param("~path_samples_per_step", 3))
+        self.path_samples_per_step = max(1, samples_per_step)
 
         publish_default = max(0.02, self.primitive_dt / max(self.primitive_steps, 1))
         self.plan_publish_period = rospy.Duration.from_sec(
@@ -610,7 +612,11 @@ class InferenceNode:
             zero_acc,
             duration,
         )
-        points, velocities = sample_quintic(coeffs, duration, self.primitive_steps)
+        sample_count = max(
+            self.primitive_steps,
+            self.primitive_steps * self.path_samples_per_step,
+        )
+        points, velocities = sample_quintic(coeffs, duration, sample_count)
         if points.size == 0:
             return None
         command_vector = velocities[1] if velocities.shape[0] >= 2 else velocities[0]

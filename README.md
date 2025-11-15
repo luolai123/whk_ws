@@ -97,7 +97,7 @@ roslaunch autonomy_demo inference.launch \
   - `/drone/movement_command` / `/drone/movement_offsets`：长度、俯仰、偏航调节（offsets 现包含完整轨迹时长，模拟器据此平滑跟踪）。
   - `/drone/safe_trajectory`：3–5 dt 的五阶多项式安全轨迹，姿态控制器按该轨迹跟踪至下个 goal；若当前路径与上一条相似，会自动保持旧轨迹以避免“走走停停”。
 - `~goal_direction_blend`、`~goal_bias_distance` 控制安全方向与 RViz 目标方向的融合比例；`~plan_publish_period` 决定最小轨迹刷新周期，而 `~plan_hold_time` / `~plan_similarity_epsilon` 则决定何时强制推送最新轨迹，可显著减少实时运行时的顿挫感。
-- `~primitive_steps`、`~primitive_dt`、`~camera_pitch_deg`、`~max_obstacle_candidates` 等参数可在 launch 文件内调整，实现实时性与安全性折中。
+- `~primitive_steps`、`~primitive_dt`、`~path_samples_per_step`（用于在同一 3–5 dt 轨迹内增加采样点，从而提升模拟器跟踪的连续性）、`~camera_pitch_deg`、`~max_obstacle_candidates` 等参数可在 launch 文件内调整，实现实时性与安全性折中。
 - 模型文件保存为包含 `model_state`、`normalization(mean/std)` 以及 `input_size` 的字典；旧版仅含 `state_dict` 的模型仍可加载，但推理节点不会应用额外的标准化或重采样。
 
 ## 性能优化与容错 / Performance & Robustness
