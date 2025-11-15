@@ -199,6 +199,12 @@ class InferenceNode:
         self.goal_frame: Optional[str] = None
         self.goal_direction_blend = float(rospy.get_param("~goal_direction_blend", 0.4))
         self.goal_bias_distance = float(rospy.get_param("~goal_bias_distance", 10.0))
+
+        primitive_steps = int(rospy.get_param("~primitive_steps", 4))
+        self.primitive_steps = max(3, min(5, primitive_steps))
+        self.primitive_dt = float(rospy.get_param("~primitive_dt", 0.25))
+        self.primitive_duration = self.primitive_steps * self.primitive_dt
+
         self.plan_hold_time = rospy.Duration.from_sec(
             float(rospy.get_param("~plan_hold_time", self.primitive_dt * 0.6))
         )
@@ -220,10 +226,6 @@ class InferenceNode:
         rospy.Subscriber("drone/rgb/image_raw", Image, self.image_callback, queue_size=1)
         rospy.Subscriber("move_base_simple/goal", PoseStamped, self.goal_callback, queue_size=1)
 
-        primitive_steps = int(rospy.get_param("~primitive_steps", 4))
-        self.primitive_steps = max(3, min(5, primitive_steps))
-        self.primitive_dt = float(rospy.get_param("~primitive_dt", 0.25))
-        self.primitive_duration = self.primitive_steps * self.primitive_dt
         self.distance_scale_min = float(rospy.get_param("~distance_scale_min", 0.7))
         self.distance_scale_max = float(rospy.get_param("~distance_scale_max", 1.4))
         self.duration_scale_min = float(rospy.get_param("~duration_scale_min", 0.7))
