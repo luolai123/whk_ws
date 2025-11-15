@@ -82,7 +82,7 @@ python3 src/autonomy_demo/training/train_classifier.py \
 - 训练集自动划分验证集，报告 loss、IoU、precision/recall。
 - 训练脚本会在切分后统计训练集 RGB 通道均值/方差，并写入模型 checkpoint；推理节点会自动按同样的分辨率与标准化重新采样输
   入帧，避免出现“全部红色”的 domain shift。
-- 二分类标签使用红/绿二值图，损失函数为加权交叉熵 + dice；推理阶段会渲染红色障碍与绿色安全区。
+- 二分类标签使用红/绿二值图，损失函数为加权交叉熵 + dice；推理阶段会渲染红色障碍与绿色安全区，并仅对聚类得到的最大安全斑块执行轨迹规划，确保路径永远位于真实连通区域内。
 - 策略阶段以五阶多项式轨迹评估安全性（碰撞率、最小距离）、目标导向度、轨迹 jerk 峰值与姿态变化率，并在训练时强制将采样目标与安全斑块边界的距离、角度关联起来，使策略真正学会“指向目标又保持安全”。
 
 ## 推理部署 / Inference Deployment
@@ -96,7 +96,7 @@ roslaunch autonomy_demo inference.launch \
   - `/drone/safe_center`：最大安全斑块中心点。
   - `/drone/movement_command` / `/drone/movement_offsets`：长度、俯仰、偏航调节（offsets 现包含完整轨迹时长，模拟器据此平滑跟踪）。
   - `/drone/safe_trajectory`：3–5 dt 的五阶多项式安全轨迹，姿态控制器按该轨迹跟踪至下个 goal；若当前路径与上一条相似，会自动保持旧轨迹以避免“走走停停”。
-- `~goal_direction_blend`、`~goal_bias_distance` 控制安全方向与 RViz 目标方向的融合比例；`~plan_hold_time` / `~plan_similarity_epsilon` 则决定何时刷新轨迹，可显著减少实时运行时的顿挫感。
+- `~goal_direction_blend`、`~goal_bias_distance` 控制安全方向与 RViz 目标方向的融合比例；`~plan_publish_period` 决定最小轨迹刷新周期，而 `~plan_hold_time` / `~plan_similarity_epsilon` 则决定何时强制推送最新轨迹，可显著减少实时运行时的顿挫感。
 - `~primitive_steps`、`~primitive_dt`、`~camera_pitch_deg`、`~max_obstacle_candidates` 等参数可在 launch 文件内调整，实现实时性与安全性折中。
 - 模型文件保存为包含 `model_state`、`normalization(mean/std)` 以及 `input_size` 的字典；旧版仅含 `state_dict` 的模型仍可加载，但推理节点不会应用额外的标准化或重采样。
 

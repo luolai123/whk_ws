@@ -205,8 +205,13 @@ class InferenceNode:
         self.primitive_dt = float(rospy.get_param("~primitive_dt", 0.25))
         self.primitive_duration = self.primitive_steps * self.primitive_dt
 
+        publish_default = max(0.02, self.primitive_dt / max(self.primitive_steps, 1))
+        self.plan_publish_period = rospy.Duration.from_sec(
+            float(rospy.get_param("~plan_publish_period", publish_default))
+        )
+        hold_default = max(self.plan_publish_period.to_sec(), self.primitive_dt * 0.6)
         self.plan_hold_time = rospy.Duration.from_sec(
-            float(rospy.get_param("~plan_hold_time", self.primitive_dt * 0.6))
+            float(rospy.get_param("~plan_hold_time", hold_default))
         )
         self.plan_similarity_epsilon = float(rospy.get_param("~plan_similarity_epsilon", 0.35))
         self._last_plan_signature: Optional[Tuple[float, float, float, float]] = None
@@ -320,9 +325,6 @@ class InferenceNode:
         cleaned = cv2.morphologyEx(safe_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
         safe_mask = cleaned.astype(bool)
-        distance_field = cv2.distanceTransform(
-            safe_mask.astype(np.uint8), cv2.DIST_L2, 5
-        ).astype(np.float32)
 
         color_map = np.zeros((height, width, 3), dtype=np.uint8)
         color_map[:, :, 0] = 255  # default to red for obstacle/unknown
@@ -338,6 +340,10 @@ class InferenceNode:
             self._publish_fallback(msg.header.stamp)
             self._log_timing(start_time)
             return
+
+        cluster_mask = np.zeros_like(safe_mask)
+        min_r, max_r, min_c, max_c = region.bounds
+        cluster_mask[min_r : max_r + 1, min_c : max_c + 1] = region.mask
 
         center_row, center_col = region.centroid
         total_pixels = height * width
@@ -391,7 +397,7 @@ class InferenceNode:
             speed = self.default_speed
         base_vector_world = base_world_direction * speed
 
-        distance_scale, duration_scale = self._policy_scales(safe_mask, speed)
+        distance_scale, duration_scale = self._policy_scales(cluster_mask, speed)
         plan = self._plan_quintic_path(
             origin,
             rotation,
@@ -527,16 +533,27 @@ class InferenceNode:
             self._last_plan_signature = signature
             self._last_plan_stamp = stamp
             return True
+
         age = (stamp - self._last_plan_stamp).to_sec()
-        if age > self.plan_hold_time.to_sec():
+        publish_period = self.plan_publish_period.to_sec()
+        hold_time = self.plan_hold_time.to_sec()
+
+        if age >= publish_period:
             self._last_plan_signature = signature
             self._last_plan_stamp = stamp
             return True
+
         delta = sum(abs(a - b) for a, b in zip(signature, self._last_plan_signature))
         if delta >= self.plan_similarity_epsilon:
             self._last_plan_signature = signature
             self._last_plan_stamp = stamp
             return True
+
+        if age >= hold_time:
+            self._last_plan_signature = signature
+            self._last_plan_stamp = stamp
+            return True
+
         return False
 
 
