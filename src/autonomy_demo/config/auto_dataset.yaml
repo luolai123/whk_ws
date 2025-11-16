@@ -1,0 +1,33 @@
+# Default configuration for the offline dataset generator
+world:
+  size: [160.0, 160.0, 15.0]
+  obstacle_density: 0.015
+  obstacle_count: 90
+  height_range: [1.2, 9.0]
+  size_range: [1.0, 5.0]
+  sphere_ratio: 0.25
+  gate_ratio: 0.25
+  gate_opening_range: [3.5, 7.5]
+  gate_height_range: [5.0, 10.0]
+  gate_post_thickness_range: [0.35, 0.9]
+  gate_depth_range: [0.6, 1.5]
+  gate_top_thickness_range: [0.35, 0.8]
+
+camera:
+  width: 128
+  height: 72
+  fov_deg: 120.0
+  max_range: 15.0
+  camera_offset: [0.18, 0.0, 0.08]
+
+dataset:
+  seed: 2024
+  env_count: 12
+  samples_per_env: 240
+  safe_distance: 1.5
+  max_attempts: 800
+  near_threshold: 4.5
+  roll_range_deg: 8.0
+  pitch_range_deg: 14.0
+  z_range: [1.2, 6.0]
+  output_dir: "~/autonomy_demo/datasets/auto"
