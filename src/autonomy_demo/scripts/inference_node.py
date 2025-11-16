@@ -255,12 +255,18 @@ class InferenceNode:
         self.plan_hold_time = rospy.Duration.from_sec(
             float(rospy.get_param("~plan_hold_time", hold_default))
         )
+        self.fixed_altitude = float(rospy.get_param("~fixed_altitude", 2.0))
+        self.fixed_altitude = max(0.1, self.fixed_altitude)
+        self.enforce_fixed_altitude = bool(rospy.get_param("~enforce_fixed_altitude", True))
+        self.offset_filter_alpha = float(rospy.get_param("~offset_filter_alpha", 0.6))
+        self.offset_filter_alpha = max(0.0, min(1.0, self.offset_filter_alpha))
         self.plan_similarity_epsilon = float(rospy.get_param("~plan_similarity_epsilon", 0.35))
         self.safety_gate = float(rospy.get_param("~primitive_safety_gate", 0.6))
         self.clearance_gate = float(rospy.get_param("~primitive_clearance_gate", 0.08))
         self._last_plan_signature: Optional[Tuple[float, float, float, float]] = None
         self._last_plan_stamp = rospy.Time(0.0)
         self._smoothed_command: Optional[np.ndarray] = None
+        self._last_committed_offset: Optional[np.ndarray] = None
 
         self.label_pub = rospy.Publisher("drone/rgb/distance_class", Image, queue_size=1)
         self.safe_center_pub = rospy.Publisher("drone/safe_center", PointStamped, queue_size=1)
@@ -302,6 +308,8 @@ class InferenceNode:
         self.goal_frame = msg.header.frame_id or "map"
         if self.odom is not None and abs(self.goal_world[2]) < 1e-3:
             self.goal_world[2] = float(self.odom.pose.pose.position.z)
+        if self.enforce_fixed_altitude:
+            self.goal_world[2] = self.fixed_altitude
 
     def _goal_vector(self, origin: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[float]]:
         if self.goal_world is None:
@@ -418,6 +426,8 @@ class InferenceNode:
             ],
             dtype=np.float32,
         )
+        if self.enforce_fixed_altitude:
+            origin[2] = self.fixed_altitude
         rotation = transformations.quaternion_matrix(
             [
                 self.odom.pose.pose.orientation.x,
@@ -452,7 +462,10 @@ class InferenceNode:
         travel_duration = plan["duration"]
         distance_scale = plan["distance_scale"]
         duration_scale = plan["duration_scale"]
-        base_vector_world = rotation.dot(plan["sample"].start_vel_body)
+        base_velocity_body = plan["sample"].start_vel_body.copy()
+        if self.enforce_fixed_altitude:
+            base_velocity_body[2] = 0.0
+        base_vector_world = rotation.dot(base_velocity_body)
         signature = (
             round(float(command_vector_world[0]), 3),
             round(float(command_vector_world[1]), 3),
@@ -477,6 +490,10 @@ class InferenceNode:
         primitive_msg.vector.y = base_vector_world[1]
         primitive_msg.vector.z = base_vector_world[2]
         self.primitive_pub.publish(primitive_msg)
+
+        self._last_committed_offset = plan.get("offset_vector", None)
+        if self._last_committed_offset is not None:
+            self._last_committed_offset = self._last_committed_offset.copy()
 
         command_msg = Vector3Stamped()
         command_msg.header = msg.header
@@ -514,6 +531,7 @@ class InferenceNode:
             return
         self._last_plan_signature = None
         self._smoothed_command = None
+        self._last_committed_offset = None
         speed = self.default_speed
         vectors = self._generate_fallback_vectors(speed)
         rotation = transformations.quaternion_matrix(
@@ -608,7 +626,15 @@ class InferenceNode:
             np.clip(1.0 + 0.2 * outputs[3], self.duration_scale_min, self.duration_scale_max)
         )
         offset_vec = offset * self.primitive_config.radio_range
-        return offset_vec.astype(np.float32), duration_scale
+        offset_vec = offset_vec.astype(np.float32)
+        if self.enforce_fixed_altitude:
+            offset_vec[2] = 0.0
+        if self._last_committed_offset is not None and self.offset_filter_alpha < 1.0:
+            offset_vec = (
+                self.offset_filter_alpha * offset_vec
+                + (1.0 - self.offset_filter_alpha) * self._last_committed_offset
+            )
+        return offset_vec, duration_scale
 
     def _plan_motion_primitive(
         self,
@@ -638,6 +664,9 @@ class InferenceNode:
         best_plan: Optional[dict] = None
         best_score = -float("inf")
         origin = origin.astype(np.float32)
+        if self.enforce_fixed_altitude:
+            origin = origin.copy()
+            origin[2] = self.fixed_altitude
         sample_count = max(
             self.primitive_steps,
             self.primitive_steps * self.path_samples_per_step,
@@ -646,6 +675,9 @@ class InferenceNode:
             state_vec = primitive_state_vector(sample, self.primitive_config)
             offset_vec, duration_scale = self._policy_offsets(cluster_mask, state_vec)
             goal_body = apply_goal_offset(sample, offset_vec, self.primitive_config)
+            if self.enforce_fixed_altitude:
+                goal_body = goal_body.copy()
+                goal_body[2] = 0.0
             points_body, velocities_body, duration = primitive_quintic_trajectory(
                 sample,
                 goal_body,
@@ -654,6 +686,9 @@ class InferenceNode:
             )
             if points_body.size == 0:
                 continue
+            if self.enforce_fixed_altitude:
+                points_body[:, 2] = 0.0
+                velocities_body[:, 2] = 0.0
             evaluation = self._evaluate_candidate(
                 points_body,
                 cluster_mask,
@@ -673,6 +708,9 @@ class InferenceNode:
                 continue
             world_points = origin + rotation.dot(points_body.T).T
             world_velocities = rotation.dot(velocities_body.T).T
+            if self.enforce_fixed_altitude:
+                world_points[:, 2] = self.fixed_altitude
+                world_velocities[:, 2] = 0.0
             travel_distance = float(np.linalg.norm(world_points[-1] - origin))
             jerk_metric = jerk_score(
                 world_points, duration / max(points_body.shape[0] - 1, 1)
@@ -724,6 +762,7 @@ class InferenceNode:
                 ),
                 "duration_scale": duration_scale,
                 "offset_norm": float(np.linalg.norm(offset_vec)),
+                "offset_vector": offset_vec.copy(),
                 "sample": sample,
             }
             best_score = score
