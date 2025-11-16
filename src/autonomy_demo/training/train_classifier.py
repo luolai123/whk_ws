@@ -783,7 +783,7 @@ def train_navigation_policy(
         for start in range(0, len(indices), batch_size):
             batch = indices[start : start + batch_size]
             optimizer.zero_grad()
-            batch_loss = 0.0
+            batch_loss = torch.zeros(1, device=device, dtype=torch.float32)
             valid_samples = 0
 
             for idx in batch:
@@ -931,7 +931,7 @@ def train_navigation_policy(
 
             if valid_samples == 0:
                 continue
-            batch_loss = batch_loss / valid_samples
+            batch_loss = batch_loss / float(valid_samples)
             batch_loss.backward()
             optimizer.step()
 
