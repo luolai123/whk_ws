@@ -11,6 +11,7 @@ import numpy as np
 import cv2
 import torch
 import torch.nn.functional as F
+from torch.distributions import Normal
 from torch.utils.data import DataLoader, Dataset
 
 from autonomy_demo.safe_navigation import (
@@ -644,8 +645,14 @@ def train_navigation_policy(
                 state_tensor = torch.from_numpy(state_vec).unsqueeze(0).to(device=device)
 
                 outputs = policy(mask_tensor, state_tensor)
-                offset_raw = outputs[0, 0:3]
-                duration_delta = outputs[0, 3]
+                # 使用带噪策略输出，允许对不可微奖励应用 REINFORCE（log_prob）梯度
+                action_std = torch.full_like(outputs[0], 0.1)
+                action_dist = Normal(outputs[0], action_std)
+                sampled_action = action_dist.rsample()
+                log_prob = action_dist.log_prob(sampled_action).sum()
+
+                offset_raw = sampled_action[0:3]
+                duration_delta = sampled_action[3]
                 duration_scale = torch.clamp(
                     1.0 + 0.2 * duration_delta,
                     0.7,
@@ -752,7 +759,8 @@ def train_navigation_policy(
                     + 0.03 * jerk_score_t
                     + 0.02 * orientation_score_t
                 )
-                loss = -reward
+                reward_tensor = reward.detach()
+                loss = -reward_tensor * log_prob
                 batch_loss += loss
                 valid_samples += 1
 
