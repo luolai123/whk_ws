@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset>
+    <contributor>
+      <authoring_tool>autonomy_demo</authoring_tool>
+    </contributor>
+    <created>2024-06-01T00:00:00Z</created>
+    <modified>2024-06-01T00:00:00Z</modified>
+    <unit name="meter" meter="1" />
+    <up_axis>Z_UP</up_axis>
+  </asset>
+  <library_geometries>
+    <geometry id="uav-body" name="uav-body">
+      <mesh>
+        <source id="uav-body-positions">
+          <float_array id="uav-body-positions-array" count="24">
+            -0.20 -0.20 0.00  0.20 -0.20 0.00  0.20 0.20 0.00  -0.20 0.20 0.00
+            -0.10 -0.40 0.00  0.10 -0.40 0.00  0.10 0.40 0.00  -0.10 0.40 0.00
+          </float_array>
+          <technique_common>
+            <accessor source="#uav-body-positions-array" count="8" stride="3">
+              <param name="X" type="float" />
+              <param name="Y" type="float" />
+              <param name="Z" type="float" />
+            </accessor>
+          </technique_common>
+        </source>
+        <vertices id="uav-body-vertices">
+          <input semantic="POSITION" source="#uav-body-positions" />
+        </vertices>
+        <triangles count="12" material="body">
+          <input semantic="VERTEX" source="#uav-body-vertices" offset="0" />
+          <p>
+            0 1 2  0 2 3
+            4 5 6  4 6 7
+            0 1 5  0 5 4
+            1 2 6  1 6 5
+            2 3 7  2 7 6
+            3 0 4  3 4 7
+          </p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+  <library_visual_scenes>
+    <visual_scene id="Scene" name="Scene">
+      <node id="uav" name="uav">
+        <instance_geometry url="#uav-body" />
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+  <scene>
+    <instance_visual_scene url="#Scene" />
+  </scene>
+</COLLADA>
