@@ -85,6 +85,10 @@ python3 src/autonomy_demo/training/train_classifier.py \
 - 二分类标签使用红/绿二值图，损失函数为加权交叉熵 + dice；推理阶段会渲染红色障碍与绿色安全区，并仅对聚类得到的最大安全斑块执行轨迹规划，确保路径永远位于真实连通区域内。
 - 策略阶段以五阶多项式轨迹评估安全性（碰撞率、最小距离）、目标导向度、轨迹 jerk 峰值与姿态变化率，并在训练时强制将采样目标与安全斑块边界的距离、角度关联起来，使策略真正学会“指向目标又保持安全”。
 
+### YOPO 式安全运动基元 / YOPO-style motion primitives
+- **中文**：`train_classifier.py` 与 `inference_node.py` 现共享同一套 YOPO 运动基元参数。`radio_range` 定义轨迹地平线（默认 5 m），结合 `vel_max_train`、`primitive_dt/primitive_steps` 自动推导 3–5×`dt` 的轨迹时长。`v_forward_mean/sigma`（对数正态）、`v_std_unit`、`a_std_unit` 控制机体系速度/加速度采样分布，而 `yaw_std_deg`、`pitch_std_deg` + `horizon/vertical fov` 确保采样方向位于相机视野内。策略网络输出 3 维偏移量 + 1 个时长缩放，`offset_gain` 负责约束偏移幅度。`inference.launch` 中的参数与训练脚本的 `--radio_range --vel_max_train ... --camera_pitch_deg` 保持一一对应，可直接复现训练时的运动基元云。
+- **English**: Both the trainer and the inference node now draw YOPO-style primitives from the same `PrimitiveConfig`. `radio_range` fixes the horizon (5 m by default), while `vel_max_train`, `primitive_dt`, and `primitive_steps` determine the 3–5 × dt duration. Forward velocity follows a log-normal law (`v_forward_mean`/`v_forward_sigma`), lateral/vertical components use zero-mean Gaussians scaled by `v_std_unit`, and accelerations mirror `a_std_unit`. `yaw_std_deg`/`pitch_std_deg` together with the camera FOV restrict candidate directions to what the RGB sensor can actually observe. The policy outputs a 3D offset and a duration scale that are clamped via `offset_gain` and `duration_scale_[min|max]`. Keep the new CLI flags (`--radio_range`, `--primitive_dt`, `--path_samples_per_step`, `--camera_pitch_deg`, etc.) aligned with the ROS parameters in `inference.launch` to guarantee that training and runtime primitives stay consistent.
+
 ## 推理部署 / Inference Deployment
 ```bash
 roslaunch autonomy_demo inference.launch \

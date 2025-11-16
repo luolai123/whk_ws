@@ -16,9 +16,21 @@
     <param name="primitive_dt" value="0.25" />
     <param name="path_samples_per_step" value="3" />
     <param name="camera_pitch_deg" value="10.0" />
-    <param name="yopo_yaw_deg" value="[-14.0, -8.0, -4.0, 0.0, 4.0, 8.0, 14.0]" />
-    <param name="yopo_pitch_deg" value="[-8.0, -4.0, 0.0, 4.0, 8.0]" />
-    <param name="primitive_length_scales" value="[0.85, 1.0, 1.15]" />
+    <param name="radio_range" value="5.0" />
+    <param name="vel_max_train" value="6.0" />
+    <param name="acc_max_train" value="3.0" />
+    <param name="v_forward_mean" value="2.0" />
+    <param name="v_forward_sigma" value="0.45" />
+    <param name="v_std_unit" value="0.22" />
+    <param name="a_std_unit" value="0.35" />
+    <param name="goal_length_scale" value="1.0" />
+    <param name="offset_gain" value="0.25" />
+    <param name="yaw_std_deg" value="20.0" />
+    <param name="pitch_std_deg" value="10.0" />
+    <param name="primitive_candidate_count" value="24" />
+    <param name="primitive_seed" value="0" />
+    <param name="primitive_safety_gate" value="0.6" />
+    <param name="primitive_clearance_gate" value="0.08" />
     <param name="min_clearance_fraction" value="0.08" />
     <param name="max_heading_rate_deg" value="110.0" />
     <param name="max_jerk_mps3" value="35.0" />

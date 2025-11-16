@@ -14,15 +14,17 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from autonomy_demo.safe_navigation import (
+    PrimitiveConfig,
+    apply_goal_offset,
     clamp_normalized,
     compute_direction_from_pixel,
     find_largest_safe_region,
     jerk_score,
     orientation_rate_score,
-    path_smoothness,
+    primitive_quintic_trajectory,
+    primitive_state_vector,
     project_direction_to_pixel,
-    quintic_coefficients,
-    sample_quintic,
+    sample_motion_primitives,
 )
 
 
@@ -382,10 +384,11 @@ def _sample_goal_pixel(region: "SafeRegion", rng: random.Random) -> Tuple[float,
 
 
 class SafeNavigationPolicy(torch.nn.Module):
-    def __init__(self, height: int, width: int) -> None:
+    def __init__(self, height: int, width: int, state_dim: int) -> None:
         super().__init__()
         self.height = height
         self.width = width
+        self.state_dim = state_dim
         self.backbone = torch.nn.Sequential(
             torch.nn.Conv2d(1, 16, kernel_size=3, padding=1),
             torch.nn.ReLU(inplace=True),
@@ -395,13 +398,13 @@ class SafeNavigationPolicy(torch.nn.Module):
             torch.nn.ReLU(inplace=True),
         )
         self.global_pool = torch.nn.AdaptiveAvgPool2d(1)
-        self.fc1 = torch.nn.Linear(64 + 1, 64)
-        self.fc2 = torch.nn.Linear(64, 2)
+        self.fc1 = torch.nn.Linear(64 + state_dim, 64)
+        self.fc2 = torch.nn.Linear(64, 4)
 
-    def forward(self, mask: torch.Tensor, speed: torch.Tensor) -> torch.Tensor:
+    def forward(self, mask: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
         features = self.backbone(mask)
         pooled = self.global_pool(features).view(mask.size(0), -1)
-        combined = torch.cat([pooled, speed.unsqueeze(1)], dim=1)
+        combined = torch.cat([pooled, state], dim=1)
         hidden = F.relu(self.fc1(combined))
         output = torch.tanh(self.fc2(hidden))
         return output
@@ -562,41 +565,28 @@ def train_navigation_policy(
     lr: float,
     noise_rate: float,
     policy_output: pathlib.Path,
+    primitive_config: PrimitiveConfig,
+    primitive_dt: float,
+    primitive_steps: int,
+    samples_per_step: int,
+    camera_pitch_deg: float,
+    seed: int,
 ) -> None:
-    policy = SafeNavigationPolicy(dataset.height, dataset.width).to(device)
+    policy = SafeNavigationPolicy(dataset.height, dataset.width, state_dim=8).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
-    max_range = 12.0
-    tan_half_h = math.tan(math.radians(120.0) / 2.0)
-    tan_half_v = tan_half_h * (dataset.height / float(dataset.width))
-    tan_half_h_t = torch.tensor(tan_half_h, device=device)
-    tan_half_v_t = torch.tensor(tan_half_v, device=device)
-    pitch_limit = torch.tensor(math.radians(15.0), device=device)
-    yaw_limit = torch.tensor(math.radians(15.0), device=device)
     diag = math.sqrt(dataset.width ** 2 + dataset.height ** 2)
-    diag_t = torch.tensor(diag, device=device)
-    primitive_dt = 0.25
-
+    camera_pitch = -math.radians(camera_pitch_deg)
+    camera_to_body = np.array(
+        [
+            [math.cos(camera_pitch), 0.0, math.sin(camera_pitch)],
+            [0.0, 1.0, 0.0],
+            [-math.sin(camera_pitch), 0.0, math.cos(camera_pitch)],
+        ],
+        dtype=np.float32,
+    )
+    body_to_camera = camera_to_body.T
+    rng = np.random.default_rng(seed or None)
     indices = list(range(len(dataset)))
-
-    def bilinear_sample(sample: torch.Tensor, row_value: torch.Tensor, col_value: torch.Tensor) -> torch.Tensor:
-        h = sample.shape[0]
-        w = sample.shape[1]
-        row0 = torch.clamp(torch.floor(row_value), 0, h - 1)
-        row1 = torch.clamp(row0 + 1, 0, h - 1)
-        col0 = torch.clamp(torch.floor(col_value), 0, w - 1)
-        col1 = torch.clamp(col0 + 1, 0, w - 1)
-        row_frac = row_value - row0
-        col_frac = col_value - col0
-        s00 = sample[row0.long(), col0.long()]
-        s01 = sample[row0.long(), col1.long()]
-        s10 = sample[row1.long(), col0.long()]
-        s11 = sample[row1.long(), col1.long()]
-        return (
-            s00 * (1.0 - row_frac) * (1.0 - col_frac)
-            + s01 * (1.0 - row_frac) * col_frac
-            + s10 * row_frac * (1.0 - col_frac)
-            + s11 * row_frac * col_frac
-        )
 
     for epoch in range(epochs):
         random.shuffle(indices)
@@ -608,9 +598,7 @@ def train_navigation_policy(
             "clearance": 0.0,
             "goal": 0.0,
             "goal_alignment": 0.0,
-            "stability": 0.0,
             "smoothness": 0.0,
-            "speed": 0.0,
             "jerk": 0.0,
             "orientation": 0.0,
         }
@@ -622,7 +610,7 @@ def train_navigation_policy(
             valid_samples = 0
 
             for idx in batch:
-                safe_mask, distances, metadata = dataset[idx]
+                safe_mask, distances, _metadata = dataset[idx]
                 noisy_mask = add_noise(safe_mask, noise_rate)
                 region = find_largest_safe_region(noisy_mask.astype(bool), 0.05)
                 if region is None:
@@ -630,30 +618,9 @@ def train_navigation_policy(
 
                 center_row, center_col = region.centroid
                 goal_row, goal_col = _sample_goal_pixel(region, random)
-                safe_fraction = region.area / float(dataset.height * dataset.width)
                 mask_tensor = torch.from_numpy(noisy_mask).to(device=device, dtype=torch.float32)
                 mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
 
-                speed = torch.rand(1, device=device) * 4.0 + 3.0
-                normalized_speed = (speed - 3.0) / 4.0
-
-                outputs = policy(mask_tensor, normalized_speed)
-                distance_delta, duration_delta = outputs[0]
-                distance_scale = torch.clamp(1.0 + 0.25 * distance_delta, 0.6, 1.4)
-                duration_scale = torch.clamp(1.0 + 0.2 * duration_delta, 0.7, 1.3)
-
-                base_direction_np = compute_direction_from_pixel(
-                    center_col, center_row, dataset.width, dataset.height, 120.0
-                ).astype(np.float32)
-                goal_direction_np = compute_direction_from_pixel(
-                    goal_col, goal_row, dataset.width, dataset.height, 120.0
-                ).astype(np.float32)
-                blend = np.clip(0.25 + 0.5 * safe_fraction, 0.0, 0.9)
-                combined_direction_np = clamp_normalized(
-                    (1.0 - blend) * base_direction_np + blend * goal_direction_np
-                )
-
-                distances_t = torch.from_numpy(distances).to(device=device)
                 clearance_map = cv2.distanceTransform(
                     (noisy_mask > 0.5).astype(np.uint8), cv2.DIST_L2, 5
                 ).astype(np.float32)
@@ -662,150 +629,140 @@ def train_navigation_policy(
                     clearance_norm = clearance_map / max_clearance
                 else:
                     clearance_norm = clearance_map
-                clearance_t = torch.from_numpy(clearance_norm).to(device=device)
 
-                center_row_t = torch.tensor(center_row, device=device, dtype=torch.float32)
-                center_col_t = torch.tensor(center_col, device=device, dtype=torch.float32)
-                goal_row_t = torch.tensor(goal_row, device=device, dtype=torch.float32)
-                goal_col_t = torch.tensor(goal_col, device=device, dtype=torch.float32)
+                base_direction_camera = compute_direction_from_pixel(
+                    center_col, center_row, dataset.width, dataset.height, 120.0
+                ).astype(np.float32)
+                sample = sample_motion_primitives(
+                    base_direction_camera,
+                    camera_to_body,
+                    rng,
+                    primitive_config,
+                    1,
+                )[0]
+                state_vec = primitive_state_vector(sample, primitive_config)
+                state_tensor = torch.from_numpy(state_vec).unsqueeze(0).to(device=device)
 
-                clearance_center = bilinear_sample(clearance_t, center_row_t, center_col_t)
-                goal_distance_est = bilinear_sample(distances_t, goal_row_t, goal_col_t)
-
-                base_distance = torch.clamp(goal_distance_est, 1.0, max_range)
-                target_distance = base_distance * distance_scale
-                primitive_steps = 4
-                primitive_duration = primitive_dt * primitive_steps
-                duration_value = torch.clamp(primitive_duration * duration_scale, min=primitive_dt)
-
-                speed_value = float(speed.item())
-                target_distance_val = float(target_distance.detach().cpu())
-                duration_val = float(duration_value.detach().cpu())
-                start_pos = np.zeros(3, dtype=np.float32)
-                start_vel = combined_direction_np * speed_value
-                end_pos = combined_direction_np * target_distance_val
-                end_vel = combined_direction_np * speed_value
-                coeffs = quintic_coefficients(
-                    start_pos,
-                    start_vel,
-                    np.zeros(3, dtype=np.float32),
-                    end_pos,
-                    end_vel,
-                    np.zeros(3, dtype=np.float32),
-                    duration_val,
+                outputs = policy(mask_tensor, state_tensor)
+                offset_raw = outputs[0, 0:3]
+                duration_delta = outputs[0, 3]
+                duration_scale = torch.clamp(
+                    1.0 + 0.2 * duration_delta,
+                    0.7,
+                    1.3,
                 )
-                points_np, velocities_np = sample_quintic(coeffs, duration_val, primitive_steps)
-                path_points = [pt for pt in points_np]
-                directions = []
-                samples: List[Tuple[int, int]] = []
+                offset_vec = offset_raw.detach().cpu().numpy() * primitive_config.radio_range
+                goal_body = apply_goal_offset(sample, offset_vec, primitive_config)
+                sample_count = max(primitive_steps * samples_per_step, primitive_steps)
+                points_np, velocities_np, duration_val = primitive_quintic_trajectory(
+                    sample,
+                    goal_body,
+                    float(duration_scale.detach().cpu()),
+                    sample_count,
+                )
+                if points_np.size == 0:
+                    continue
+
+                safety_hits: List[float] = []
+                clearance_values: List[float] = []
+                smoothness_sum = 0.0
+                prev_dir: Optional[np.ndarray] = None
                 last_col = center_col
                 last_row = center_row
                 for point in points_np[1:]:
-                    norm = np.linalg.norm(point)
-                    if norm < 1e-4:
-                        continue
-                    direction = point / norm
-                    directions.append(direction)
+                    direction_body = clamp_normalized(point)
+                    direction_camera = body_to_camera.dot(direction_body)
                     col_pix, row_pix = project_direction_to_pixel(
-                        direction, dataset.width, dataset.height, 120.0
+                        direction_camera,
+                        dataset.width,
+                        dataset.height,
+                        120.0,
                     )
                     last_col, last_row = col_pix, row_pix
                     col_i = int(round(col_pix))
                     row_i = int(round(row_pix))
                     if 0 <= row_i < dataset.height and 0 <= col_i < dataset.width:
-                        samples.append((row_i, col_i))
-                    else:
-                        samples.append((-1, -1))
-
-                if not samples:
-                    continue
-
-                safety_hits = []
-                clearance_values = []
-                for row_i, col_i in samples:
-                    if row_i >= 0:
                         safety_hits.append(float(noisy_mask[row_i, col_i]))
                         clearance_values.append(float(clearance_norm[row_i, col_i]))
                     else:
                         safety_hits.append(0.0)
                         clearance_values.append(0.0)
+                    if prev_dir is not None:
+                        smoothness_sum += max(
+                            -1.0, min(1.0, float(np.dot(prev_dir, direction_body)))
+                        )
+                    prev_dir = direction_body
 
-                safety_score = torch.tensor(
-                    float(min(safety_hits)), device=device, dtype=torch.float32
-                )
-                if clearance_values:
-                    min_clearance_val = max(0.0, min(clearance_values))
-                else:
-                    min_clearance_val = float(clearance_center.detach().cpu())
-                clearance_score = torch.tensor(
-                    min(1.0, min_clearance_val), device=device, dtype=torch.float32
-                )
+                if not safety_hits:
+                    continue
 
+                safety_ratio = sum(safety_hits) / len(safety_hits)
+                clearance_min = max(0.0, min(clearance_values))
+                if safety_ratio < 0.45 or clearance_min < 0.05:
+                    continue
+
+                smoothness_score = max(
+                    0.0,
+                    min(1.0, (smoothness_sum / max(len(safety_hits) - 1, 1) + 1.0) * 0.5),
+                )
                 goal_error = math.sqrt((last_col - goal_col) ** 2 + (last_row - goal_row) ** 2)
+                goal_direction_camera = compute_direction_from_pixel(
+                    goal_col,
+                    goal_row,
+                    dataset.width,
+                    dataset.height,
+                    120.0,
+                )
+                final_direction = clamp_normalized(points_np[-1])
+                final_cam = body_to_camera.dot(final_direction)
+                goal_alignment = float(
+                    max(-1.0, min(1.0, np.dot(clamp_normalized(final_cam), goal_direction_camera)))
+                )
+                jerk_metric_val = jerk_score(points_np, primitive_dt / max(samples_per_step, 1))
+                orientation_metric_val = orientation_rate_score(velocities_np)
+
+                safety_score = torch.tensor(safety_ratio, device=device, dtype=torch.float32)
+                clearance_score = torch.tensor(
+                    min(1.0, clearance_min), device=device, dtype=torch.float32
+                )
                 goal_score = torch.exp(
                     -torch.tensor(goal_error / diag, device=device, dtype=torch.float32)
                 )
-                goal_alignment_val = float(
-                    max(-1.0, min(1.0, np.dot(combined_direction_np, goal_direction_np)))
-                )
                 goal_alignment_score = torch.tensor(
-                    (goal_alignment_val + 1.0) * 0.5,
-                    device=device,
-                    dtype=torch.float32,
+                    (goal_alignment + 1.0) * 0.5, device=device, dtype=torch.float32
                 )
-
-                stability_penalty = (
-                    torch.abs(distance_scale - 1.0) / 0.3 + torch.abs(duration_scale - 1.0) / 0.3
-                ) * 0.5
-                stability_score = torch.exp(-stability_penalty)
-
-                avg_speed = target_distance_val / max(duration_val, 1e-3)
-                speed_penalty = abs(avg_speed - speed_value) / max(speed_value, 1.0)
-                speed_score = torch.exp(-torch.tensor(speed_penalty, device=device, dtype=torch.float32))
-
-                smoothness_metric = path_smoothness(path_points)
-                smoothness_score = torch.tensor(
-                    float(max(0.0, min(1.0, smoothness_metric))), device=device, dtype=torch.float32
+                smoothness_score_t = torch.tensor(
+                    smoothness_score, device=device, dtype=torch.float32
                 )
-
-                jerk_metric_val = jerk_score(path_points, primitive_dt)
                 jerk_score_t = torch.tensor(
-                    float(max(0.0, min(1.0, jerk_metric_val))),
-                    device=device,
-                    dtype=torch.float32,
+                    max(0.0, min(1.0, jerk_metric_val)), device=device, dtype=torch.float32
                 )
-
-                orientation_metric_val = orientation_rate_score(directions)
                 orientation_score_t = torch.tensor(
-                    float(max(0.0, min(1.0, orientation_metric_val))),
+                    max(0.0, min(1.0, orientation_metric_val)),
                     device=device,
                     dtype=torch.float32,
                 )
 
                 reward = (
-                    0.4 * safety_score
+                    0.45 * safety_score
                     + 0.2 * clearance_score
-                    + 0.18 * goal_score
-                    + 0.06 * goal_alignment_score
-                    + 0.05 * smoothness_score
-                    + 0.04 * jerk_score_t
-                    + 0.03 * orientation_score_t
-                    + 0.02 * stability_score
-                    + 0.02 * speed_score
+                    + 0.15 * goal_score
+                    + 0.08 * goal_alignment_score
+                    + 0.07 * smoothness_score_t
+                    + 0.03 * jerk_score_t
+                    + 0.02 * orientation_score_t
                 )
                 loss = -reward
                 batch_loss += loss
                 valid_samples += 1
 
-                metrics_accumulator['safety'] += float(safety_score.detach().cpu())
-                metrics_accumulator['clearance'] += float(clearance_score.detach().cpu())
-                metrics_accumulator['goal'] += float(goal_score.detach().cpu())
-                metrics_accumulator['goal_alignment'] += float(goal_alignment_score.detach().cpu())
-                metrics_accumulator['stability'] += float(stability_score.detach().cpu())
-                metrics_accumulator['speed'] += float(speed_score.detach().cpu())
-                metrics_accumulator['jerk'] += float(jerk_metric_val)
-                metrics_accumulator['orientation'] += float(orientation_metric_val)
-                metrics_accumulator['smoothness'] += float(smoothness_metric)
+                metrics_accumulator["safety"] += safety_ratio
+                metrics_accumulator["clearance"] += clearance_min
+                metrics_accumulator["goal"] += float(goal_score.detach().cpu())
+                metrics_accumulator["goal_alignment"] += (goal_alignment + 1.0) * 0.5
+                metrics_accumulator["smoothness"] += smoothness_score
+                metrics_accumulator["jerk"] += jerk_metric_val
+                metrics_accumulator["orientation"] += orientation_metric_val
 
                 epoch_count += 1
 
@@ -819,14 +776,11 @@ def train_navigation_policy(
 
         if epoch_count:
             avg_loss = epoch_loss / epoch_count
-        else:
-            avg_loss = float("nan")
-        if epoch_count:
             averaged_metrics = {
                 key: value / epoch_count for key, value in metrics_accumulator.items()
             }
             print(
-                "Policy epoch {}/{} - avg loss: {:.4f}, safety: {:.3f}, clearance: {:.3f}, goal: {:.3f}, align: {:.3f}, smoothness: {:.3f}, jerk: {:.3f}, orientation: {:.3f}, stability: {:.3f}, speed: {:.3f}".format(
+                "Policy epoch {}/{} - avg loss: {:.4f}, safety: {:.3f}, clearance: {:.3f}, goal: {:.3f}, align: {:.3f}, smoothness: {:.3f}, jerk: {:.3f}, orientation: {:.3f}".format(
                     epoch + 1,
                     epochs,
                     avg_loss,
@@ -837,12 +791,10 @@ def train_navigation_policy(
                     averaged_metrics["smoothness"],
                     averaged_metrics["jerk"],
                     averaged_metrics["orientation"],
-                    averaged_metrics["stability"],
-                    averaged_metrics["speed"],
                 )
             )
         else:
-            print(f"Policy epoch {epoch + 1}/{epochs} - avg loss: {avg_loss:.4f}")
+            print(f"Policy epoch {epoch + 1}/{epochs} - avg loss: nan")
 
     policy_output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(policy.state_dict(), policy_output)
@@ -867,6 +819,22 @@ def parse_args() -> argparse.Namespace:
         type=pathlib.Path,
         default=pathlib.Path.home() / "autonomy_demo" / "navigation_policy.pt",
     )
+    parser.add_argument("--camera_pitch_deg", type=float, default=10.0)
+    parser.add_argument("--primitive_steps", type=int, default=4)
+    parser.add_argument("--primitive_dt", type=float, default=0.25)
+    parser.add_argument("--path_samples_per_step", type=int, default=3)
+    parser.add_argument("--radio_range", type=float, default=5.0)
+    parser.add_argument("--vel_max_train", type=float, default=6.0)
+    parser.add_argument("--acc_max_train", type=float, default=3.0)
+    parser.add_argument("--v_forward_mean", type=float, default=2.0)
+    parser.add_argument("--v_forward_sigma", type=float, default=0.45)
+    parser.add_argument("--v_std_unit", type=float, default=0.22)
+    parser.add_argument("--a_std_unit", type=float, default=0.35)
+    parser.add_argument("--goal_length_scale", type=float, default=1.0)
+    parser.add_argument("--offset_gain", type=float, default=0.25)
+    parser.add_argument("--yaw_std_deg", type=float, default=20.0)
+    parser.add_argument("--pitch_std_deg", type=float, default=10.0)
+    parser.add_argument("--policy_seed", type=int, default=0)
     return parser.parse_args()
 
 
@@ -930,6 +898,21 @@ def main() -> None:
 
     if not args.no_policy:
         nav_dataset = NavigationDataset(args.dataset)
+        primitive_config = PrimitiveConfig(
+            radio_range=args.radio_range,
+            vel_max_train=args.vel_max_train,
+            acc_max_train=args.acc_max_train,
+            forward_log_mean=math.log(max(0.2, args.v_forward_mean)),
+            forward_log_sigma=max(0.05, args.v_forward_sigma),
+            v_std_unit=max(0.05, args.v_std_unit),
+            a_std_unit=max(0.05, args.a_std_unit),
+            yaw_std_deg=args.yaw_std_deg,
+            pitch_std_deg=args.pitch_std_deg,
+            goal_length_scale=max(0.2, args.goal_length_scale),
+            offset_gain=max(0.05, args.offset_gain),
+        )
+        primitive_steps = max(3, min(5, args.primitive_steps))
+        samples_per_step = max(1, args.path_samples_per_step)
         train_navigation_policy(
             nav_dataset,
             device,
@@ -938,6 +921,12 @@ def main() -> None:
             args.policy_lr,
             args.policy_noise,
             args.policy_output,
+            primitive_config,
+            args.primitive_dt,
+            primitive_steps,
+            samples_per_step,
+            args.camera_pitch_deg,
+            args.policy_seed,
         )
 
 

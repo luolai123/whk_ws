@@ -25,11 +25,17 @@ from std_msgs.msg import Float32MultiArray, Header
 from tf_conversions import transformations
 
 from autonomy_demo.safe_navigation import (
+    PrimitiveConfig,
+    apply_goal_offset,
     clamp_normalized,
     compute_direction_from_pixel,
     find_largest_safe_region,
-    quintic_coefficients,
-    sample_quintic,
+    orientation_rate_score,
+    jerk_score,
+    primitive_quintic_trajectory,
+    primitive_state_vector,
+    project_direction_to_pixel,
+    sample_motion_primitives,
 )
 
 
@@ -93,10 +99,11 @@ class DistanceClassifier(torch.nn.Module):
 
 
 class SafeNavigationPolicy(torch.nn.Module):
-    def __init__(self, height: int, width: int) -> None:
+    def __init__(self, height: int, width: int, state_dim: int) -> None:
         super().__init__()
         self.height = height
         self.width = width
+        self.state_dim = state_dim
         self.backbone = torch.nn.Sequential(
             torch.nn.Conv2d(1, 16, kernel_size=3, padding=1),
             torch.nn.ReLU(inplace=True),
@@ -106,13 +113,13 @@ class SafeNavigationPolicy(torch.nn.Module):
             torch.nn.ReLU(inplace=True),
         )
         self.global_pool = torch.nn.AdaptiveAvgPool2d(1)
-        self.fc1 = torch.nn.Linear(64 + 1, 64)
-        self.fc2 = torch.nn.Linear(64, 2)
+        self.fc1 = torch.nn.Linear(64 + state_dim, 64)
+        self.fc2 = torch.nn.Linear(64, 4)
 
-    def forward(self, mask: torch.Tensor, speed: torch.Tensor) -> torch.Tensor:
+    def forward(self, mask: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
         features = self.backbone(mask)
         pooled = self.global_pool(features).view(mask.size(0), -1)
-        combined = torch.cat([pooled, speed.unsqueeze(1)], dim=1)
+        combined = torch.cat([pooled, state], dim=1)
         hidden = torch.relu(self.fc1(combined))
         return torch.tanh(self.fc2(hidden))
 
@@ -188,6 +195,7 @@ class InferenceNode:
         self._camera_mount_matrix = (
             transformations.quaternion_matrix(self._camera_mount_quat)[0:3, 0:3]
         ).astype(np.float32)
+        self._body_to_camera = self._camera_mount_matrix
         self._camera_to_body = self._camera_mount_matrix.T
 
         self.camera_info: Optional[CameraInfo] = None
@@ -204,6 +212,38 @@ class InferenceNode:
         self.primitive_steps = max(3, min(5, primitive_steps))
         self.primitive_dt = float(rospy.get_param("~primitive_dt", 0.25))
         self.primitive_duration = self.primitive_steps * self.primitive_dt
+        self.primitive_candidate_count = int(rospy.get_param("~primitive_candidate_count", 24))
+        primitive_seed = int(rospy.get_param("~primitive_seed", 0))
+        self._rng = np.random.default_rng(primitive_seed or None)
+        forward_mean = float(rospy.get_param("~v_forward_mean", 2.0))
+        forward_sigma = float(rospy.get_param("~v_forward_sigma", 0.45))
+        v_std_unit = float(rospy.get_param("~v_std_unit", 0.22))
+        a_std_unit = float(rospy.get_param("~a_std_unit", 0.35))
+        radio_range = float(rospy.get_param("~radio_range", 5.0))
+        vel_max_train = float(rospy.get_param("~vel_max_train", 6.0))
+        acc_max_train = float(rospy.get_param("~acc_max_train", 3.0))
+        goal_length_scale = float(rospy.get_param("~goal_length_scale", 1.0))
+        offset_gain = float(rospy.get_param("~offset_gain", 0.25))
+        yaw_std_deg = float(rospy.get_param("~yaw_std_deg", 20.0))
+        pitch_std_deg = float(rospy.get_param("~pitch_std_deg", 10.0))
+        horizon_fov = float(rospy.get_param("~horizon_camera_fov", 90.0))
+        vertical_fov = float(rospy.get_param("~vertical_camera_fov", 60.0))
+        self.primitive_config = PrimitiveConfig(
+            radio_range=radio_range,
+            vel_max_train=vel_max_train,
+            acc_max_train=acc_max_train,
+            forward_log_mean=math.log(max(0.2, forward_mean)),
+            forward_log_sigma=max(0.05, forward_sigma),
+            v_std_unit=max(0.05, v_std_unit),
+            a_std_unit=max(0.05, a_std_unit),
+            yaw_std_deg=yaw_std_deg,
+            pitch_std_deg=pitch_std_deg,
+            horizon_camera_fov=horizon_fov,
+            vertical_camera_fov=vertical_fov,
+            goal_length_scale=max(0.2, goal_length_scale),
+            offset_gain=max(0.05, offset_gain),
+        )
+        self.policy_state_dim = 8
         samples_per_step = int(rospy.get_param("~path_samples_per_step", 3))
         self.path_samples_per_step = max(1, samples_per_step)
 
@@ -216,6 +256,8 @@ class InferenceNode:
             float(rospy.get_param("~plan_hold_time", hold_default))
         )
         self.plan_similarity_epsilon = float(rospy.get_param("~plan_similarity_epsilon", 0.35))
+        self.safety_gate = float(rospy.get_param("~primitive_safety_gate", 0.6))
+        self.clearance_gate = float(rospy.get_param("~primitive_clearance_gate", 0.08))
         self._last_plan_signature: Optional[Tuple[float, float, float, float]] = None
         self._last_plan_stamp = rospy.Time(0.0)
         self._smoothed_command: Optional[np.ndarray] = None
@@ -276,7 +318,7 @@ class InferenceNode:
         if self.image_shape is None:
             return
         height, width = self.image_shape
-        self.policy = SafeNavigationPolicy(height, width).to(self.device)
+        self.policy = SafeNavigationPolicy(height, width, self.policy_state_dim).to(self.device)
         if self.policy_state:
             self.policy.load_state_dict(self.policy_state)
         else:
@@ -358,9 +400,16 @@ class InferenceNode:
         safe_msg.point.z = safe_fraction
         self.safe_center_pub.publish(safe_msg)
 
+        clearance_map = cv2.distanceTransform(safe_mask.astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
+        max_clearance = float(np.max(clearance_map))
+        if max_clearance > 1e-6:
+            clearance_map /= max_clearance
+
         fov_deg = math.degrees(2.0 * math.atan(self.tan_half_h))
-        base_direction = compute_direction_from_pixel(center_col, center_row, width, height, fov_deg)
-        base_direction = clamp_normalized(base_direction.dot(self._camera_to_body))
+        base_direction_camera = compute_direction_from_pixel(
+            center_col, center_row, width, height, fov_deg
+        )
+        base_direction_body = clamp_normalized(self._camera_to_body.dot(base_direction_camera))
         origin = np.array(
             [
                 self.odom.pose.pose.position.x,
@@ -377,36 +426,17 @@ class InferenceNode:
                 self.odom.pose.pose.orientation.w,
             ]
         )[0:3, 0:3]
-        base_world_direction = clamp_normalized(rotation.dot(base_direction))
         goal_direction, goal_distance = self._goal_vector(origin)
-        adjusted_direction = base_world_direction
-        if goal_direction is not None:
-            safe_ratio = min(1.0, max(0.0, safe_fraction / max(self.min_safe_fraction, 1e-3)))
-            blend = np.clip(
-                self.goal_direction_blend + 0.35 * safe_ratio,
-                0.0,
-                0.95,
-            )
-            adjusted_direction = clamp_normalized(
-                (1.0 - blend) * base_world_direction + blend * goal_direction
-            )
-        else:
-            goal_distance = None
 
-        velocity = self.odom.twist.twist.linear
-        speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
-        if speed < 1e-3:
-            speed = self.default_speed
-        base_vector_world = base_world_direction * speed
-
-        distance_scale, duration_scale = self._policy_scales(cluster_mask, speed)
-        plan = self._plan_quintic_path(
+        plan = self._plan_motion_primitive(
             origin,
             rotation,
-            adjusted_direction,
-            speed,
-            distance_scale,
-            duration_scale,
+            base_direction_camera,
+            cluster_mask,
+            clearance_map,
+            center_row,
+            center_col,
+            goal_direction,
             goal_distance,
         )
 
@@ -415,11 +445,14 @@ class InferenceNode:
             self._log_timing(start_time)
             return
 
-        path_points = plan["points"]
-        velocities = plan["velocities"]
+        path_points = plan["points_world"]
+        velocities = plan["velocities_world"]
         command_vector_world = plan["command_vector"]
         travel_distance = plan["distance"]
         travel_duration = plan["duration"]
+        distance_scale = plan["distance_scale"]
+        duration_scale = plan["duration_scale"]
+        base_vector_world = rotation.dot(plan["sample"].start_vel_body)
         signature = (
             round(float(command_vector_world[0]), 3),
             round(float(command_vector_world[1]), 3),
@@ -559,73 +592,201 @@ class InferenceNode:
         return False
 
 
-    def _policy_scales(self, safe_mask: np.ndarray, speed: float) -> Tuple[float, float]:
+    def _policy_offsets(
+        self, safe_mask: np.ndarray, state_vec: np.ndarray
+    ) -> Tuple[np.ndarray, float]:
         if self.policy is None:
-            return 1.0, 1.0
+            return np.zeros(3, dtype=np.float32), 1.0
         mask_tensor = (
             torch.from_numpy(safe_mask.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(self.device)
         )
-        speed_norm = torch.tensor([(speed - 3.0) / 4.0], device=self.device, dtype=torch.float32)
+        state_tensor = torch.from_numpy(state_vec.astype(np.float32)).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            scales = self.policy(mask_tensor, speed_norm).squeeze(0).cpu().numpy()
-        distance_scale = float(
-            np.clip(1.0 + 0.25 * scales[0], self.distance_scale_min, self.distance_scale_max)
-        )
+            outputs = self.policy(mask_tensor, state_tensor).squeeze(0).cpu().numpy()
+        offset = np.clip(outputs[0:3], -1.0, 1.0)
         duration_scale = float(
-            np.clip(1.0 + 0.2 * scales[1], self.duration_scale_min, self.duration_scale_max)
+            np.clip(1.0 + 0.2 * outputs[3], self.duration_scale_min, self.duration_scale_max)
         )
-        return distance_scale, duration_scale
+        offset_vec = offset * self.primitive_config.radio_range
+        return offset_vec.astype(np.float32), duration_scale
 
-    def _plan_quintic_path(
+    def _plan_motion_primitive(
         self,
         origin: np.ndarray,
         rotation: np.ndarray,
-        world_direction: np.ndarray,
-        speed: float,
-        distance_scale: float,
-        duration_scale: float,
+        base_direction_camera: np.ndarray,
+        cluster_mask: np.ndarray,
+        clearance_map: np.ndarray,
+        center_row: float,
+        center_col: float,
+        goal_direction: Optional[np.ndarray],
         goal_distance: Optional[float],
     ) -> Optional[dict]:
-        if self.odom is None:
+        if cluster_mask.size == 0:
             return None
-        base_speed = speed if speed > 1e-3 else self.default_speed
-        base_distance = base_speed * self.primitive_duration
-        target_distance = max(0.5, base_distance * distance_scale)
-        if goal_distance is not None:
-            target_distance = min(target_distance, max(goal_distance - self.goal_tolerance, 0.3))
-        duration = max(0.2, self.primitive_duration * duration_scale)
-        origin = origin.astype(np.float32)
-        world_direction = clamp_normalized(world_direction)
-        target_point = origin + world_direction * target_distance
-        twist = self.odom.twist.twist.linear
-        start_vel_body = np.array([twist.x, twist.y, twist.z], dtype=np.float32)
-        start_vel_world = rotation.dot(start_vel_body)
-        end_speed = max(self.default_speed * 0.5, min(base_speed, self.default_speed * 1.2))
-        end_vel = world_direction * end_speed
-        zero_acc = np.zeros(3, dtype=np.float32)
-        coeffs = quintic_coefficients(
-            origin,
-            start_vel_world,
-            zero_acc,
-            target_point,
-            end_vel,
-            zero_acc,
-            duration,
+        height, width = cluster_mask.shape
+        if width == 0 or height == 0:
+            return None
+        fov_deg = math.degrees(2.0 * math.atan(self.tan_half_h)) if self.tan_half_h else 120.0
+        primitives = sample_motion_primitives(
+            base_direction_camera,
+            self._camera_to_body,
+            self._rng,
+            self.primitive_config,
+            self.primitive_candidate_count,
         )
+        best_plan: Optional[dict] = None
+        best_score = -float("inf")
+        origin = origin.astype(np.float32)
         sample_count = max(
             self.primitive_steps,
             self.primitive_steps * self.path_samples_per_step,
         )
-        points, velocities = sample_quintic(coeffs, duration, sample_count)
-        if points.size == 0:
+        for sample in primitives:
+            state_vec = primitive_state_vector(sample, self.primitive_config)
+            offset_vec, duration_scale = self._policy_offsets(cluster_mask, state_vec)
+            goal_body = apply_goal_offset(sample, offset_vec, self.primitive_config)
+            points_body, velocities_body, duration = primitive_quintic_trajectory(
+                sample,
+                goal_body,
+                duration_scale,
+                sample_count,
+            )
+            if points_body.size == 0:
+                continue
+            evaluation = self._evaluate_candidate(
+                points_body,
+                cluster_mask,
+                clearance_map,
+                center_row,
+                center_col,
+                width,
+                height,
+                fov_deg,
+            )
+            if evaluation is None:
+                continue
+            if (
+                evaluation["safety"] < self.safety_gate
+                or evaluation["clearance"] < self.clearance_gate
+            ):
+                continue
+            world_points = origin + rotation.dot(points_body.T).T
+            world_velocities = rotation.dot(velocities_body.T).T
+            travel_distance = float(np.linalg.norm(world_points[-1] - origin))
+            jerk_metric = jerk_score(
+                world_points, duration / max(points_body.shape[0] - 1, 1)
+            )
+            orientation_metric = orientation_rate_score(world_velocities)
+            goal_alignment = 0.0
+            if goal_direction is not None:
+                final_dir = clamp_normalized(world_points[-1] - origin)
+                goal_alignment = float(np.dot(final_dir, goal_direction))
+            goal_alignment_score = (goal_alignment + 1.0) * 0.5
+            diag = math.sqrt(width ** 2 + height ** 2)
+            goal_score = math.exp(-evaluation["goal_error"] / max(diag, 1e-3))
+            smoothness_score = evaluation["smoothness"]
+            jerk_score_val = max(0.0, min(1.0, jerk_metric))
+            orientation_score_val = max(0.0, min(1.0, orientation_metric))
+            score = (
+                0.45 * evaluation["safety"]
+                + 0.2 * evaluation["clearance"]
+                + 0.15 * goal_score
+                + 0.08 * goal_alignment_score
+                + 0.07 * smoothness_score
+                + 0.03 * jerk_score_val
+                + 0.02 * orientation_score_val
+            )
+            if goal_distance is not None:
+                overreach = max(
+                    0.0,
+                    travel_distance - max(goal_distance - self.goal_tolerance, 0.5),
+                )
+                if overreach > 0.0:
+                    score -= min(0.35, overreach / max(goal_distance, 1.0))
+            if score <= best_score:
+                continue
+            command_vector = (
+                world_velocities[1] if world_velocities.shape[0] >= 2 else world_velocities[0]
+            )
+            best_plan = {
+                "points_world": world_points,
+                "velocities_world": world_velocities,
+                "command_vector": command_vector,
+                "distance": travel_distance,
+                "duration": duration,
+                "distance_scale": float(
+                    np.clip(
+                        evaluation["distance_scale"],
+                        self.distance_scale_min,
+                        self.distance_scale_max,
+                    )
+                ),
+                "duration_scale": duration_scale,
+                "offset_norm": float(np.linalg.norm(offset_vec)),
+                "sample": sample,
+            }
+            best_score = score
+        return best_plan
+
+    def _evaluate_candidate(
+        self,
+        points_body: np.ndarray,
+        cluster_mask: np.ndarray,
+        clearance_map: np.ndarray,
+        center_row: float,
+        center_col: float,
+        width: int,
+        height: int,
+        fov_deg: float,
+    ) -> Optional[dict]:
+        if points_body.shape[0] < 2:
             return None
-        command_vector = velocities[1] if velocities.shape[0] >= 2 else velocities[0]
+        safety_hits: List[float] = []
+        clearance_values: List[float] = []
+        smoothness_sum = 0.0
+        last_col = center_col
+        last_row = center_row
+        prev_dir: Optional[np.ndarray] = None
+        for idx in range(1, points_body.shape[0]):
+            direction_body = clamp_normalized(points_body[idx])
+            direction_camera = self._body_to_camera.dot(direction_body)
+            col, row = project_direction_to_pixel(
+                direction_camera, width, height, fov_deg
+            )
+            last_col, last_row = col, row
+            col_i = int(round(col))
+            row_i = int(round(row))
+            if 0 <= row_i < height and 0 <= col_i < width:
+                safe = bool(cluster_mask[row_i, col_i])
+                safety_hits.append(1.0 if safe else 0.0)
+                clearance_values.append(float(clearance_map[row_i, col_i]))
+            else:
+                safety_hits.append(0.0)
+                clearance_values.append(0.0)
+            if prev_dir is not None:
+                smoothness_sum += max(
+                    -1.0, min(1.0, float(np.dot(prev_dir, direction_body)))
+                )
+            prev_dir = direction_body
+        if not safety_hits:
+            return None
+        safety_ratio = sum(safety_hits) / len(safety_hits)
+        clearance_min = max(0.0, min(clearance_values))
+        smoothness_score = max(
+            0.0,
+            min(1.0, (smoothness_sum / max(len(safety_hits) - 1, 1) + 1.0) * 0.5),
+        )
+        goal_error = math.sqrt((last_col - center_col) ** 2 + (last_row - center_row) ** 2)
+        distance_scale = float(
+            np.linalg.norm(points_body[-1]) / max(self.primitive_config.radio_range, 1e-3)
+        )
         return {
-            'points': points,
-            'velocities': velocities,
-            'command_vector': command_vector,
-            'distance': float(target_distance),
-            'duration': float(duration),
+            "safety": safety_ratio,
+            "clearance": clearance_min,
+            "goal_error": goal_error,
+            "smoothness": smoothness_score,
+            "distance_scale": distance_scale,
         }
 
     def _publish_trajectory(self, header, points: np.ndarray, velocities: Optional[np.ndarray] = None) -> None:

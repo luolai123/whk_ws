@@ -5,10 +5,243 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+
+def clamp_normalized(vec: np.ndarray) -> np.ndarray:
+    """Return ``vec`` normalized to unit length with safe fallback."""
+
+    vec = np.asarray(vec, dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if norm < 1e-6:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    return vec / norm
+
+
+@dataclass
+class PrimitiveConfig:
+    """Parameters shared by the YOPO-style primitive sampler."""
+
+    radio_range: float = 5.0
+    vel_max_train: float = 6.0
+    acc_max_train: float = 3.0
+    forward_log_mean: float = math.log(2.0)
+    forward_log_sigma: float = 0.45
+    v_std_unit: float = 0.22
+    a_std_unit: float = 0.35
+    yaw_std_deg: float = 20.0
+    pitch_std_deg: float = 10.0
+    horizon_camera_fov: float = 90.0
+    vertical_camera_fov: float = 60.0
+    goal_length_scale: float = 1.0
+    offset_gain: float = 0.25
+
+    @property
+    def traj_time(self) -> float:
+        vel = max(self.vel_max_train, 0.5)
+        return max(0.5, 2.0 * self.radio_range / vel)
+
+
+@dataclass
+class PrimitiveSample:
+    """Represents a single sampled primitive in the drone body frame."""
+
+    base_direction_camera: np.ndarray
+    goal_direction_body: np.ndarray
+    start_vel_body: np.ndarray
+    start_acc_body: np.ndarray
+    yaw_offset: float
+    pitch_offset: float
+    goal_length: float
+    duration: float
+
+
+def _local_basis(forward: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    forward = clamp_normalized(forward)
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    lateral = np.cross(up, forward)
+    lateral = clamp_normalized(lateral)
+    if np.linalg.norm(lateral) < 1e-5:
+        lateral = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    vertical = np.cross(forward, lateral)
+    vertical = clamp_normalized(vertical)
+    return forward, lateral, vertical
+
+
+def _clamp_angle(angle: float, limit_deg: float) -> float:
+    limit = math.radians(max(1e-3, float(limit_deg)))
+    return max(-limit, min(limit, angle))
+
+
+def sample_motion_primitives(
+    base_direction_camera: np.ndarray,
+    camera_to_body: np.ndarray,
+    rng: np.random.Generator,
+    config: PrimitiveConfig,
+    count: int,
+) -> List[PrimitiveSample]:
+    """Draw ``count`` YOPO-style primitives aligned with ``base_direction_camera``."""
+
+    base_direction_camera = clamp_normalized(base_direction_camera)
+    camera_to_body = np.asarray(camera_to_body, dtype=np.float32)
+    samples: List[PrimitiveSample] = []
+    count = max(1, int(count))
+    yaw_limit = config.horizon_camera_fov * 0.5
+    pitch_limit = config.vertical_camera_fov * 0.5
+
+    for _ in range(count):
+        yaw_offset = _clamp_angle(
+            rng.normal(0.0, math.radians(config.yaw_std_deg)), yaw_limit
+        )
+        pitch_offset = _clamp_angle(
+            rng.normal(0.0, math.radians(config.pitch_std_deg)), pitch_limit
+        )
+        offset_direction_camera = rotate_direction(
+            base_direction_camera, yaw_offset, pitch_offset
+        )
+        goal_direction_body = clamp_normalized(camera_to_body.dot(offset_direction_camera))
+
+        vx = float(
+            np.clip(
+                rng.lognormal(config.forward_log_mean, config.forward_log_sigma),
+                0.0,
+                config.vel_max_train,
+            )
+        )
+        vy = float(
+            np.clip(
+                rng.normal(0.0, config.vel_max_train * config.v_std_unit),
+                -config.vel_max_train,
+                config.vel_max_train,
+            )
+        )
+        vz = float(
+            np.clip(
+                rng.normal(0.0, config.vel_max_train * config.v_std_unit * 0.8),
+                -config.vel_max_train,
+                config.vel_max_train,
+            )
+        )
+        start_vel = np.array([vx, vy, vz], dtype=np.float32)
+
+        ax = float(
+            np.clip(
+                rng.normal(0.0, config.acc_max_train * config.a_std_unit),
+                -config.acc_max_train,
+                config.acc_max_train,
+            )
+        )
+        ay = float(
+            np.clip(
+                rng.normal(0.0, config.acc_max_train * config.a_std_unit),
+                -config.acc_max_train,
+                config.acc_max_train,
+            )
+        )
+        az = float(
+            np.clip(
+                rng.normal(0.0, config.acc_max_train * config.a_std_unit),
+                -config.acc_max_train,
+                config.acc_max_train,
+            )
+        )
+        start_acc = np.array([ax, ay, az], dtype=np.float32)
+
+        length_scale = float(np.clip(rng.normal(config.goal_length_scale, 0.15), 0.4, 1.4))
+        goal_length = config.radio_range * length_scale
+        duration = max(0.2, config.traj_time * length_scale)
+
+        samples.append(
+            PrimitiveSample(
+                base_direction_camera=offset_direction_camera,
+                goal_direction_body=goal_direction_body,
+                start_vel_body=start_vel,
+                start_acc_body=start_acc,
+                yaw_offset=yaw_offset,
+                pitch_offset=pitch_offset,
+                goal_length=goal_length,
+                duration=duration,
+            )
+        )
+
+    return samples
+
+
+def primitive_state_vector(sample: PrimitiveSample, config: PrimitiveConfig) -> np.ndarray:
+    """Return normalized features describing ``sample`` for the policy network."""
+
+    forward, lateral, vertical = _local_basis(sample.goal_direction_body)
+    vel = sample.start_vel_body
+    acc = sample.start_acc_body
+    vel_forward = float(np.dot(vel, forward)) / max(config.vel_max_train, 1e-3)
+    vel_lateral = float(np.dot(vel, lateral)) / max(config.vel_max_train, 1e-3)
+    vel_vertical = float(np.dot(vel, vertical)) / max(config.vel_max_train, 1e-3)
+    acc_forward = float(np.dot(acc, forward)) / max(config.acc_max_train, 1e-3)
+    acc_lateral = float(np.dot(acc, lateral)) / max(config.acc_max_train, 1e-3)
+    acc_vertical = float(np.dot(acc, vertical)) / max(config.acc_max_train, 1e-3)
+    goal_norm = float(sample.goal_length / max(config.radio_range, 1e-3))
+    duration_norm = float(sample.duration / max(config.traj_time, 1e-3))
+
+    return np.array(
+        [
+            vel_forward,
+            vel_lateral,
+            vel_vertical,
+            acc_forward,
+            acc_lateral,
+            acc_vertical,
+            goal_norm,
+            duration_norm,
+        ],
+        dtype=np.float32,
+    )
+
+
+def apply_goal_offset(
+    sample: PrimitiveSample, offset: Sequence[float], config: PrimitiveConfig
+) -> np.ndarray:
+    """Return the offset goal (body frame) after applying the network output."""
+
+    offset = np.asarray(offset, dtype=np.float32)
+    if offset.shape != (3,):
+        raise ValueError("offset must be length-3")
+    base_goal = sample.goal_direction_body * sample.goal_length
+    max_offset = config.radio_range * config.offset_gain
+    offset_norm = float(np.linalg.norm(offset))
+    if offset_norm > 1e-6:
+        offset = offset / offset_norm * min(offset_norm, max_offset)
+    goal = base_goal + offset
+    max_range = config.radio_range * 1.5
+    goal_norm = float(np.linalg.norm(goal))
+    if goal_norm > max_range:
+        goal = goal / goal_norm * max_range
+    return goal
+
+
+def primitive_quintic_trajectory(
+    sample: PrimitiveSample,
+    goal_body: np.ndarray,
+    duration_scale: float,
+    steps: int,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Return body-frame samples along the quintic primitive."""
+
+    duration = max(0.2, float(sample.duration) * float(duration_scale))
+    goal_body = np.asarray(goal_body, dtype=np.float32)
+    coeffs = quintic_coefficients(
+        np.zeros(3, dtype=np.float32),
+        sample.start_vel_body,
+        sample.start_acc_body,
+        goal_body,
+        np.zeros(3, dtype=np.float32),
+        np.zeros(3, dtype=np.float32),
+        duration,
+    )
+    sample_count = max(steps, 1)
+    points, velocities = sample_quintic(coeffs, duration, sample_count)
+    return points, velocities, duration
 
 @dataclass
 class SafeRegion:
@@ -339,16 +572,6 @@ def orientation_rate_score(directions: Iterable[np.ndarray]) -> float:
 
     score, _ = orientation_rate_stats(directions)
     return score
-
-
-def clamp_normalized(vec: np.ndarray) -> np.ndarray:
-    """Return ``vec`` normalized to unit length with safe fallback."""
-
-    vec = np.asarray(vec, dtype=np.float32)
-    norm = float(np.linalg.norm(vec))
-    if norm < 1e-6:
-        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    return vec / norm
 
 
 def quintic_coefficients(
