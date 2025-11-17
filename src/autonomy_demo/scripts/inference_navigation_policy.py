@@ -493,7 +493,9 @@ class NavigationPolicyInferenceNode:
         max_clearance: float,
     ) -> Optional[dict]:
         steps = max(2, self.primitive_steps)
-        directions = sample_yopo_directions(base_direction, yaw_offset, pitch_offset, steps)
+        directions = sample_yopo_directions(
+            base_direction, yaw_offset, pitch_offset, 0.0, steps
+        )
         if not directions:
             return None
 
@@ -628,7 +630,9 @@ class NavigationPolicyInferenceNode:
     ) -> np.ndarray:
         steps = self.primitive_steps
         if directions is None:
-            directions = sample_yopo_directions(base_direction, yaw_offset, pitch_offset, steps)
+            directions = sample_yopo_directions(
+                base_direction, yaw_offset, pitch_offset, 0.0, steps
+            )
         else:
             directions = list(directions)
         points = [origin.astype(np.float32)]

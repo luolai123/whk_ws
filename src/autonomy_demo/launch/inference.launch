@@ -25,8 +25,9 @@
     <param name="a_std_unit" value="0.35" />
     <param name="goal_length_scale" value="1.0" />
     <param name="offset_gain" value="0.25" />
-    <param name="yaw_std_deg" value="20.0" />
-    <param name="pitch_std_deg" value="10.0" />
+    <param name="yaw_range_deg" value="360.0" />
+    <param name="pitch_std_deg" value="30.0" />
+    <param name="roll_std_deg" value="30.0" />
     <param name="primitive_candidate_count" value="24" />
     <param name="primitive_seed" value="0" />
     <param name="primitive_safety_gate" value="0.6" />
