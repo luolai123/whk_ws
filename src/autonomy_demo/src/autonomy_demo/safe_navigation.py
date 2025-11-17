@@ -20,6 +20,19 @@ def clamp_normalized(vec: np.ndarray) -> np.ndarray:
     return vec / norm
 
 
+def _extract_rotation(matrix: np.ndarray) -> np.ndarray:
+    """Return a 3x3 rotation matrix from a 3x3/3x4/4x4 transform."""
+
+    matrix = np.asarray(matrix, dtype=np.float32)
+    if matrix.shape == (4, 4):
+        matrix = matrix[0:3, 0:3]
+    elif matrix.shape == (3, 4):
+        matrix = matrix[:, 0:3]
+    if matrix.shape != (3, 3):
+        raise ValueError("camera_to_body must be a 3x3, 3x4, or 4x4 matrix")
+    return matrix
+
+
 @dataclass
 class PrimitiveConfig:
     """Parameters shared by the YOPO-style primitive sampler."""
@@ -87,16 +100,17 @@ def sample_motion_primitives(
     """Draw ``count`` YOPO-style primitives aligned with ``base_direction_camera``."""
 
     base_direction_camera = clamp_normalized(base_direction_camera)
-    camera_to_body = np.asarray(camera_to_body, dtype=np.float32)
+    camera_to_body = _extract_rotation(camera_to_body)
     samples: List[PrimitiveSample] = []
     count = max(1, int(count))
-    yaw_limit = max(1.0, float(config.yaw_range_deg)) * 0.5
+    yaw_limit = max(0.0, float(config.yaw_range_deg)) * 0.5
+    yaw_limit_rad = math.radians(yaw_limit)
     pitch_limit = 90.0
     roll_limit = 90.0
 
     for _ in range(count):
         yaw_offset = _clamp_angle(
-            rng.uniform(-math.radians(yaw_limit), math.radians(yaw_limit)),
+            rng.uniform(-yaw_limit_rad, yaw_limit_rad),
             yaw_limit,
         )
         pitch_offset = _clamp_angle(

@@ -199,6 +199,11 @@ class InferenceNode:
         ).astype(np.float32)
         self._body_to_camera = self._camera_mount_matrix
         self._camera_to_body = self._camera_mount_matrix.T
+        rospy.loginfo(
+            "camera_to_body rotation (pitch %.1f deg about Y):\n%s",
+            pitch_deg,
+            self._camera_to_body,
+        )
 
         self.camera_info: Optional[CameraInfo] = None
         self.odom: Optional[Odometry] = None
@@ -510,6 +515,18 @@ class InferenceNode:
                 0.35 * command_vector_world + 0.65 * self._smoothed_command
             )
         command_vector_world = self._smoothed_command.copy()
+
+        plan_sample = plan["sample"]
+        rospy.loginfo_throttle(
+            1.0,
+            "Goal dir (cam): %s | yaw/pitch/roll offsets (deg): %.1f/%.1f/%.1f | goal dir (body): %s | offset norm: %.3f",
+            np.array2string(plan_sample.base_direction_camera, precision=3),
+            math.degrees(plan_sample.yaw_offset),
+            math.degrees(plan_sample.pitch_offset),
+            math.degrees(plan_sample.roll_offset),
+            np.array2string(plan_sample.goal_direction_body, precision=3),
+            plan["offset_norm"],
+        )
 
         primitive_msg = Vector3Stamped()
         primitive_msg.header = msg.header
