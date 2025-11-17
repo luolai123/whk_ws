@@ -32,6 +32,7 @@ from autonomy_demo.safe_navigation import (
     find_largest_safe_region,
     orientation_rate_score,
     jerk_score,
+    normalize_navigation_inputs,
     primitive_quintic_trajectory,
     primitive_state_vector,
     project_direction_to_pixel,
@@ -301,6 +302,15 @@ class InferenceNode:
     def odom_callback(self, msg: Odometry) -> None:
         self.odom = msg
 
+    def _current_speed(self) -> float:
+        if self.odom is None:
+            return self.default_speed
+        lin = self.odom.twist.twist.linear
+        speed = math.sqrt(lin.x ** 2 + lin.y ** 2 + lin.z ** 2)
+        if speed < 1e-3:
+            return self.default_speed
+        return float(speed)
+
     def goal_callback(self, msg: PoseStamped) -> None:
         self.goal_world = np.array(
             [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z], dtype=np.float32
@@ -311,14 +321,23 @@ class InferenceNode:
         if self.enforce_fixed_altitude:
             self.goal_world[2] = self.fixed_altitude
 
-    def _goal_vector(self, origin: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[float]]:
+    def _goal_vector(
+        self, origin: np.ndarray
+    ) -> Tuple[Optional[np.ndarray], Optional[float], Optional[np.ndarray], Optional[float]]:
         if self.goal_world is None:
-            return None, None
+            return None, None, None, None
         goal_vec = self.goal_world.astype(np.float32) - origin.astype(np.float32)
         goal_distance = float(np.linalg.norm(goal_vec))
         if goal_distance < max(self.goal_tolerance * 0.5, 1e-3):
-            return None, goal_distance
-        return goal_vec / goal_distance, goal_distance
+            return None, goal_distance, None, None
+
+        speed = self._current_speed()
+        step_distance = speed * 0.8
+        step_distance = max(0.2, min(step_distance, self.primitive_config.radio_range))
+        local_distance = goal_distance if goal_distance < 0.5 else min(goal_distance, step_distance)
+        direction = goal_vec / goal_distance
+        local_goal = origin + direction * local_distance
+        return direction, goal_distance, local_goal, local_distance
 
     def _ensure_policy(self) -> None:
         if self.policy is not None:
@@ -436,7 +455,7 @@ class InferenceNode:
                 self.odom.pose.pose.orientation.w,
             ]
         )[0:3, 0:3]
-        goal_direction, goal_distance = self._goal_vector(origin)
+        goal_direction, goal_distance, local_goal, local_distance = self._goal_vector(origin)
 
         plan = self._plan_motion_primitive(
             origin,
@@ -448,6 +467,8 @@ class InferenceNode:
             center_col,
             goal_direction,
             goal_distance,
+            local_goal,
+            local_distance,
         )
 
         if plan is None:
@@ -647,6 +668,8 @@ class InferenceNode:
         center_col: float,
         goal_direction: Optional[np.ndarray],
         goal_distance: Optional[float],
+        local_goal: Optional[np.ndarray],
+        local_distance: Optional[float],
     ) -> Optional[dict]:
         if cluster_mask.size == 0:
             return None
@@ -671,6 +694,7 @@ class InferenceNode:
             self.primitive_steps,
             self.primitive_steps * self.path_samples_per_step,
         )
+        target_distance = local_distance if local_distance is not None else goal_distance
         for sample in primitives:
             state_vec = primitive_state_vector(sample, self.primitive_config)
             offset_vec, duration_scale = self._policy_offsets(cluster_mask, state_vec)
@@ -723,6 +747,22 @@ class InferenceNode:
             goal_alignment_score = (goal_alignment + 1.0) * 0.5
             diag = math.sqrt(width ** 2 + height ** 2)
             goal_score = math.exp(-evaluation["goal_error"] / max(diag, 1e-3))
+            _, _, normalized_goal = normalize_navigation_inputs(
+                origin,
+                world_velocities[-1],
+                (world_points[-1] - origin),
+                self.primitive_config,
+            )
+            normalized_local_goal = None
+            if local_goal is not None:
+                _, _, normalized_local_goal = normalize_navigation_inputs(
+                    origin, world_velocities[-1], local_goal - origin, self.primitive_config
+                )
+            normalized_goal_error = 0.0
+            if normalized_local_goal is not None:
+                normalized_goal_error = float(
+                    np.linalg.norm(normalized_goal - normalized_local_goal)
+                )
             smoothness_score = evaluation["smoothness"]
             jerk_score_val = max(0.0, min(1.0, jerk_metric))
             orientation_score_val = max(0.0, min(1.0, orientation_metric))
@@ -735,13 +775,15 @@ class InferenceNode:
                 + 0.03 * jerk_score_val
                 + 0.02 * orientation_score_val
             )
-            if goal_distance is not None:
+            if normalized_local_goal is not None:
+                score -= min(0.25, normalized_goal_error * 0.2)
+            if target_distance is not None:
                 overreach = max(
                     0.0,
-                    travel_distance - max(goal_distance - self.goal_tolerance, 0.5),
+                    travel_distance - max(target_distance - self.goal_tolerance, 0.5),
                 )
                 if overreach > 0.0:
-                    score -= min(0.35, overreach / max(goal_distance, 1.0))
+                    score -= min(0.35, overreach / max(target_distance, 1.0))
             if score <= best_score:
                 continue
             command_vector = (
