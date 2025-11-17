@@ -27,7 +27,7 @@ dataset:
   safe_distance: 1.5
   max_attempts: 800
   near_threshold: 4.5
-  roll_range_deg: 8.0
-  pitch_range_deg: 14.0
+  roll_std_deg: 30.0     # 正态分布标准差（均值 0），与在线采样保持一致
+  pitch_std_deg: 30.0    # 正态分布标准差（均值 0），与在线采样保持一致
   z_range: [1.2, 6.0]
   output_dir: "~/autonomy_demo/datasets/auto"

@@ -34,6 +34,7 @@ from autonomy_demo.safe_navigation import (
     jerk_score,
     normalize_navigation_inputs,
     primitive_quintic_trajectory,
+    primitive_state_dim,
     primitive_state_vector,
     project_direction_to_pixel,
     sample_motion_primitives,
@@ -100,7 +101,7 @@ class DistanceClassifier(torch.nn.Module):
 
 
 class SafeNavigationPolicy(torch.nn.Module):
-    def __init__(self, height: int, width: int, state_dim: int) -> None:
+    def __init__(self, height: int, width: int, state_dim: int = 8) -> None:
         super().__init__()
         self.height = height
         self.width = width
@@ -225,8 +226,11 @@ class InferenceNode:
         acc_max_train = float(rospy.get_param("~acc_max_train", 3.0))
         goal_length_scale = float(rospy.get_param("~goal_length_scale", 1.0))
         offset_gain = float(rospy.get_param("~offset_gain", 0.25))
-        yaw_std_deg = float(rospy.get_param("~yaw_std_deg", 20.0))
-        pitch_std_deg = float(rospy.get_param("~pitch_std_deg", 10.0))
+        yaw_range_deg = float(
+            rospy.get_param("~yaw_range_deg", rospy.get_param("~yaw_std_deg", 360.0))
+        )
+        pitch_std_deg = float(rospy.get_param("~pitch_std_deg", 30.0))
+        roll_std_deg = float(rospy.get_param("~roll_std_deg", 30.0))
         horizon_fov = float(rospy.get_param("~horizon_camera_fov", 90.0))
         vertical_fov = float(rospy.get_param("~vertical_camera_fov", 60.0))
         self.primitive_config = PrimitiveConfig(
@@ -237,14 +241,16 @@ class InferenceNode:
             forward_log_sigma=max(0.05, forward_sigma),
             v_std_unit=max(0.05, v_std_unit),
             a_std_unit=max(0.05, a_std_unit),
-            yaw_std_deg=yaw_std_deg,
+            yaw_range_deg=yaw_range_deg,
             pitch_std_deg=pitch_std_deg,
+            roll_std_deg=roll_std_deg,
             horizon_camera_fov=horizon_fov,
             vertical_camera_fov=vertical_fov,
             goal_length_scale=max(0.2, goal_length_scale),
             offset_gain=max(0.05, offset_gain),
         )
-        self.policy_state_dim = 8
+        self.goal_feature_dim = 4
+        self.policy_state_dim = primitive_state_dim(self.primitive_config) + self.goal_feature_dim
         samples_per_step = int(rospy.get_param("~path_samples_per_step", 3))
         self.path_samples_per_step = max(1, samples_per_step)
 
@@ -697,6 +703,21 @@ class InferenceNode:
         target_distance = local_distance if local_distance is not None else goal_distance
         for sample in primitives:
             state_vec = primitive_state_vector(sample, self.primitive_config)
+            target_hint = np.zeros(3, dtype=np.float32)
+            target_bias = 1.0
+            if local_goal is not None:
+                local_hint = rotation.T.dot(local_goal - origin)
+                target_hint = clamp_normalized(local_hint)
+                target_bias = min(
+                    1.0, np.linalg.norm(local_hint) / max(self.primitive_config.radio_range, 1e-3)
+                )
+            elif goal_direction is not None:
+                target_hint = clamp_normalized(rotation.T.dot(goal_direction))
+                target_bias = 0.5
+            goal_features = np.concatenate(
+                [target_hint, np.array([target_bias], dtype=np.float32)]
+            ).astype(np.float32)
+            state_vec = np.concatenate([state_vec, goal_features]).astype(np.float32)
             offset_vec, duration_scale = self._policy_offsets(cluster_mask, state_vec)
             goal_body = apply_goal_offset(sample, offset_vec, self.primitive_config)
             if self.enforce_fixed_altitude:
@@ -766,17 +787,29 @@ class InferenceNode:
             smoothness_score = evaluation["smoothness"]
             jerk_score_val = max(0.0, min(1.0, jerk_metric))
             orientation_score_val = max(0.0, min(1.0, orientation_metric))
+            command_vector = (
+                world_velocities[1] if world_velocities.shape[0] >= 2 else world_velocities[0]
+            )
+            continuity_score = 1.0
+            if self._smoothed_command is not None:
+                prev_dir = clamp_normalized(self._smoothed_command)
+                new_dir = clamp_normalized(command_vector)
+                heading_delta = math.acos(
+                    max(-1.0, min(1.0, float(np.dot(prev_dir, new_dir))))
+                )
+                continuity_score = math.exp(-heading_delta)
             score = (
                 0.45 * evaluation["safety"]
                 + 0.2 * evaluation["clearance"]
-                + 0.15 * goal_score
-                + 0.08 * goal_alignment_score
+                + 0.18 * goal_score
+                + 0.1 * goal_alignment_score
                 + 0.07 * smoothness_score
                 + 0.03 * jerk_score_val
                 + 0.02 * orientation_score_val
+                + 0.05 * continuity_score
             )
             if normalized_local_goal is not None:
-                score -= min(0.25, normalized_goal_error * 0.2)
+                score -= min(0.35, normalized_goal_error * 0.25)
             if target_distance is not None:
                 overreach = max(
                     0.0,
@@ -786,9 +819,6 @@ class InferenceNode:
                     score -= min(0.35, overreach / max(target_distance, 1.0))
             if score <= best_score:
                 continue
-            command_vector = (
-                world_velocities[1] if world_velocities.shape[0] >= 2 else world_velocities[0]
-            )
             best_plan = {
                 "points_world": world_points,
                 "velocities_world": world_velocities,

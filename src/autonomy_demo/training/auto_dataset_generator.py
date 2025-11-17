@@ -52,8 +52,19 @@ class DatasetGenerator:
         self.max_attempts = int(dataset_cfg.get("max_attempts", 500))
         self.near_threshold = float(dataset_cfg.get("near_threshold", 4.0))
 
-        self.roll_range = math.radians(float(dataset_cfg.get("roll_range_deg", 8.0)))
-        self.pitch_range = math.radians(float(dataset_cfg.get("pitch_range_deg", 12.0)))
+        # 姿态采样遵循“均值 0、标准差 30°”的正态分布，保持与在线采样一致
+        roll_std_deg = float(
+            dataset_cfg.get(
+                "roll_std_deg", dataset_cfg.get("roll_range_deg", 30.0)
+            )
+        )
+        pitch_std_deg = float(
+            dataset_cfg.get(
+                "pitch_std_deg", dataset_cfg.get("pitch_range_deg", 30.0)
+            )
+        )
+        self.roll_std = math.radians(roll_std_deg)
+        self.pitch_std = math.radians(pitch_std_deg)
 
         self.z_range = dataset_cfg.get("z_range", [1.0, 4.0])
         if not isinstance(self.z_range, Sequence) or len(self.z_range) != 2:
@@ -199,9 +210,9 @@ class DatasetGenerator:
             distance = field.distance_to_point(point)
             if distance < self.safe_distance:
                 continue
-            roll = self._clamp_normal(self.roll_range)
-            pitch = self._clamp_normal(self.pitch_range)
-            yaw = self.rng.uniform(-math.pi, math.pi)
+            roll = self._sample_gaussian_angle(self.roll_std)
+            pitch = self._sample_gaussian_angle(self.pitch_std)
+            yaw = self.rng.uniform(0.0, 2.0 * math.pi)
             quat = transformations.quaternion_from_euler(roll, pitch, yaw)
             return point, np.array(quat, dtype=np.float32)
         raise RuntimeError("Failed to sample a safe pose within the maximum attempts")
@@ -450,11 +461,20 @@ class DatasetGenerator:
         local_dirs /= norms
         return local_dirs.reshape(-1, 3)
 
-    def _clamp_normal(self, max_angle: float) -> float:
-        if max_angle <= 0.0:
+    def _sample_gaussian_angle(self, std: float, limit: float = math.radians(90.0)) -> float:
+        """Sample an angle with mean 0 and standard deviation ``std``.
+
+        The result is clipped to ``limit`` (default ±90°) to keep poses
+        physically plausible while still covering >99% of the target normal
+        distribution described in the requirements.
+        """
+
+        std = max(0.0, float(std))
+        limit = abs(float(limit))
+        if std == 0.0 or limit == 0.0:
             return 0.0
-        sample = self.np_rng.normal(0.0, max_angle / 3.0)
-        return float(np.clip(sample, -max_angle, max_angle))
+        sample = self.np_rng.normal(0.0, std)
+        return float(np.clip(sample, -limit, limit))
 
     def _normalize(self, vec: np.ndarray) -> np.ndarray:
         norm = float(np.linalg.norm(vec))

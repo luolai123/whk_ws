@@ -31,8 +31,9 @@ class PrimitiveConfig:
     forward_log_sigma: float = 0.45
     v_std_unit: float = 0.22
     a_std_unit: float = 0.35
-    yaw_std_deg: float = 20.0
-    pitch_std_deg: float = 10.0
+    yaw_range_deg: float = 360.0
+    pitch_std_deg: float = 30.0
+    roll_std_deg: float = 30.0
     horizon_camera_fov: float = 90.0
     vertical_camera_fov: float = 60.0
     goal_length_scale: float = 1.0
@@ -54,6 +55,7 @@ class PrimitiveSample:
     start_acc_body: np.ndarray
     yaw_offset: float
     pitch_offset: float
+    roll_offset: float
     goal_length: float
     duration: float
 
@@ -88,18 +90,23 @@ def sample_motion_primitives(
     camera_to_body = np.asarray(camera_to_body, dtype=np.float32)
     samples: List[PrimitiveSample] = []
     count = max(1, int(count))
-    yaw_limit = config.horizon_camera_fov * 0.5
-    pitch_limit = config.vertical_camera_fov * 0.5
+    yaw_limit = max(1.0, float(config.yaw_range_deg)) * 0.5
+    pitch_limit = 90.0
+    roll_limit = 90.0
 
     for _ in range(count):
         yaw_offset = _clamp_angle(
-            rng.normal(0.0, math.radians(config.yaw_std_deg)), yaw_limit
+            rng.uniform(-math.radians(yaw_limit), math.radians(yaw_limit)),
+            yaw_limit,
         )
         pitch_offset = _clamp_angle(
             rng.normal(0.0, math.radians(config.pitch_std_deg)), pitch_limit
         )
+        roll_offset = _clamp_angle(
+            rng.normal(0.0, math.radians(config.roll_std_deg)), roll_limit
+        )
         offset_direction_camera = rotate_direction(
-            base_direction_camera, yaw_offset, pitch_offset
+            base_direction_camera, yaw_offset, pitch_offset, roll_offset
         )
         goal_direction_body = clamp_normalized(camera_to_body.dot(offset_direction_camera))
 
@@ -161,6 +168,7 @@ def sample_motion_primitives(
                 start_acc_body=start_acc,
                 yaw_offset=yaw_offset,
                 pitch_offset=pitch_offset,
+                roll_offset=roll_offset,
                 goal_length=goal_length,
                 duration=duration,
             )
@@ -183,6 +191,11 @@ def primitive_state_vector(sample: PrimitiveSample, config: PrimitiveConfig) -> 
     acc_vertical = float(np.dot(acc, vertical)) / max(config.acc_max_train, 1e-3)
     goal_norm = float(sample.goal_length / max(config.radio_range, 1e-3))
     duration_norm = float(sample.duration / max(config.traj_time, 1e-3))
+    goal_dir = clamp_normalized(sample.goal_direction_body)
+    orientation_offsets = np.array(
+        [sample.yaw_offset, sample.pitch_offset, sample.roll_offset], dtype=np.float32
+    )
+    orientation_norm = orientation_offsets / math.pi
 
     return np.array(
         [
@@ -194,9 +207,32 @@ def primitive_state_vector(sample: PrimitiveSample, config: PrimitiveConfig) -> 
             acc_vertical,
             goal_norm,
             duration_norm,
+            goal_dir[0],
+            goal_dir[1],
+            goal_dir[2],
+            orientation_norm[0],
+            orientation_norm[1],
+            orientation_norm[2],
         ],
         dtype=np.float32,
     )
+
+
+def primitive_state_dim(config: PrimitiveConfig) -> int:
+    """Return the length of the policy state vector for ``config``."""
+
+    dummy = PrimitiveSample(
+        base_direction_camera=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        goal_direction_body=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        start_vel_body=np.zeros(3, dtype=np.float32),
+        start_acc_body=np.zeros(3, dtype=np.float32),
+        yaw_offset=0.0,
+        pitch_offset=0.0,
+        roll_offset=0.0,
+        goal_length=config.radio_range,
+        duration=config.traj_time,
+    )
+    return int(len(primitive_state_vector(dummy, config)))
 
 
 def apply_goal_offset(
@@ -370,9 +406,12 @@ def compute_direction_from_pixel(
 
 
 def rotate_direction(
-    base_direction: np.ndarray, yaw_offset: float, pitch_offset: float
+    base_direction: np.ndarray,
+    yaw_offset: float,
+    pitch_offset: float,
+    roll_offset: float = 0.0,
 ) -> np.ndarray:
-    """Rotate ``base_direction`` by yaw and pitch offsets in the camera/base frame."""
+    """Rotate ``base_direction`` by yaw, pitch, and roll offsets in the camera/base frame."""
 
     if base_direction.shape != (3,):
         raise ValueError("base_direction must be a 3-vector")
@@ -381,11 +420,14 @@ def rotate_direction(
     sy = math.sin(yaw_offset)
     cp = math.cos(pitch_offset)
     sp = math.sin(pitch_offset)
+    cr = math.cos(roll_offset)
+    sr = math.sin(roll_offset)
 
     r_yaw = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
     r_pitch = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float32)
+    r_roll = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float32)
 
-    rotated = r_yaw.dot(r_pitch.dot(base_direction.astype(np.float32)))
+    rotated = r_yaw.dot(r_pitch.dot(r_roll.dot(base_direction.astype(np.float32))))
     norm = float(np.linalg.norm(rotated))
     if norm < 1e-6:
         return base_direction.astype(np.float32)
@@ -447,6 +489,7 @@ def sample_yopo_directions(
     base_direction: np.ndarray,
     yaw_offset: float,
     pitch_offset: float,
+    roll_offset: float,
     steps: int,
 ) -> List[np.ndarray]:
     """Return a list of interpolated directions along a YOPO-like primitive.
@@ -468,6 +511,7 @@ def sample_yopo_directions(
                 base_direction,
                 yaw_offset * blend,
                 pitch_offset * blend,
+                roll_offset * blend,
             )
         )
     return directions

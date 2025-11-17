@@ -326,6 +326,7 @@ def train_navigation_policy(
                     cache.base_dir_np,
                     float(yaw_offset.detach().cpu().numpy()),
                     float(pitch_offset.detach().cpu().numpy()),
+                    0.0,
                     6,
                 )
                 points = [np.zeros(3, dtype=np.float32)]

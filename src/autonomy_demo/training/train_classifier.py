@@ -24,6 +24,7 @@ from autonomy_demo.safe_navigation import (
     normalize_navigation_inputs,
     orientation_rate_score,
     primitive_quintic_trajectory,
+    primitive_state_dim,
     primitive_state_vector,
     project_direction_to_pixel,
     sample_motion_primitives,
@@ -386,7 +387,7 @@ def _sample_goal_pixel(region: "SafeRegion", rng: random.Random) -> Tuple[float,
 
 
 class SafeNavigationPolicy(torch.nn.Module):
-    def __init__(self, height: int, width: int, state_dim: int) -> None:
+    def __init__(self, height: int, width: int, state_dim: int = 8) -> None:
         super().__init__()
         self.height = height
         self.width = width
@@ -574,7 +575,9 @@ def train_navigation_policy(
     camera_pitch_deg: float,
     seed: int,
 ) -> None:
-    policy = SafeNavigationPolicy(dataset.height, dataset.width, state_dim=8).to(device)
+    goal_feature_dim = 4
+    state_dim = primitive_state_dim(primitive_config) + goal_feature_dim
+    policy = SafeNavigationPolicy(dataset.height, dataset.width, state_dim=state_dim).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
     diag = math.sqrt(dataset.width ** 2 + dataset.height ** 2)
     camera_pitch = -math.radians(camera_pitch_deg)
@@ -643,7 +646,17 @@ def train_navigation_policy(
                     1,
                 )[0]
                 state_vec = primitive_state_vector(sample, primitive_config)
-                state_tensor = torch.from_numpy(state_vec).unsqueeze(0).to(device=device)
+                goal_direction_body = clamp_normalized(
+                    camera_to_body.dot(goal_direction_camera)
+                )
+                goal_bias = math.sqrt(
+                    (goal_col - center_col) ** 2 + (goal_row - center_row) ** 2
+                ) / max(diag, 1e-3)
+                goal_features = np.concatenate(
+                    [goal_direction_body, np.array([goal_bias], dtype=np.float32)]
+                )
+                enriched_state = np.concatenate([state_vec, goal_features]).astype(np.float32)
+                state_tensor = torch.from_numpy(enriched_state).unsqueeze(0).to(device=device)
 
                 outputs = policy(mask_tensor, state_tensor)
                 # 使用带噪策略输出，允许对不可微奖励应用 REINFORCE（log_prob）梯度
@@ -739,6 +752,11 @@ def train_navigation_policy(
                 )
                 jerk_metric_val = jerk_score(points_np, primitive_dt / max(samples_per_step, 1))
                 orientation_metric_val = orientation_rate_score(velocities_np)
+                goal_heading = clamp_normalized(goal_body)
+                path_heading = clamp_normalized(points_np[-1])
+                heading_alignment = float(
+                    max(-1.0, min(1.0, np.dot(goal_heading, path_heading)))
+                )
 
                 safety_score = torch.tensor(safety_ratio, device=device, dtype=torch.float32)
                 clearance_score = torch.tensor(
@@ -761,6 +779,9 @@ def train_navigation_policy(
                     device=device,
                     dtype=torch.float32,
                 )
+                heading_alignment_score = torch.tensor(
+                    (heading_alignment + 1.0) * 0.5, device=device, dtype=torch.float32
+                )
                 normalized_goal_penalty = torch.tensor(
                     min(0.25, normalized_goal_error * 0.2),
                     device=device,
@@ -770,12 +791,13 @@ def train_navigation_policy(
                 reward = (
                     0.45 * safety_score
                     + 0.2 * clearance_score
-                    + 0.15 * goal_score
-                    + 0.08 * goal_alignment_score
-                    + 0.07 * smoothness_score_t
+                    + 0.18 * goal_score
+                    + 0.1 * goal_alignment_score
+                    + 0.05 * heading_alignment_score
+                    + 0.05 * smoothness_score_t
                     + 0.03 * jerk_score_t
                     + 0.02 * orientation_score_t
-                    - normalized_goal_penalty
+                    - 1.2 * normalized_goal_penalty
                 )
                 reward_tensor = reward.detach()
                 loss = -reward_tensor * log_prob
@@ -858,8 +880,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--a_std_unit", type=float, default=0.35)
     parser.add_argument("--goal_length_scale", type=float, default=1.0)
     parser.add_argument("--offset_gain", type=float, default=0.25)
-    parser.add_argument("--yaw_std_deg", type=float, default=20.0)
-    parser.add_argument("--pitch_std_deg", type=float, default=10.0)
+    parser.add_argument("--yaw_range_deg", type=float, default=360.0)
+    parser.add_argument("--pitch_std_deg", type=float, default=30.0)
+    parser.add_argument("--roll_std_deg", type=float, default=30.0)
     parser.add_argument("--policy_seed", type=int, default=0)
     return parser.parse_args()
 
@@ -932,8 +955,9 @@ def main() -> None:
             forward_log_sigma=max(0.05, args.v_forward_sigma),
             v_std_unit=max(0.05, args.v_std_unit),
             a_std_unit=max(0.05, args.a_std_unit),
-            yaw_std_deg=args.yaw_std_deg,
+            yaw_range_deg=args.yaw_range_deg,
             pitch_std_deg=args.pitch_std_deg,
+            roll_std_deg=args.roll_std_deg,
             goal_length_scale=max(0.2, args.goal_length_scale),
             offset_gain=max(0.05, args.offset_gain),
         )
