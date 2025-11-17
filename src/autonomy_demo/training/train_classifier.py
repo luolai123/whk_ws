@@ -21,6 +21,7 @@ from autonomy_demo.safe_navigation import (
     compute_direction_from_pixel,
     find_largest_safe_region,
     jerk_score,
+    normalize_navigation_inputs,
     orientation_rate_score,
     primitive_quintic_trajectory,
     primitive_state_vector,
@@ -670,6 +671,17 @@ def train_navigation_policy(
                 if points_np.size == 0:
                     continue
 
+                origin_body = np.zeros(3, dtype=np.float32)
+                _, _, normalized_goal_vec = normalize_navigation_inputs(
+                    origin_body, velocities_np[-1], goal_body, primitive_config
+                )
+                _, _, normalized_endpoint = normalize_navigation_inputs(
+                    origin_body, velocities_np[-1], points_np[-1], primitive_config
+                )
+                normalized_goal_error = float(
+                    np.linalg.norm(normalized_endpoint - normalized_goal_vec)
+                )
+
                 safety_hits: List[float] = []
                 clearance_values: List[float] = []
                 smoothness_sum = 0.0
@@ -749,6 +761,11 @@ def train_navigation_policy(
                     device=device,
                     dtype=torch.float32,
                 )
+                normalized_goal_penalty = torch.tensor(
+                    min(0.25, normalized_goal_error * 0.2),
+                    device=device,
+                    dtype=torch.float32,
+                )
 
                 reward = (
                     0.45 * safety_score
@@ -758,6 +775,7 @@ def train_navigation_policy(
                     + 0.07 * smoothness_score_t
                     + 0.03 * jerk_score_t
                     + 0.02 * orientation_score_t
+                    - normalized_goal_penalty
                 )
                 reward_tensor = reward.detach()
                 loss = -reward_tensor * log_prob

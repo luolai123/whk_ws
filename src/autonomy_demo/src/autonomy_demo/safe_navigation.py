@@ -220,6 +220,29 @@ def apply_goal_offset(
     return goal
 
 
+def normalize_navigation_inputs(
+    position: Sequence[float],
+    velocity: Sequence[float],
+    goal_point: Sequence[float],
+    config: PrimitiveConfig,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Normalize navigation-related vectors for model consumption.
+
+    ``position`` and ``goal_point`` are scaled by ``config.radio_range`` while
+    ``velocity`` is scaled by ``config.vel_max_train``. The function returns
+    float32 numpy arrays to keep training and inference inputs consistent and
+    dimensionless.
+    """
+
+    range_scale = max(float(config.radio_range), 1e-3)
+    vel_scale = max(float(config.vel_max_train), 1e-3)
+
+    pos_arr = np.asarray(position, dtype=np.float32) / range_scale
+    vel_arr = np.asarray(velocity, dtype=np.float32) / vel_scale
+    goal_arr = np.asarray(goal_point, dtype=np.float32) / range_scale
+    return pos_arr.astype(np.float32), vel_arr.astype(np.float32), goal_arr.astype(np.float32)
+
+
 def primitive_quintic_trajectory(
     sample: PrimitiveSample,
     goal_body: np.ndarray,
