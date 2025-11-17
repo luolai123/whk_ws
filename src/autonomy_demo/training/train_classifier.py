@@ -214,7 +214,7 @@ class ObstacleDataset(Dataset):
         std: Optional[np.ndarray] = None,
         target_hw: Optional[Tuple[int, int]] = None,
     ) -> None:
-        self.files: List[pathlib.Path] = sorted(data_dir.glob("*.npz"))
+        self.files: List[pathlib.Path] = sorted(data_dir.rglob("*.npz"))
         if not self.files:
             raise FileNotFoundError(f"No samples found in {data_dir}")
         if indices is None:
@@ -321,7 +321,7 @@ class ObstacleDataset(Dataset):
 
 class NavigationDataset(Dataset):
     def __init__(self, data_dir: pathlib.Path) -> None:
-        self.files: List[pathlib.Path] = sorted(data_dir.glob("*.npz"))
+        self.files: List[pathlib.Path] = sorted(data_dir.rglob("*.npz"))
         if not self.files:
             raise FileNotFoundError(f"No samples found in {data_dir}")
         with np.load(self.files[0]) as first:
@@ -626,6 +626,9 @@ def train_navigation_policy(
                 mask_tensor = torch.from_numpy(noisy_mask).to(device=device, dtype=torch.float32)
                 mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
 
+                goal_direction_camera = compute_direction_from_pixel(
+                    goal_col, goal_row, dataset.width, dataset.height, 120.0
+                ).astype(np.float32)
                 clearance_map = cv2.distanceTransform(
                     (noisy_mask > 0.5).astype(np.uint8), cv2.DIST_L2, 5
                 ).astype(np.float32)
@@ -851,7 +854,11 @@ def train_navigation_policy(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the distance classifier and navigation policy")
-    parser.add_argument("dataset", type=pathlib.Path, help="Directory containing *.npz samples")
+    parser.add_argument(
+        "dataset",
+        type=pathlib.Path,
+        help="Directory tree containing *.npz samples (searched recursively)",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
