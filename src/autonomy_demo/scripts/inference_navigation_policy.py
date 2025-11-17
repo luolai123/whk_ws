@@ -26,13 +26,18 @@ from tf_conversions import transformations
 
 from autonomy_demo.safe_navigation import (
     clamp_normalized,
+    calculate_yaw,
     compute_direction_from_pixel,
+    denormalize_weight,
     find_largest_safe_region,
     jerk_score,
     orientation_rate_score,
     path_smoothness,
+    Poly5Solver,
     project_direction_to_pixel,
+    smoothness_penalty,
     sample_yopo_directions,
+    rotate_direction,
 )
 
 # 从原始推理脚本导入模型定义
@@ -84,6 +89,18 @@ class NavigationPolicyInferenceNode:
             "orient": float(rospy.get_param("~w_orient", 1.5)),
             "stability": float(rospy.get_param("~w_stability", 1.0)),
         }
+
+        self.smoothness_gain = float(rospy.get_param("~smoothness_gain", 0.02))
+        self.smoothness_vel_ref = float(
+            rospy.get_param("~smoothness_vel_ref", self.default_speed)
+        )
+        self.max_yaw_rate = float(
+            rospy.get_param("~max_yaw_rate", math.radians(60.0))
+        )
+
+        self.last_poly_coeffs: Optional[np.ndarray] = None
+        self.last_poly_duration: float = 0.0
+        self.last_target_yaw: Optional[float] = None
 
         self.camera_info: Optional[CameraInfo] = None
         self.odom: Optional[Odometry] = None
@@ -293,7 +310,9 @@ class NavigationPolicyInferenceNode:
         final_direction_local = candidate["final_direction_local"]
         path_points = candidate["path_points"]
 
-        final_world_direction = clamp_normalized(rotation.dot(final_direction_local))
+        final_world_direction = candidate.get("final_direction_world")
+        if final_world_direction is None:
+            final_world_direction = clamp_normalized(rotation.dot(final_direction_local))
         commanded_speed = speed * length_scale
 
         command_vector_world = final_world_direction * commanded_speed
@@ -322,8 +341,68 @@ class NavigationPolicyInferenceNode:
         self.offset_pub.publish(offsets_msg)
 
         self._publish_trajectory(self.mask_header, path_points)
+        self.last_poly_coeffs = candidate.get("poly_coeffs")
+        self.last_poly_duration = float(candidate.get("poly_duration", 0.0))
+        self.last_target_yaw = float(math.atan2(final_world_direction[1], final_world_direction[0]))
         self._publish_fallback(self.mask_header.stamp, include_default=False)
         self._log_timing(start_time)
+
+    def _current_velocity(self) -> np.ndarray:
+        if self.odom is None:
+            return np.zeros(3, dtype=np.float32)
+        return np.array(
+            [
+                self.odom.twist.twist.linear.x,
+                self.odom.twist.twist.linear.y,
+                self.odom.twist.twist.linear.z,
+            ],
+            dtype=np.float32,
+        )
+
+    def _current_acceleration(self) -> np.ndarray:
+        # Acceleration feedback is not available; fall back to the last solved
+        # polynomial end-state if present to encourage continuity.
+        if self.last_poly_coeffs is not None and self.last_poly_duration > 0.0:
+            solver = Poly5Solver(self.last_poly_duration)
+            _, _, acc, _ = solver.evaluate(self.last_poly_coeffs, self.last_poly_duration)
+            return acc
+        return np.zeros(3, dtype=np.float32)
+
+    def _limit_yaw_offset(self, yaw_offset: float, base_direction: np.ndarray) -> float:
+        dt = self.primitive_dt * max(1, self.primitive_steps)
+        max_change = self.max_yaw_rate * dt
+        yaw_base = math.atan2(base_direction[1], base_direction[0])
+        previous_yaw = self.last_target_yaw if self.last_target_yaw is not None else yaw_base
+        limited_yaw = calculate_yaw(
+            previous_yaw,
+            self._current_velocity(),
+            rotate_direction(base_direction, yaw_offset, 0.0, 0.0),
+            self.max_yaw_rate,
+            dt,
+        )
+        limited_offset = float(np.clip(limited_yaw - yaw_base, -max_change, max_change))
+        return limited_offset
+
+    def _build_poly_trajectory(
+        self,
+        origin: np.ndarray,
+        rotation: np.ndarray,
+        final_direction_local: np.ndarray,
+        commanded_speed: float,
+        steps: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
+        duration = self.primitive_dt * max(1, steps)
+        final_dir_world = clamp_normalized(rotation.dot(final_direction_local))
+        start_vel = self._current_velocity()
+        start_acc = self._current_acceleration()
+        end_vel = final_dir_world * commanded_speed
+        end_acc = np.zeros(3, dtype=np.float32)
+        end_pos = origin + end_vel * duration * 0.5  # trapezoidal distance estimate
+
+        solver = Poly5Solver(duration)
+        coeffs = solver.solve(origin, start_vel, start_acc, end_pos, end_vel, end_acc)
+        points, velocities = solver.sample(coeffs, steps)
+        return points, velocities, coeffs, duration, solver.jerk_hessian(), final_dir_world
 
     def _generate_fallback_vectors(self, speed: float) -> List[np.ndarray]:
         patterns = [
@@ -492,6 +571,7 @@ class NavigationPolicyInferenceNode:
         speed: float,
         max_clearance: float,
     ) -> Optional[dict]:
+        yaw_offset = self._limit_yaw_offset(yaw_offset, base_direction)
         steps = max(2, self.primitive_steps)
         directions = sample_yopo_directions(
             base_direction, yaw_offset, pitch_offset, 0.0, steps
@@ -534,26 +614,37 @@ class NavigationPolicyInferenceNode:
 
         # Build primitive points and kinematics
         commanded_speed = speed * length_scale
-        points = self._primitive_points(
+        (
+            points,
+            velocities,
+            coeffs,
+            duration,
+            jerk_hess,
+            final_dir_world,
+        ) = self._build_poly_trajectory(
             origin,
             rotation,
-            base_direction,
-            yaw_offset,
-            pitch_offset,
+            directions[-1],
             commanded_speed,
-            directions,
+            steps,
         )
         if points.shape[0] < 2:
             return None
 
         displacement = float(np.linalg.norm(points[-1] - points[0]))
-        expected = commanded_speed * max(self.primitive_dt, 1e-3) * len(directions)
+        expected = commanded_speed * max(duration, 1e-3)
         if expected > 1e-3 and displacement < expected * 0.35:
             return None
 
         # Smoothness & dynamics
         smooth_metric = path_smoothness(points)
-        jerk_metric = jerk_score(points, self.primitive_dt)
+        jerk_dt = duration / max(points.shape[0] - 1, 1)
+        jerk_metric = jerk_score(points, jerk_dt)
+        smooth_penalty = smoothness_penalty(self.last_poly_coeffs, coeffs, jerk_hess)
+        smooth_gain = math.exp(-self.smoothness_gain * smooth_penalty)
+        smooth_weight = denormalize_weight(
+            self.weight["smooth"], commanded_speed, self.smoothness_vel_ref
+        )
         # jerk_peak: max |jerk| over segments (normalized)
         if points.shape[0] >= 4:
             v = np.diff(points, axis=0) / max(self.primitive_dt, 1e-3)
@@ -598,11 +689,12 @@ class NavigationPolicyInferenceNode:
             clearance_norm = min_clearance / max(max_clearance, 1e-6)
 
         # Weighted score (after safety veto)
+        smooth_combo = 0.5 * smooth_metric + 0.5 * smooth_gain
         total_score = (
             self.weight["prob"] * min_prob
             + self.weight["clearance"] * clearance_norm
             + self.weight["goal"] * goal_score
-            + self.weight["smooth"] * smooth_metric
+            + smooth_weight * smooth_combo
             + self.weight["jerk"] * jerk_metric
             + self.weight["jerk_peak"] * jerk_peak_score
             + self.weight["orient"] * orientation_metric
@@ -615,7 +707,10 @@ class NavigationPolicyInferenceNode:
             "pitch_offset": float(pitch_offset),
             "yaw_offset": float(yaw_offset),
             "final_direction_local": directions[-1],
+            "final_direction_world": final_dir_world,
             "path_points": points,
+            "poly_coeffs": coeffs,
+            "poly_duration": float(duration),
         }
 
     def _primitive_points(

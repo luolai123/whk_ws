@@ -58,6 +58,19 @@ class PrimitiveConfig:
         return max(0.5, 2.0 * self.radio_range / vel)
 
 
+def denormalize_weight(weight: float, speed: float, reference_speed: float) -> float:
+    """Scale ``weight`` based on the commanded ``speed``.
+
+    The scaling keeps smoothness-relevant costs dominant when the vehicle
+    accelerates, discouraging short-horizon jumps in the chosen primitives.
+    """
+
+    reference_speed = max(reference_speed, 1e-3)
+    # Emphasize smoothness at higher speeds while keeping a stable lower bound.
+    scale = max(1.0, speed / reference_speed)
+    return weight * scale
+
+
 @dataclass
 class PrimitiveSample:
     """Represents a single sampled primitive in the drone body frame."""
@@ -621,6 +634,52 @@ def jerk_score(points: Iterable[np.ndarray], dt: float) -> float:
     return score
 
 
+def jerk_hessian(duration: float) -> np.ndarray:
+    """Return the Hessian of the integral of jerk^2 for a quintic.
+
+    The Hessian corresponds to the quadratic form on the high-order
+    coefficients ``[c3, c4, c5]`` such that ``x^T R x`` equals the
+    jerk-squared integral over ``[0, duration]``.
+    """
+
+    duration = max(float(duration), 1e-3)
+    T = duration
+    return np.array(
+        [
+            [36.0 * T, 72.0 * (T**2), 120.0 * (T**3)],
+            [72.0 * (T**2), 192.0 * (T**3), 360.0 * (T**4)],
+            [120.0 * (T**3), 360.0 * (T**4), 720.0 * (T**5)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def smoothness_penalty(
+    previous_coeffs: Optional[np.ndarray],
+    current_coeffs: np.ndarray,
+    hessian: np.ndarray,
+) -> float:
+    """Compute the smoothness deviation cost between two quintics.
+
+    The cost penalizes deviations in the high-order terms (c3..c5) to limit
+    sudden changes in jerk between consecutive primitives.
+    """
+
+    if previous_coeffs is None:
+        return 0.0
+
+    current_coeffs = np.asarray(current_coeffs, dtype=np.float32)
+    previous_coeffs = np.asarray(previous_coeffs, dtype=np.float32)
+    hessian = np.asarray(hessian, dtype=np.float32)
+    delta = current_coeffs[3:6] - previous_coeffs[3:6]
+
+    cost = 0.0
+    for axis in range(3):
+        diff = delta[:, axis]
+        cost += float(diff.T.dot(hessian).dot(diff))
+    return cost
+
+
 def orientation_rate_stats(
     directions: Iterable[np.ndarray], dt: float = 1.0
 ) -> Tuple[float, float]:
@@ -728,3 +787,90 @@ def sample_quintic(
         velocities += power * coeffs[power] * (times ** (power - 1))[:, None]
 
     return points, velocities
+
+
+def _wrap_angle(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def calculate_yaw(
+    previous_yaw: float,
+    velocity_direction: np.ndarray,
+    target_direction: np.ndarray,
+    max_yaw_rate: float,
+    dt: float,
+) -> float:
+    """Update yaw with a rate limit using motion context.
+
+    The function blends the previous yaw with the current velocity direction as
+    a baseline, then steers toward ``target_direction`` under the specified
+    ``max_yaw_rate`` constraint.
+    """
+
+    velocity_direction = np.asarray(velocity_direction, dtype=np.float32)
+    target_direction = np.asarray(target_direction, dtype=np.float32)
+    dt = max(float(dt), 1e-3)
+    max_yaw_rate = max(float(max_yaw_rate), 0.0)
+
+    base_yaw = float(previous_yaw)
+    speed = float(np.linalg.norm(velocity_direction))
+    if speed > 1e-3:
+        base_yaw = math.atan2(velocity_direction[1], velocity_direction[0])
+
+    target_yaw = math.atan2(target_direction[1], target_direction[0])
+    yaw_change = _wrap_angle(target_yaw - base_yaw)
+    yaw_change = float(np.clip(yaw_change, -max_yaw_rate * dt, max_yaw_rate * dt))
+
+    return base_yaw + yaw_change
+
+
+@dataclass
+class Poly5Solver:
+    """Utility to generate and evaluate C²-continuous quintic trajectories."""
+
+    duration: float
+
+    def solve(
+        self,
+        start_pos: np.ndarray,
+        start_vel: np.ndarray,
+        start_acc: np.ndarray,
+        end_pos: np.ndarray,
+        end_vel: np.ndarray,
+        end_acc: np.ndarray,
+    ) -> np.ndarray:
+        return quintic_coefficients(
+            start_pos,
+            start_vel,
+            start_acc,
+            end_pos,
+            end_vel,
+            end_acc,
+            self.duration,
+        )
+
+    def sample(self, coeffs: np.ndarray, steps: int) -> Tuple[np.ndarray, np.ndarray]:
+        return sample_quintic(coeffs, self.duration, steps)
+
+    def jerk_hessian(self) -> np.ndarray:
+        return jerk_hessian(self.duration)
+
+    def evaluate(self, coeffs: np.ndarray, t: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return position, velocity, acceleration, and jerk at time ``t``."""
+
+        t = max(float(t), 0.0)
+        pos = np.zeros(3, dtype=np.float32)
+        vel = np.zeros(3, dtype=np.float32)
+        acc = np.zeros(3, dtype=np.float32)
+        jerk = np.zeros(3, dtype=np.float32)
+
+        for power in range(6):
+            pos += coeffs[power] * (t**power)
+        for power in range(1, 6):
+            vel += power * coeffs[power] * (t ** (power - 1))
+        for power in range(2, 6):
+            acc += power * (power - 1) * coeffs[power] * (t ** (power - 2))
+        for power in range(3, 6):
+            jerk += power * (power - 1) * (power - 2) * coeffs[power] * (t ** (power - 3))
+
+        return pos, vel, acc, jerk
