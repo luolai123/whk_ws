@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Inference node that loads trained models and emits safe navigation primitives."""
 
+import copy
 import math
 import pathlib
 import time
@@ -36,8 +37,10 @@ from autonomy_demo.safe_navigation import (
     primitive_quintic_trajectory,
     primitive_state_dim,
     primitive_state_vector,
+    quintic_coefficients,
     project_direction_to_pixel,
     sample_motion_primitives,
+    sample_quintic,
 )
 
 
@@ -215,6 +218,14 @@ class InferenceNode:
         self.goal_direction_blend = float(rospy.get_param("~goal_direction_blend", 0.4))
         self.goal_bias_distance = float(rospy.get_param("~goal_bias_distance", 10.0))
 
+        self._ekf_state: Optional[np.ndarray] = None
+        self._ekf_cov: Optional[np.ndarray] = None
+        self._last_odom_time: Optional[float] = None
+        self._previous_end_state: Optional[dict] = None
+
+        self.ekf_process_noise = float(rospy.get_param("~ekf_process_noise", 0.15))
+        self.ekf_measurement_noise = float(rospy.get_param("~ekf_measurement_noise", 0.35))
+
         primitive_steps = int(rospy.get_param("~primitive_steps", 4))
         self.primitive_steps = max(3, min(5, primitive_steps))
         self.primitive_dt = float(rospy.get_param("~primitive_dt", 0.25))
@@ -311,7 +322,7 @@ class InferenceNode:
         self._ensure_policy()
 
     def odom_callback(self, msg: Odometry) -> None:
-        self.odom = msg
+        self.odom = self._ekf_correct(msg)
 
     def _current_speed(self) -> float:
         if self.odom is None:
@@ -551,6 +562,7 @@ class InferenceNode:
         self.offset_pub.publish(offsets_msg)
 
         self._publish_trajectory(msg.header, path_points, velocities)
+        self._record_plan_state(plan)
 
         self._publish_fallback(msg.header.stamp, include_default=False)
         self._log_timing(start_time)
@@ -576,6 +588,7 @@ class InferenceNode:
         self._last_plan_signature = None
         self._smoothed_command = None
         self._last_committed_offset = None
+        self._previous_end_state = None
         speed = self.default_speed
         vectors = self._generate_fallback_vectors(speed)
         rotation = transformations.quaternion_matrix(
@@ -680,6 +693,106 @@ class InferenceNode:
             )
         return offset_vec, duration_scale
 
+    def _ekf_correct(self, msg: Odometry) -> Odometry:
+        position = np.array(
+            [msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z],
+            dtype=np.float32,
+        )
+        velocity = np.array(
+            [msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z],
+            dtype=np.float32,
+        )
+        stamp = msg.header.stamp.to_sec()
+        if self._ekf_state is None:
+            self._ekf_state = np.concatenate([position, velocity]).astype(np.float32)
+            self._ekf_cov = np.eye(6, dtype=np.float32) * 0.5
+            self._last_odom_time = stamp
+        else:
+            dt = max(stamp - (self._last_odom_time or stamp), 1e-3)
+            f = np.eye(6, dtype=np.float32)
+            f[0, 3] = dt
+            f[1, 4] = dt
+            f[2, 5] = dt
+            q = np.eye(6, dtype=np.float32) * (self.ekf_process_noise * dt)
+            self._ekf_state = f.dot(self._ekf_state)
+            self._ekf_cov = f.dot(self._ekf_cov).dot(f.T) + q
+
+            z = np.concatenate([position, velocity]).astype(np.float32)
+            h = np.eye(6, dtype=np.float32)
+            r = np.eye(6, dtype=np.float32) * self.ekf_measurement_noise
+            y = z - h.dot(self._ekf_state)
+            s = h.dot(self._ekf_cov).dot(h.T) + r
+            k = self._ekf_cov.dot(h.T).dot(np.linalg.inv(s))
+            self._ekf_state = self._ekf_state + k.dot(y)
+            self._ekf_cov = (np.eye(6, dtype=np.float32) - k.dot(h)).dot(self._ekf_cov)
+            self._last_odom_time = stamp
+
+        filtered = copy.deepcopy(msg)
+        filtered.pose.pose.position.x = float(self._ekf_state[0])
+        filtered.pose.pose.position.y = float(self._ekf_state[1])
+        filtered.pose.pose.position.z = float(self._ekf_state[2])
+        filtered.twist.twist.linear.x = float(self._ekf_state[3])
+        filtered.twist.twist.linear.y = float(self._ekf_state[4])
+        filtered.twist.twist.linear.z = float(self._ekf_state[5])
+        return filtered
+
+    def _inherit_kinematics(self, rotation: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if self._previous_end_state is None:
+            return None, None
+        world_vel = self._previous_end_state.get("velocity")
+        world_acc = self._previous_end_state.get("acceleration")
+        if world_vel is None:
+            return None, None
+        start_vel_body = rotation.T.dot(world_vel)
+        start_acc_body = rotation.T.dot(world_acc) if world_acc is not None else None
+        return start_vel_body.astype(np.float32), (
+            start_acc_body.astype(np.float32) if start_acc_body is not None else None
+        )
+
+    def _blend_transition_segment(
+        self, points: np.ndarray, velocities: np.ndarray, duration: float
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if self._previous_end_state is None or points.shape[0] < 2:
+            return points, velocities
+
+        dt = duration / max(points.shape[0] - 1, 1)
+        end_vel_prev = self._previous_end_state.get("velocity")
+        end_acc_prev = self._previous_end_state.get("acceleration")
+        start_acc_next = (velocities[1] - velocities[0]) / max(dt, 1e-3)
+        if end_vel_prev is None or end_acc_prev is None:
+            return points, velocities
+
+        coeffs = quintic_coefficients(
+            points[0],
+            end_vel_prev,
+            end_acc_prev,
+            points[0],
+            velocities[0],
+            start_acc_next,
+            max(self.primitive_dt, dt),
+        )
+        transition_pts, transition_vels = sample_quintic(coeffs, max(self.primitive_dt, dt), 3)
+        blended_points = np.vstack([transition_pts[:-1], points])
+        blended_vels = np.vstack([transition_vels[:-1], velocities])
+        return blended_points.astype(np.float32), blended_vels.astype(np.float32)
+
+    def _record_plan_state(self, plan: dict) -> None:
+        if not plan:
+            return
+        velocities = plan.get("velocities_world")
+        points = plan.get("points_world")
+        duration = float(plan.get("duration", 0.0))
+        if velocities is None or points is None or velocities.shape[0] < 2:
+            return
+        dt = duration / max(velocities.shape[0] - 1, 1)
+        accels = np.diff(velocities, axis=0) / max(dt, 1e-3)
+        end_acc = accels[-1] if accels.size else np.zeros(3, dtype=np.float32)
+        self._previous_end_state = {
+            "position": points[-1].astype(np.float32),
+            "velocity": velocities[-1].astype(np.float32),
+            "acceleration": end_acc.astype(np.float32),
+        }
+
     def _plan_motion_primitive(
         self,
         origin: np.ndarray,
@@ -719,6 +832,11 @@ class InferenceNode:
         )
         target_distance = local_distance if local_distance is not None else goal_distance
         for sample in primitives:
+            start_vel_body, start_acc_body = self._inherit_kinematics(rotation)
+            if start_vel_body is not None:
+                sample.start_vel_body = start_vel_body
+            if start_acc_body is not None:
+                sample.start_acc_body = start_acc_body
             state_vec = primitive_state_vector(sample, self.primitive_config)
             target_hint = np.zeros(3, dtype=np.float32)
             target_bias = 1.0
@@ -773,6 +891,9 @@ class InferenceNode:
             if self.enforce_fixed_altitude:
                 world_points[:, 2] = self.fixed_altitude
                 world_velocities[:, 2] = 0.0
+            world_points, world_velocities = self._blend_transition_segment(
+                world_points, world_velocities, duration
+            )
             travel_distance = float(np.linalg.norm(world_points[-1] - origin))
             jerk_metric = jerk_score(
                 world_points, duration / max(points_body.shape[0] - 1, 1)
