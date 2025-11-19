@@ -361,6 +361,40 @@ class InferenceNode:
         local_goal = origin + direction * local_distance
         return direction, goal_distance, local_goal, local_distance
 
+    def _planning_origin(self, current_origin: np.ndarray) -> np.ndarray:
+        if self._previous_end_state is None:
+            return current_origin
+        previous_position = self._previous_end_state.get("position")
+        if previous_position is None:
+            return current_origin
+        return previous_position.astype(np.float32)
+
+    def _publish_stop_command(self, stamp: rospy.Time) -> None:
+        if self.odom is None:
+            return
+        command_msg = Vector3Stamped()
+        command_msg.header.stamp = stamp
+        command_msg.header.frame_id = self.odom.header.frame_id or "map"
+        command_msg.vector.x = 0.0
+        command_msg.vector.y = 0.0
+        command_msg.vector.z = 0.0
+        self.command_pub.publish(command_msg)
+
+        self._previous_end_state = {
+            "position": np.array(
+                [
+                    self.odom.pose.pose.position.x,
+                    self.odom.pose.pose.position.y,
+                    self.odom.pose.pose.position.z,
+                ],
+                dtype=np.float32,
+            ),
+            "velocity": np.zeros(3, dtype=np.float32),
+            "acceleration": np.zeros(3, dtype=np.float32),
+        }
+
+        self._publish_empty_trajectory(stamp)
+
     def _ensure_policy(self) -> None:
         if self.policy is not None:
             return
@@ -477,10 +511,16 @@ class InferenceNode:
                 self.odom.pose.pose.orientation.w,
             ]
         )[0:3, 0:3]
-        goal_direction, goal_distance, local_goal, local_distance = self._goal_vector(origin)
+        plan_origin = self._planning_origin(origin)
+        goal_direction, goal_distance, local_goal, local_distance = self._goal_vector(plan_origin)
+
+        if goal_distance is not None and goal_distance <= 2.0:
+            self._publish_stop_command(msg.header.stamp)
+            self._log_timing(start_time)
+            return
 
         plan = self._plan_motion_primitive(
-            origin,
+            plan_origin,
             rotation,
             base_direction_camera,
             cluster_mask,
