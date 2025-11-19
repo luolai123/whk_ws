@@ -37,10 +37,8 @@ from autonomy_demo.safe_navigation import (
     primitive_quintic_trajectory,
     primitive_state_dim,
     primitive_state_vector,
-    quintic_coefficients,
     project_direction_to_pixel,
     sample_motion_primitives,
-    sample_quintic,
 )
 
 
@@ -791,33 +789,6 @@ class InferenceNode:
             start_acc_body.astype(np.float32) if start_acc_body is not None else None
         )
 
-    def _blend_transition_segment(
-        self, points: np.ndarray, velocities: np.ndarray, duration: float
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        if self._previous_end_state is None or points.shape[0] < 2:
-            return points, velocities
-
-        dt = duration / max(points.shape[0] - 1, 1)
-        end_vel_prev = self._previous_end_state.get("velocity")
-        end_acc_prev = self._previous_end_state.get("acceleration")
-        start_acc_next = (velocities[1] - velocities[0]) / max(dt, 1e-3)
-        if end_vel_prev is None or end_acc_prev is None:
-            return points, velocities
-
-        coeffs = quintic_coefficients(
-            points[0],
-            end_vel_prev,
-            end_acc_prev,
-            points[0],
-            velocities[0],
-            start_acc_next,
-            max(self.primitive_dt, dt),
-        )
-        transition_pts, transition_vels = sample_quintic(coeffs, max(self.primitive_dt, dt), 3)
-        blended_points = np.vstack([transition_pts[:-1], points])
-        blended_vels = np.vstack([transition_vels[:-1], velocities])
-        return blended_points.astype(np.float32), blended_vels.astype(np.float32)
-
     def _record_plan_state(self, plan: dict) -> None:
         if not plan:
             return
@@ -933,9 +904,6 @@ class InferenceNode:
             if self.enforce_fixed_altitude:
                 world_points[:, 2] = self.fixed_altitude
                 world_velocities[:, 2] = 0.0
-            world_points, world_velocities = self._blend_transition_segment(
-                world_points, world_velocities, duration
-            )
             travel_distance = float(np.linalg.norm(world_points[-1] - origin))
             jerk_metric = jerk_score(
                 world_points, duration / max(points_body.shape[0] - 1, 1)
