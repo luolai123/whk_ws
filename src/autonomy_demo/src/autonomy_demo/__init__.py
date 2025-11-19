@@ -3,11 +3,13 @@
 from .camera_utils import camera_mount_from_pitch, parse_camera_offset, precompute_unit_rays
 from .obstacle_field import ObstacleField
 from .safe_navigation import (
+    blended_quintic_transition,
     SafeRegion,
     clamp_normalized,
     compute_direction_from_pixel,
     cubic_hermite_path,
     find_largest_safe_region,
+    inherit_motion_state,
     is_pixel_safe,
     jerk_metrics,
     jerk_score,
@@ -24,6 +26,7 @@ from .safe_navigation import (
 
 __all__ = [
     "ObstacleField",
+    "blended_quintic_transition",
     "camera_mount_from_pitch",
     "parse_camera_offset",
     "precompute_unit_rays",
@@ -32,6 +35,7 @@ __all__ = [
     "compute_direction_from_pixel",
     "cubic_hermite_path",
     "find_largest_safe_region",
+    "inherit_motion_state",
     "is_pixel_safe",
     "jerk_metrics",
     "jerk_score",
