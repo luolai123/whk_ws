@@ -38,6 +38,7 @@ class PrimitiveConfig:
     """Parameters shared by the YOPO-style primitive sampler."""
 
     radio_range: float = 5.0
+    planning_horizon_override: Optional[float] = None
     vel_max_train: float = 6.0
     acc_max_train: float = 3.0
     forward_log_mean: float = math.log(2.0)
@@ -53,9 +54,25 @@ class PrimitiveConfig:
     offset_gain: float = 0.25
 
     @property
+    def planning_horizon(self) -> float:
+        """Length of each primitive, tied to the planning horizon.
+
+        By default the horizon follows the YOPO convention of covering a
+        diameter-sized bubble of free space (``2 * radio_range``).  When a
+        mission or experiment requires an explicit horizon, it can be provided
+        via ``planning_horizon_override`` in the configuration.
+        """
+
+        if self.planning_horizon_override is not None:
+            return max(float(self.planning_horizon_override), 1e-3)
+        return max(1e-3, 2.0 * float(self.radio_range))
+
+    @property
     def traj_time(self) -> float:
+        """Replan interval derived from the planning horizon and max speed."""
+
         vel = max(self.vel_max_train, 0.5)
-        return max(0.5, 2.0 * self.radio_range / vel)
+        return max(0.5, self.planning_horizon / vel)
 
 
 def denormalize_weight(weight: float, speed: float, reference_speed: float) -> float:
@@ -184,7 +201,7 @@ def sample_motion_primitives(
         start_acc = np.array([ax, ay, az], dtype=np.float32)
 
         length_scale = float(np.clip(rng.normal(config.goal_length_scale, 0.15), 0.4, 1.4))
-        goal_length = config.radio_range * length_scale
+        goal_length = config.planning_horizon * length_scale
         duration = max(0.2, config.traj_time * length_scale)
 
         samples.append(
@@ -271,12 +288,12 @@ def apply_goal_offset(
     if offset.shape != (3,):
         raise ValueError("offset must be length-3")
     base_goal = sample.goal_direction_body * sample.goal_length
-    max_offset = config.radio_range * config.offset_gain
+    max_offset = (config.planning_horizon * 0.5) * config.offset_gain
     offset_norm = float(np.linalg.norm(offset))
     if offset_norm > 1e-6:
         offset = offset / offset_norm * min(offset_norm, max_offset)
     goal = base_goal + offset
-    max_range = config.radio_range * 1.5
+    max_range = config.planning_horizon * 0.75
     goal_norm = float(np.linalg.norm(goal))
     if goal_norm > max_range:
         goal = goal / goal_norm * max_range
@@ -327,6 +344,59 @@ def primitive_quintic_trajectory(
     )
     sample_count = max(steps, 1)
     points, velocities = sample_quintic(coeffs, duration, sample_count)
+    return points, velocities, duration
+
+
+def inherit_motion_state(
+    previous_coeffs: Optional[np.ndarray], solver: Optional[Poly5Solver]
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Return the terminal state of a quintic trajectory if available."""
+
+    if previous_coeffs is None or solver is None:
+        return None
+    return solver.evaluate(previous_coeffs, solver.duration)[:3]
+
+
+def blended_quintic_transition(
+    previous_coeffs: Optional[np.ndarray],
+    previous_solver: Optional[Poly5Solver],
+    sample: PrimitiveSample,
+    goal_body: np.ndarray,
+    duration_scale: float,
+    steps: int,
+    inherit_weight: float = 0.6,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Generate a C²-continuous trajectory by inheriting prior dynamics.
+
+    The transition keeps position/velocity/acceleration continuous by
+    evaluating the end state of ``previous_coeffs`` (if supplied) and blending
+    it with the new primitive's desired initial dynamics.  The resulting path
+    is solved as a quintic segment, mirroring YOPO's "inherit velocity" and
+    "quintic transition" strategy for high-order smoothness.
+    """
+
+    goal_body = np.asarray(goal_body, dtype=np.float32)
+    inherit_weight = max(0.0, min(1.0, float(inherit_weight)))
+
+    previous_state = inherit_motion_state(previous_coeffs, previous_solver)
+    if previous_state is None:
+        return primitive_quintic_trajectory(sample, goal_body, duration_scale, steps)
+
+    end_pos, end_vel, end_acc = previous_state
+    blended_vel = (1.0 - inherit_weight) * sample.start_vel_body + inherit_weight * end_vel
+    blended_acc = (1.0 - inherit_weight) * sample.start_acc_body + inherit_weight * end_acc
+
+    duration = max(0.2, float(sample.duration) * float(duration_scale))
+    solver = Poly5Solver(duration=duration)
+    coeffs = solver.solve(
+        start_pos=end_pos,
+        start_vel=blended_vel,
+        start_acc=blended_acc,
+        end_pos=end_pos + goal_body,
+        end_vel=np.zeros(3, dtype=np.float32),
+        end_acc=np.zeros(3, dtype=np.float32),
+    )
+    points, velocities = solver.sample(coeffs, max(steps, 1))
     return points, velocities, duration
 
 @dataclass
