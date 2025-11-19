@@ -204,6 +204,79 @@ def _normalize_distance_array(
     return arr.astype(np.float32)
 
 
+def apply_offsets_torch(
+    base_direction: torch.Tensor,
+    yaw_offset: torch.Tensor,
+    pitch_offset: torch.Tensor,
+    roll_offset: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Rotate ``base_direction`` by yaw/pitch/roll offsets using Torch ops.
+
+    The helper mirrors :func:`autonomy_demo.safe_navigation.rotate_direction`
+    but stays fully in Torch so the accelerated navigation trainer can backprop
+    through the projected directions without bouncing to NumPy.
+    """
+
+    if base_direction.dim() == 1:
+        base = base_direction.unsqueeze(0)
+        squeeze = True
+    elif base_direction.dim() == 2 and base_direction.size(-1) == 3:
+        base = base_direction
+        squeeze = False
+    else:
+        raise ValueError("base_direction must have shape (3,) or (N, 3)")
+
+    def _prepare_offset(offset: torch.Tensor, name: str) -> torch.Tensor:
+        if not torch.is_tensor(offset):
+            offset = torch.as_tensor(offset, dtype=base.dtype, device=base.device)
+        else:
+            offset = offset.to(dtype=base.dtype, device=base.device)
+        if offset.dim() == 0:
+            offset = offset.view(1, 1)
+        elif offset.dim() == 1:
+            offset = offset.view(-1, 1)
+        elif offset.dim() != 2 or offset.size(-1) != 1:
+            raise ValueError(f"{name} must broadcast to (N, 1)")
+        if offset.size(0) == 1 and base.size(0) > 1:
+            offset = offset.expand(base.size(0), 1)
+        elif offset.size(0) != base.size(0):
+            raise ValueError(f"{name} batch dimension must match base_direction")
+        return offset
+
+    yaw = _prepare_offset(yaw_offset, "yaw_offset")
+    pitch = _prepare_offset(pitch_offset, "pitch_offset")
+    if roll_offset is None:
+        roll = torch.zeros(1, 1, dtype=base.dtype, device=base.device)
+    else:
+        roll = _prepare_offset(roll_offset, "roll_offset")
+
+    cy, sy = torch.cos(yaw), torch.sin(yaw)
+    cp, sp = torch.cos(pitch), torch.sin(pitch)
+    cr, sr = torch.cos(roll), torch.sin(roll)
+
+    x, y, z = base[:, 0:1], base[:, 1:2], base[:, 2:3]
+
+    # Roll around the x-axis.
+    y_roll = y * cr - z * sr
+    z_roll = y * sr + z * cr
+
+    # Pitch around the y-axis.
+    x_pitch = x * cp + z_roll * sp
+    z_pitch = -x * sp + z_roll * cp
+
+    # Yaw around the z-axis.
+    x_yaw = x_pitch * cy - y_roll * sy
+    y_yaw = x_pitch * sy + y_roll * cy
+
+    rotated = torch.cat([x_yaw, y_yaw, z_pitch], dim=1)
+    norm = torch.linalg.norm(rotated, dim=1, keepdim=True).clamp_min(1e-6)
+    rotated = rotated / norm
+
+    if squeeze:
+        return rotated.squeeze(0)
+    return rotated
+
+
 class ObstacleDataset(Dataset):
     def __init__(
         self,
