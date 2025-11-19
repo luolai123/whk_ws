@@ -16,6 +16,7 @@
     <param name="primitive_dt" value="0.25" />
     <param name="path_samples_per_step" value="3" />
     <param name="camera_pitch_deg" value="10.0" />
+    <param name="goal_stop_distance" value="1.0" />
     <param name="radio_range" value="5.0" />
     <param name="vel_max_train" value="6.0" />
     <param name="acc_max_train" value="3.0" />

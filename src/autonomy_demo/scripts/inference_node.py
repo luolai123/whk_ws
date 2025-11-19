@@ -190,6 +190,7 @@ class InferenceNode:
         self.default_speed = float(rospy.get_param("~default_speed", 3.0))
         self.safe_threshold = float(rospy.get_param("~safe_probability_threshold", 0.55))
         self.goal_tolerance = float(rospy.get_param("~goal_tolerance", 0.3))
+        self.goal_stop_distance = float(rospy.get_param("~goal_stop_distance", 1.0))
         self.min_clearance_fraction = float(rospy.get_param("~min_clearance_fraction", 0.08))
         self.clearance_softening = float(rospy.get_param("~clearance_softening", 0.18))
         self.max_heading_rate = math.radians(rospy.get_param("~max_heading_rate_deg", 110.0))
@@ -350,7 +351,8 @@ class InferenceNode:
             return None, None, None, None
         goal_vec = self.goal_world.astype(np.float32) - origin.astype(np.float32)
         goal_distance = float(np.linalg.norm(goal_vec))
-        if goal_distance < max(self.goal_tolerance * 0.5, 1e-3):
+        stop_distance = max(self.goal_stop_distance, self.goal_tolerance * 0.5, 1e-3)
+        if goal_distance < stop_distance:
             return None, goal_distance, None, None
 
         speed = self._current_speed()
@@ -514,7 +516,7 @@ class InferenceNode:
         plan_origin = self._planning_origin(origin)
         goal_direction, goal_distance, local_goal, local_distance = self._goal_vector(plan_origin)
 
-        if goal_distance is not None and goal_distance <= 2.0:
+        if goal_distance is not None and goal_distance <= self.goal_stop_distance:
             self._publish_stop_command(msg.header.stamp)
             self._log_timing(start_time)
             return
