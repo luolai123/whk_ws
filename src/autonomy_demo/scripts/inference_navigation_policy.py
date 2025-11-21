@@ -35,6 +35,7 @@ from autonomy_demo.safe_navigation import (
     path_smoothness,
     Poly5Solver,
     project_direction_to_pixel,
+    smooth_trajectory,
     smoothness_penalty,
     sample_yopo_directions,
     rotate_direction,
@@ -126,7 +127,10 @@ class NavigationPolicyInferenceNode:
         primitive_steps = int(rospy.get_param("~primitive_steps", 4))
         self.primitive_steps = max(3, min(5, primitive_steps))
         self.primitive_dt = float(rospy.get_param("~primitive_dt", 0.25))
-        
+        self.primitive_smooth_window = max(
+            1, int(rospy.get_param("~primitive_smooth_window", 3))
+        )
+
         self.current_safe_mask: Optional[np.ndarray] = None
         self.current_safe_prob: Optional[np.ndarray] = None
         self.mask_header: Optional[Header] = None
@@ -395,6 +399,14 @@ class NavigationPolicyInferenceNode:
         final_dir_world = clamp_normalized(rotation.dot(final_direction_local))
         start_vel = self._current_velocity()
         start_acc = self._current_acceleration()
+        if self.last_poly_coeffs is not None and self.last_poly_duration > 0.0:
+            previous_solver = Poly5Solver(self.last_poly_duration)
+            _, prev_vel, prev_acc, _ = previous_solver.evaluate(
+                self.last_poly_coeffs, self.last_poly_duration
+            )
+            inherit_gain = 0.6
+            start_vel = inherit_gain * prev_vel + (1.0 - inherit_gain) * start_vel
+            start_acc = inherit_gain * prev_acc + (1.0 - inherit_gain) * start_acc
         end_vel = final_dir_world * commanded_speed
         end_acc = np.zeros(3, dtype=np.float32)
         end_pos = origin + end_vel * duration * 0.5  # trapezoidal distance estimate
@@ -402,7 +414,20 @@ class NavigationPolicyInferenceNode:
         solver = Poly5Solver(duration)
         coeffs = solver.solve(origin, start_vel, start_acc, end_pos, end_vel, end_acc)
         points, velocities = solver.sample(coeffs, steps)
-        return points, velocities, coeffs, duration, solver.jerk_hessian(), final_dir_world
+        smoothed_points = smooth_trajectory(points, self.primitive_smooth_window)
+        if smoothed_points.shape[0] > 1:
+            dt = duration / float(max(smoothed_points.shape[0] - 1, 1))
+            smoothed_velocities = np.gradient(smoothed_points, dt, axis=0)
+        else:
+            smoothed_velocities = velocities
+        return (
+            smoothed_points,
+            smoothed_velocities,
+            coeffs,
+            duration,
+            solver.jerk_hessian(),
+            final_dir_world,
+        )
 
     def _generate_fallback_vectors(self, speed: float) -> List[np.ndarray]:
         patterns = [
@@ -576,6 +601,9 @@ class NavigationPolicyInferenceNode:
         directions = sample_yopo_directions(
             base_direction, yaw_offset, pitch_offset, 0.0, steps
         )
+        if directions:
+            dir_array = smooth_trajectory(np.stack(directions, axis=0), self.primitive_smooth_window)
+            directions = [clamp_normalized(vec) for vec in dir_array]
         if not directions:
             return None
 
