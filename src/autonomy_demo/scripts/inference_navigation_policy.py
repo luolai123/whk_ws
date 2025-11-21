@@ -89,6 +89,7 @@ class NavigationPolicyInferenceNode:
             "jerk_peak": float(rospy.get_param("~w_jerk_peak", 1.0)),
             "orient": float(rospy.get_param("~w_orient", 1.5)),
             "stability": float(rospy.get_param("~w_stability", 1.0)),
+            "temporal": float(rospy.get_param("~w_temporal", 2.0)),
         }
 
         self.smoothness_gain = float(rospy.get_param("~smoothness_gain", 0.02))
@@ -102,6 +103,7 @@ class NavigationPolicyInferenceNode:
         self.last_poly_coeffs: Optional[np.ndarray] = None
         self.last_poly_duration: float = 0.0
         self.last_target_yaw: Optional[float] = None
+        self.last_offsets: Optional[Tuple[float, float, float]] = None
 
         self.camera_info: Optional[CameraInfo] = None
         self.odom: Optional[Odometry] = None
@@ -348,6 +350,7 @@ class NavigationPolicyInferenceNode:
         self.last_poly_coeffs = candidate.get("poly_coeffs")
         self.last_poly_duration = float(candidate.get("poly_duration", 0.0))
         self.last_target_yaw = float(math.atan2(final_world_direction[1], final_world_direction[0]))
+        self.last_offsets = (float(length_scale), float(pitch_offset), float(yaw_offset))
         self._publish_fallback(self.mask_header.stamp, include_default=False)
         self._log_timing(start_time)
 
@@ -694,6 +697,16 @@ class NavigationPolicyInferenceNode:
         ) / 3.0
         stability_score = math.exp(-max(0.0, stability_penalty))
 
+        temporal_score = 1.0
+        if self.last_offsets is not None:
+            prev_length, prev_pitch, prev_yaw = self.last_offsets
+            temporal_penalty = (
+                abs(length_scale - prev_length) / 0.2
+                + abs(pitch_offset - prev_pitch) / pitch_limit
+                + abs(yaw_offset - prev_yaw) / yaw_limit
+            ) / 3.0
+            temporal_score = math.exp(-max(0.0, temporal_penalty))
+
         # Goal attainment score
         goal_score = 0.0
         if self.goal_world is not None and self.goal_frame == (self.odom.header.frame_id or "map"):
@@ -727,6 +740,7 @@ class NavigationPolicyInferenceNode:
             + self.weight["jerk_peak"] * jerk_peak_score
             + self.weight["orient"] * orientation_metric
             + self.weight["stability"] * stability_score
+            + self.weight["temporal"] * temporal_score
         )
 
         return {
