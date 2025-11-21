@@ -859,6 +859,45 @@ def sample_quintic(
     return points, velocities
 
 
+def smooth_trajectory(
+    primitives: np.ndarray | "torch.Tensor", window_size: int = 3
+) -> np.ndarray | "torch.Tensor":
+    """Apply a sliding-window mean filter to a primitive sequence.
+
+    The helper accepts either :class:`numpy.ndarray` or ``torch.Tensor`` inputs
+    shaped as ``(N, D)``.  It preserves the input type and device while
+    attenuating high-frequency jitter between neighboring primitives.
+    """
+
+    try:
+        import torch  # Local import to avoid hard dependency for numpy callers
+    except Exception:  # pragma: no cover - torch may be unavailable
+        torch = None  # type: ignore
+
+    if window_size <= 1:
+        return primitives
+
+    if torch is not None and isinstance(primitives, torch.Tensor):
+        half = window_size // 2
+        smoothed = []
+        count = primitives.shape[0]
+        for idx in range(count):
+            start = max(0, idx - half)
+            end = min(count, idx + half + 1)
+            window = primitives[start:end]
+            smoothed.append(window.mean(dim=0))
+        return torch.stack(smoothed, dim=0)
+
+    array = np.asarray(primitives, dtype=np.float32)
+    half = window_size // 2
+    smoothed = []
+    for idx in range(array.shape[0]):
+        start = max(0, idx - half)
+        end = min(array.shape[0], idx + half + 1)
+        smoothed.append(np.mean(array[start:end], axis=0))
+    return np.stack(smoothed, axis=0)
+
+
 def _wrap_angle(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 

@@ -207,6 +207,7 @@ def train_navigation_policy(
     yaw_limit    = torch.tensor(math.radians(15.0), device=device, dtype=torch.float32)
     diag_t       = torch.tensor(math.sqrt(dataset.width ** 2 + dataset.height ** 2), device=device, dtype=torch.float32)
     primitive_dt = 0.25
+    smooth_weight = 0.3
 
     # AMP scaler
     scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
@@ -228,6 +229,7 @@ def train_navigation_policy(
             "safety": 0.0, "clearance": 0.0, "goal": 0.0,
             "stability": 0.0, "smoothness": 0.0, "speed": 0.0,
             "jerk": 0.0, "orientation": 0.0,
+            "smooth_penalty": 0.0,
         }
 
         for start in range(0, len(indices), batch_size):
@@ -329,6 +331,30 @@ def train_navigation_policy(
                     0.0,
                     6,
                 )
+                smooth_steps = max(3, len(dirs))
+                fractions = torch.linspace(0.0, 1.0, smooth_steps, device=device)
+                dirs_t = []
+                for frac in fractions:
+                    direction_t = apply_offsets_torch(
+                        cache.base_dir_t, yaw_offset * frac, pitch_offset * frac
+                    )
+                    direction_t = direction_t / torch.clamp(
+                        torch.linalg.norm(direction_t), min=1e-6
+                    )
+                    dirs_t.append(direction_t)
+                if dirs_t:
+                    primitive_points_t = torch.cumsum(torch.stack(dirs_t, dim=0), dim=0)
+                    delta_pos = primitive_points_t[1:] - primitive_points_t[:-1]
+                    smooth_loss = torch.mean(torch.linalg.norm(delta_pos, dim=1))
+                    velocities_t = delta_pos / primitive_dt
+                    if velocities_t.shape[0] > 1:
+                        delta_vel = velocities_t[1:] - velocities_t[:-1]
+                        jerk_loss = torch.mean(torch.linalg.norm(delta_vel, dim=1))
+                    else:
+                        jerk_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                    smoothing_term = 0.5 * smooth_loss + 0.5 * jerk_loss
+                else:
+                    smoothing_term = torch.tensor(0.0, device=device, dtype=torch.float32)
                 points = [np.zeros(3, dtype=np.float32)]
                 for direction in dirs:
                     points.append(points[-1] + direction)
@@ -365,7 +391,8 @@ def train_navigation_policy(
                     + 0.02 * stability_score
                     + 0.01 * speed_score
                 )
-                loss = -reward
+                reward_loss = -reward
+                loss = reward_loss + smooth_weight * smoothing_term
 
                 # 反传（AMP）
                 scaler.scale(loss).backward()
@@ -381,6 +408,7 @@ def train_navigation_policy(
                 metrics_acc["jerk"]        += float(jerk_metric_val)
                 metrics_acc["orientation"] += float(orientation_metric_val)
                 metrics_acc["smoothness"]  += path_smoothness(points)
+                metrics_acc["smooth_penalty"] += float(smoothing_term.detach().cpu())
                 epoch_count += 1
 
             if valid_samples == 0:
@@ -402,7 +430,7 @@ def train_navigation_policy(
             averaged_metrics = {k: v / epoch_count for k, v in metrics_acc.items()}
             print(
                 "Policy epoch {}/{} - avg loss: {:.4f}, safety: {:.3f}, clearance: {:.3f}, goal: {:.3f}, "
-                "smoothness: {:.3f}, jerk: {:.3f}, orientation: {:.3f}, stability: {:.3f}, speed: {:.3f}".format(
+                "smoothness: {:.3f}, jerk: {:.3f}, orientation: {:.3f}, stability: {:.3f}, speed: {:.3f}, smooth_penalty: {:.4f}".format(
                     epoch + 1, epochs, avg_loss,
                     averaged_metrics["safety"],
                     averaged_metrics["clearance"],
@@ -412,6 +440,7 @@ def train_navigation_policy(
                     averaged_metrics["orientation"],
                     averaged_metrics["stability"],
                     averaged_metrics["speed"],
+                    averaged_metrics["smooth_penalty"],
                 )
             )
         else:
