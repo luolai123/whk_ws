@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+import cv2
 
 
 def clamp_normalized(vec: np.ndarray) -> np.ndarray:
@@ -405,6 +406,8 @@ class SafeRegion:
 
     area: int
     centroid: Tuple[float, float]
+    clearance_center: Tuple[float, float]
+    clearance_score: float
     mask: np.ndarray
     bounds: Tuple[int, int, int, int]
 
@@ -471,7 +474,24 @@ def find_largest_safe_region(
             mask_slice = safe_mask[min_r : max_r + 1, min_c : max_c + 1]
             region_mask = mask_slice.copy()
             bounds = (min_r, max_r, min_c, max_c)
-            best_region = SafeRegion(area=area, centroid=centroid, mask=region_mask, bounds=bounds)
+
+            if region_mask.size > 0:
+                distance = cv2.distanceTransform(region_mask.astype(np.uint8), cv2.DIST_L2, 5)
+                max_idx = np.unravel_index(np.argmax(distance), distance.shape)
+                clearance_center = (float(max_idx[0] + min_r), float(max_idx[1] + min_c))
+                clearance_score = float(distance[max_idx])
+            else:
+                clearance_center = centroid
+                clearance_score = 0.0
+
+            best_region = SafeRegion(
+                area=area,
+                centroid=centroid,
+                clearance_center=clearance_center,
+                clearance_score=clearance_score,
+                mask=region_mask,
+                bounds=bounds,
+            )
 
     return best_region
 

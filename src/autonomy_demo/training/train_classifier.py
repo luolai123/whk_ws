@@ -437,13 +437,14 @@ def _sample_goal_pixel(region: "SafeRegion", rng: random.Random) -> Tuple[float,
     min_r, max_r, min_c, max_c = region.bounds
     mask = region.mask
     if mask.size == 0:
-        return region.centroid
+        return region.clearance_center
     coords = np.argwhere(mask)
     if coords.size == 0:
-        return region.centroid
+        return region.clearance_center
+    anchor_row, anchor_col = region.clearance_center
     local_centroid = np.array([
-        region.centroid[0] - min_r,
-        region.centroid[1] - min_c,
+        anchor_row - min_r,
+        anchor_col - min_c,
     ])
     dists = np.linalg.norm(coords - local_centroid, axis=1)
     if dists.size == 0:
