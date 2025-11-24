@@ -78,7 +78,6 @@ class DataCollector:
             rospy.get_param("~output_dir", str(Path.home() / "autonomy_demo" / "dataset"))
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.sample_count = 0
         target_raw = rospy.get_param("~target_samples", 10_000)
         try:
             self.target_samples = int(target_raw)
@@ -88,6 +87,15 @@ class DataCollector:
             )
             self.target_samples = 10_000
         self.target_samples = max(1, self.target_samples)
+        self.sample_count = self._next_sample_index()
+        if self.sample_count >= self.target_samples:
+            rospy.loginfo(
+                "Output directory already contains %d samples; target is %d. Shutting down.",
+                self.sample_count,
+                self.target_samples,
+            )
+            rospy.signal_shutdown("target samples already collected")
+            return
 
         self.hardware_accel = rospy.get_param("~hardware_accel", False)
         self.hardware_device = rospy.get_param("~hardware_device", "cuda")
@@ -234,7 +242,7 @@ class DataCollector:
                 self.target_samples,
             )
             rospy.signal_shutdown("target samples collected")
-        
+
     @staticmethod
     def _header_to_dict(header: Header) -> dict:
         return {
@@ -242,6 +250,25 @@ class DataCollector:
             "frame_id": header.frame_id,
             "seq": header.seq,
         }
+
+    def _next_sample_index(self) -> int:
+        existing = list(self.output_dir.glob("sample_*.npz"))
+        if not existing:
+            return 0
+
+        max_index = -1
+        for path in existing:
+            stem = path.stem
+            try:
+                suffix = stem.split("_", 1)[1]
+                idx = int(suffix)
+            except (IndexError, ValueError):
+                continue
+            max_index = max(max_index, idx)
+
+        next_index = max_index + 1 if max_index >= 0 else 0
+        rospy.loginfo("Resuming data collection from sample index %d", next_index)
+        return next_index
 
 def main() -> None:
     rospy.init_node("data_collector")
