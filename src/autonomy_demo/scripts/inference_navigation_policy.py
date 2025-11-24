@@ -76,6 +76,9 @@ class NavigationPolicyInferenceNode:
         self.default_speed = float(rospy.get_param("~default_speed", 3.0))
         self.safe_threshold = float(rospy.get_param("~safe_probability_threshold", 0.55))
         self.goal_tolerance = float(rospy.get_param("~goal_tolerance", 0.3))
+        self.radio_range = float(rospy.get_param("~radio_range", 5.0))
+        self.vel_max_train = float(rospy.get_param("~vel_max_train", 6.0))
+        self.acc_max_train = float(rospy.get_param("~acc_max_train", 3.0))
         # Safety & scoring parameters
         self.min_clearance_px = float(rospy.get_param("~min_clearance_px", 1.0))
         self.prob_threshold = float(rospy.get_param("~min_safe_prob", 0.55))
@@ -375,8 +378,16 @@ class NavigationPolicyInferenceNode:
             return acc
         return np.zeros(3, dtype=np.float32)
 
+    def _speed_scale(self, speed: float) -> float:
+        return max(speed / max(self.vel_max_train, 1e-3), 1e-3)
+
+    def _primitive_duration(self, planning_radius: float, speed_scale: float) -> float:
+        effective_speed = max(self.vel_max_train * max(speed_scale, 1e-3), 1e-3)
+        return max(0.2, (2.0 * planning_radius) / effective_speed)
+
     def _limit_yaw_offset(self, yaw_offset: float, base_direction: np.ndarray) -> float:
-        dt = self.primitive_dt * max(1, self.primitive_steps)
+        current_speed = max(float(np.linalg.norm(self._current_velocity())), self.default_speed)
+        dt = self._primitive_duration(self.radio_range, self._speed_scale(current_speed))
         max_change = self.max_yaw_rate * dt
         yaw_base = math.atan2(base_direction[1], base_direction[0])
         previous_yaw = self.last_target_yaw if self.last_target_yaw is not None else yaw_base
@@ -396,9 +407,11 @@ class NavigationPolicyInferenceNode:
         rotation: np.ndarray,
         final_direction_local: np.ndarray,
         commanded_speed: float,
+        planning_radius: float,
+        speed_scale: float,
         steps: int,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
-        duration = self.primitive_dt * max(1, steps)
+        duration = self._primitive_duration(planning_radius, speed_scale)
         final_dir_world = clamp_normalized(rotation.dot(final_direction_local))
         start_vel = self._current_velocity()
         start_acc = self._current_acceleration()
@@ -410,9 +423,10 @@ class NavigationPolicyInferenceNode:
             inherit_gain = 0.6
             start_vel = inherit_gain * prev_vel + (1.0 - inherit_gain) * start_vel
             start_acc = inherit_gain * prev_acc + (1.0 - inherit_gain) * start_acc
-        end_vel = final_dir_world * commanded_speed
+        end_speed = min(commanded_speed, self.vel_max_train * max(speed_scale, 1e-3))
+        end_vel = final_dir_world * end_speed
         end_acc = np.zeros(3, dtype=np.float32)
-        end_pos = origin + end_vel * duration * 0.5  # trapezoidal distance estimate
+        end_pos = origin + final_dir_world * planning_radius
 
         solver = Poly5Solver(duration)
         coeffs = solver.solve(origin, start_vel, start_acc, end_pos, end_vel, end_acc)
@@ -601,6 +615,7 @@ class NavigationPolicyInferenceNode:
     ) -> Optional[dict]:
         yaw_offset = self._limit_yaw_offset(yaw_offset, base_direction)
         steps = max(2, self.primitive_steps)
+        speed_scale = self._speed_scale(speed)
         directions = sample_yopo_directions(
             base_direction, yaw_offset, pitch_offset, 0.0, steps
         )
@@ -645,6 +660,7 @@ class NavigationPolicyInferenceNode:
 
         # Build primitive points and kinematics
         commanded_speed = speed * length_scale
+        planning_radius = self.radio_range * length_scale
         (
             points,
             velocities,
@@ -657,13 +673,15 @@ class NavigationPolicyInferenceNode:
             rotation,
             directions[-1],
             commanded_speed,
+            planning_radius,
+            speed_scale,
             steps,
         )
         if points.shape[0] < 2:
             return None
 
         displacement = float(np.linalg.norm(points[-1] - points[0]))
-        expected = commanded_speed * max(duration, 1e-3)
+        expected = min(commanded_speed, self.vel_max_train * speed_scale) * max(duration, 1e-3)
         if expected > 1e-3 and displacement < expected * 0.35:
             return None
 
@@ -678,9 +696,9 @@ class NavigationPolicyInferenceNode:
         )
         # jerk_peak: max |jerk| over segments (normalized)
         if points.shape[0] >= 4:
-            v = np.diff(points, axis=0) / max(self.primitive_dt, 1e-3)
-            a = np.diff(v, axis=0) / max(self.primitive_dt, 1e-3)
-            j = np.diff(a, axis=0) / max(self.primitive_dt, 1e-3)
+            v = np.diff(points, axis=0) / max(jerk_dt, 1e-3)
+            a = np.diff(v, axis=0) / max(jerk_dt, 1e-3)
+            j = np.diff(a, axis=0) / max(jerk_dt, 1e-3)
             jerk_peak = float(np.max(np.linalg.norm(j, axis=1))) if j.size else 0.0
             jerk_peak_score = math.exp(-jerk_peak)
         else:
@@ -762,7 +780,7 @@ class NavigationPolicyInferenceNode:
         base_direction: np.ndarray,
         yaw_offset: float,
         pitch_offset: float,
-        commanded_speed: float,
+        planning_radius: float,
         directions: Optional[List[np.ndarray]] = None,
     ) -> np.ndarray:
         steps = self.primitive_steps
@@ -773,7 +791,7 @@ class NavigationPolicyInferenceNode:
         else:
             directions = list(directions)
         points = [origin.astype(np.float32)]
-        segment_length = commanded_speed * max(self.primitive_dt, 1e-3)
+        segment_length = planning_radius / max(steps, 1)
         for direction_local in directions:
             world_dir = clamp_normalized(rotation.dot(direction_local))
             points.append(points[-1] + world_dir * segment_length)

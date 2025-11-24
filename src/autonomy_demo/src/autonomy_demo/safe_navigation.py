@@ -226,20 +226,26 @@ def sample_motion_primitives(
     return samples
 
 
-def primitive_state_vector(sample: PrimitiveSample, config: PrimitiveConfig) -> np.ndarray:
+def primitive_state_vector(
+    sample: PrimitiveSample, config: PrimitiveConfig, speed_scale: float = 1.0
+) -> np.ndarray:
     """Return normalized features describing ``sample`` for the policy network."""
 
     forward, lateral, vertical = _local_basis(sample.goal_direction_body)
+    speed_scale = max(float(speed_scale), 1e-3)
+    vel_scale = max(config.vel_max_train * speed_scale, 1e-3)
+    acc_scale = max(config.acc_max_train * (speed_scale**2), 1e-3)
     vel = sample.start_vel_body
     acc = sample.start_acc_body
-    vel_forward = float(np.dot(vel, forward)) / max(config.vel_max_train, 1e-3)
-    vel_lateral = float(np.dot(vel, lateral)) / max(config.vel_max_train, 1e-3)
-    vel_vertical = float(np.dot(vel, vertical)) / max(config.vel_max_train, 1e-3)
-    acc_forward = float(np.dot(acc, forward)) / max(config.acc_max_train, 1e-3)
-    acc_lateral = float(np.dot(acc, lateral)) / max(config.acc_max_train, 1e-3)
-    acc_vertical = float(np.dot(acc, vertical)) / max(config.acc_max_train, 1e-3)
+    vel_forward = float(np.dot(vel, forward)) / vel_scale
+    vel_lateral = float(np.dot(vel, lateral)) / vel_scale
+    vel_vertical = float(np.dot(vel, vertical)) / vel_scale
+    acc_forward = float(np.dot(acc, forward)) / acc_scale
+    acc_lateral = float(np.dot(acc, lateral)) / acc_scale
+    acc_vertical = float(np.dot(acc, vertical)) / acc_scale
     goal_norm = float(sample.goal_length / max(config.radio_range, 1e-3))
-    duration_norm = float(sample.duration / max(config.traj_time, 1e-3))
+    duration_base = (2.0 * sample.goal_length) / vel_scale
+    duration_norm = float(sample.duration / max(duration_base, 1e-3))
     goal_dir = clamp_normalized(sample.goal_direction_body)
     orientation_offsets = np.array(
         [sample.yaw_offset, sample.pitch_offset, sample.roll_offset], dtype=np.float32
@@ -310,6 +316,7 @@ def normalize_navigation_inputs(
     velocity: Sequence[float],
     goal_point: Sequence[float],
     config: PrimitiveConfig,
+    speed_scale: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Normalize navigation-related vectors for model consumption.
 
@@ -320,7 +327,7 @@ def normalize_navigation_inputs(
     """
 
     range_scale = max(float(config.radio_range), 1e-3)
-    vel_scale = max(float(config.vel_max_train), 1e-3)
+    vel_scale = max(float(config.vel_max_train) * max(float(speed_scale), 1e-3), 1e-3)
 
     pos_arr = np.asarray(position, dtype=np.float32) / range_scale
     vel_arr = np.asarray(velocity, dtype=np.float32) / vel_scale
