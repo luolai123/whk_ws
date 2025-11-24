@@ -73,7 +73,7 @@ class PrimitiveConfig:
         """Replan interval derived from the planning horizon and max speed."""
 
         vel = max(self.vel_max_train, 0.5)
-        return max(0.5, self.planning_horizon / vel)
+        return max(0.5, (2.0 * self.planning_horizon) / vel)
 
 
 def denormalize_weight(weight: float, speed: float, reference_speed: float) -> float:
@@ -203,7 +203,11 @@ def sample_motion_primitives(
 
         length_scale = float(np.clip(rng.normal(config.goal_length_scale, 0.15), 0.4, 1.4))
         goal_length = config.planning_horizon * length_scale
-        duration = max(0.2, config.traj_time * length_scale)
+        duration = max(
+            0.2,
+            (2.0 * goal_length)
+            / max(float(config.vel_max_train), 1e-3),
+        )
 
         samples.append(
             PrimitiveSample(
@@ -329,11 +333,24 @@ def primitive_quintic_trajectory(
     goal_body: np.ndarray,
     duration_scale: float,
     steps: int,
+    config: PrimitiveConfig,
+    speed_scale: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Return body-frame samples along the quintic primitive."""
+    """Return body-frame samples along the quintic primitive.
 
-    duration = max(0.2, float(sample.duration) * float(duration_scale))
+    The trajectory duration follows ``T = 2 * R / (v_max_train * speed_scale)``,
+    where ``R`` is the distance from the current body frame origin to
+    ``goal_body``. ``duration_scale`` further modulates the timing based on
+    policy outputs.
+    """
+
     goal_body = np.asarray(goal_body, dtype=np.float32)
+    planning_radius = float(np.linalg.norm(goal_body))
+    effective_speed = max(
+        float(config.vel_max_train) * max(float(speed_scale), 1e-3), 1e-3
+    )
+    duration_base = (2.0 * planning_radius) / effective_speed
+    duration = max(0.2, duration_base * float(duration_scale))
     coeffs = quintic_coefficients(
         np.zeros(3, dtype=np.float32),
         sample.start_vel_body,
@@ -365,6 +382,8 @@ def blended_quintic_transition(
     goal_body: np.ndarray,
     duration_scale: float,
     steps: int,
+    config: PrimitiveConfig,
+    speed_scale: float = 1.0,
     inherit_weight: float = 0.6,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """Generate a C²-continuous trajectory by inheriting prior dynamics.
@@ -381,13 +400,20 @@ def blended_quintic_transition(
 
     previous_state = inherit_motion_state(previous_coeffs, previous_solver)
     if previous_state is None:
-        return primitive_quintic_trajectory(sample, goal_body, duration_scale, steps)
+        return primitive_quintic_trajectory(
+            sample, goal_body, duration_scale, steps, config, speed_scale
+        )
 
     end_pos, end_vel, end_acc = previous_state
     blended_vel = (1.0 - inherit_weight) * sample.start_vel_body + inherit_weight * end_vel
     blended_acc = (1.0 - inherit_weight) * sample.start_acc_body + inherit_weight * end_acc
 
-    duration = max(0.2, float(sample.duration) * float(duration_scale))
+    planning_radius = float(np.linalg.norm(goal_body))
+    effective_speed = max(
+        float(config.vel_max_train) * max(float(speed_scale), 1e-3), 1e-3
+    )
+    duration_base = (2.0 * planning_radius) / effective_speed
+    duration = max(0.2, duration_base * float(duration_scale))
     solver = Poly5Solver(duration=duration)
     coeffs = solver.solve(
         start_pos=end_pos,

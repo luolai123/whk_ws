@@ -757,6 +757,7 @@ def train_navigation_policy(
                     goal_body,
                     float(duration_scale.detach().cpu()),
                     sample_count,
+                    primitive_config,
                 )
                 if points_np.size == 0:
                     continue
