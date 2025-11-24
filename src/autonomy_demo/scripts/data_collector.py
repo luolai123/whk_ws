@@ -79,6 +79,15 @@ class DataCollector:
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.sample_count = 0
+        target_raw = rospy.get_param("~target_samples", 10_000)
+        try:
+            self.target_samples = int(target_raw)
+        except (TypeError, ValueError):
+            rospy.logwarn(
+                "Data collector received invalid target_samples; defaulting to 10000"
+            )
+            self.target_samples = 10_000
+        self.target_samples = max(1, self.target_samples)
 
         self.hardware_accel = rospy.get_param("~hardware_accel", False)
         self.hardware_device = rospy.get_param("~hardware_device", "cuda")
@@ -219,6 +228,12 @@ class DataCollector:
         )
         self.sample_count += 1
         rospy.loginfo_throttle(5.0, "Captured %d samples", self.sample_count)
+        if self.sample_count >= self.target_samples:
+            rospy.loginfo(
+                "Reached target of %d samples; shutting down data collector",
+                self.target_samples,
+            )
+            rospy.signal_shutdown("target samples collected")
         
     @staticmethod
     def _header_to_dict(header: Header) -> dict:
