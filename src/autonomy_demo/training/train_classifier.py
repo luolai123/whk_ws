@@ -18,6 +18,7 @@ from autonomy_demo.safe_navigation import (
     PrimitiveConfig,
     apply_goal_offset,
     clamp_normalized,
+    compute_primitive_duration,
     compute_direction_from_pixel,
     find_largest_safe_region,
     jerk_score,
@@ -643,9 +644,7 @@ def train_navigation_policy(
     noise_rate: float,
     policy_output: pathlib.Path,
     primitive_config: PrimitiveConfig,
-    primitive_dt: float,
-    primitive_steps: int,
-    samples_per_step: int,
+    samples_per_second: int,
     camera_pitch_deg: float,
     seed: int,
 ) -> None:
@@ -751,7 +750,13 @@ def train_navigation_policy(
                 )
                 offset_vec = offset_raw.detach().cpu().numpy() * primitive_config.radio_range
                 goal_body = apply_goal_offset(sample, offset_vec, primitive_config)
-                sample_count = max(primitive_steps * samples_per_step, primitive_steps)
+                duration_nominal = compute_primitive_duration(
+                    goal_body,
+                    primitive_config,
+                    1.0,
+                    float(duration_scale.detach().cpu()),
+                )
+                sample_count = max(2, int(math.ceil(duration_nominal * samples_per_second)))
                 points_np, velocities_np, duration_val = primitive_quintic_trajectory(
                     sample,
                     goal_body,
@@ -828,7 +833,8 @@ def train_navigation_policy(
                 goal_alignment = float(
                     max(-1.0, min(1.0, np.dot(clamp_normalized(final_cam), goal_direction_camera)))
                 )
-                jerk_metric_val = jerk_score(points_np, primitive_dt / max(samples_per_step, 1))
+                jerk_dt = duration_val / max(sample_count - 1, 1)
+                jerk_metric_val = jerk_score(points_np, jerk_dt)
                 orientation_metric_val = orientation_rate_score(velocities_np)
                 goal_heading = clamp_normalized(goal_body)
                 path_heading = clamp_normalized(points_np[-1])
@@ -950,9 +956,7 @@ def parse_args() -> argparse.Namespace:
         default=pathlib.Path.home() / "autonomy_demo" / "navigation_policy.pt",
     )
     parser.add_argument("--camera_pitch_deg", type=float, default=10.0)
-    parser.add_argument("--primitive_steps", type=int, default=4)
-    parser.add_argument("--primitive_dt", type=float, default=0.25)
-    parser.add_argument("--path_samples_per_step", type=int, default=3)
+    parser.add_argument("--path_samples_per_step", type=int, default=12)
     parser.add_argument("--radio_range", type=float, default=5.0)
     parser.add_argument("--vel_max_train", type=float, default=6.0)
     parser.add_argument("--acc_max_train", type=float, default=3.0)
@@ -1048,8 +1052,7 @@ def main() -> None:
             goal_length_scale=max(0.2, args.goal_length_scale),
             offset_gain=max(0.05, args.offset_gain),
         )
-        primitive_steps = max(3, min(5, args.primitive_steps))
-        samples_per_step = max(1, args.path_samples_per_step)
+        samples_per_second = max(1, args.path_samples_per_step)
         train_navigation_policy(
             nav_dataset,
             device,
@@ -1059,9 +1062,7 @@ def main() -> None:
             args.policy_noise,
             args.policy_output,
             primitive_config,
-            args.primitive_dt,
-            primitive_steps,
-            samples_per_step,
+            samples_per_second,
             args.camera_pitch_deg,
             args.policy_seed,
         )

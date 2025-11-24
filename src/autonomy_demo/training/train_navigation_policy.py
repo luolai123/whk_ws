@@ -206,7 +206,6 @@ def train_navigation_policy(
     pitch_limit  = torch.tensor(math.radians(15.0), device=device, dtype=torch.float32)
     yaw_limit    = torch.tensor(math.radians(15.0), device=device, dtype=torch.float32)
     diag_t       = torch.tensor(math.sqrt(dataset.width ** 2 + dataset.height ** 2), device=device, dtype=torch.float32)
-    primitive_dt = 0.25
     smooth_weight = 0.3
 
     # AMP scaler
@@ -334,6 +333,7 @@ def train_navigation_policy(
                 smooth_steps = max(3, len(dirs))
                 fractions = torch.linspace(0.0, 1.0, smooth_steps, device=device)
                 dirs_t = []
+                segment_dt = max(sample.duration / max(smooth_steps - 1, 1), 1e-3)
                 for frac in fractions:
                     direction_t = apply_offsets_torch(
                         cache.base_dir_t, yaw_offset * frac, pitch_offset * frac
@@ -346,7 +346,7 @@ def train_navigation_policy(
                     primitive_points_t = torch.cumsum(torch.stack(dirs_t, dim=0), dim=0)
                     delta_pos = primitive_points_t[1:] - primitive_points_t[:-1]
                     smooth_loss = torch.mean(torch.linalg.norm(delta_pos, dim=1))
-                    velocities_t = delta_pos / primitive_dt
+                    velocities_t = delta_pos / segment_dt
                     if velocities_t.shape[0] > 1:
                         delta_vel = velocities_t[1:] - velocities_t[:-1]
                         jerk_loss = torch.mean(torch.linalg.norm(delta_vel, dim=1))
@@ -375,7 +375,8 @@ def train_navigation_policy(
                 clearance_score = torch.tensor(min(1.0, max(0.0, min_clearance_val)), device=device, dtype=torch.float32)
 
                 # jerk / orientation（与原逻辑一致）
-                jerk_metric_val = jerk_score(points, primitive_dt)
+                jerk_dt = sample.duration / max(len(points) - 1, 1)
+                jerk_metric_val = jerk_score(points, jerk_dt)
                 jerk_score_t    = torch.tensor(float(max(0.0, min(1.0, jerk_metric_val))), device=device, dtype=torch.float32)
                 orientation_metric_val = orientation_rate_score(dirs)
                 orientation_score_t    = torch.tensor(float(max(0.0, min(1.0, orientation_metric_val))), device=device, dtype=torch.float32)

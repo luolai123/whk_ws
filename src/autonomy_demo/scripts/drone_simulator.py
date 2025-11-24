@@ -32,8 +32,6 @@ class DroneSimulator:
         self.max_speed = rospy.get_param("~max_speed", 2.0)
         self.goal_tolerance = rospy.get_param("~goal_tolerance", 0.1)
         self.default_altitude = rospy.get_param("~altitude", 1.5)
-        self.primitive_dt = rospy.get_param("~primitive_dt", 0.25)
-        self.primitive_steps = rospy.get_param("~primitive_steps", 4)
         self.attitude_gain = rospy.get_param("~attitude_gain", 4.0)
         self.max_yaw_rate = math.radians(rospy.get_param("~max_yaw_rate_deg", 90.0))
         self.max_pitch_rate = math.radians(rospy.get_param("~max_pitch_rate_deg", 60.0))
@@ -53,8 +51,8 @@ class DroneSimulator:
         self.segment_time_remaining = 0.0
         self.desired_yaw = 0.0
         self.desired_pitch = 0.0
-        self.total_duration_hint = max(self.primitive_dt, self.primitive_dt * self.primitive_steps)
-        self.segment_duration_hint = max(self.primitive_dt, self.total_duration_hint / max(self.primitive_steps, 1))
+        self.total_duration_hint = 1.0
+        self.segment_duration_hint = self.total_duration_hint
 
         self.pose_pub = rospy.Publisher("drone/pose", PoseStamped, queue_size=1)
         self.odom_pub = rospy.Publisher("drone/odometry", Odometry, queue_size=1)
@@ -116,6 +114,7 @@ class DroneSimulator:
         self.follow_path = len(self.path_points) > 1
         if self.path_points:
             self.goal = self.path_points[-1][:]
+            self.total_duration_hint = self._estimate_path_duration()
             self._update_segment_duration()
             if self.path_orientations:
                 idx = min(self.path_index, len(self.path_orientations) - 1)
@@ -128,21 +127,28 @@ class DroneSimulator:
             return
         if len(msg.data) >= 4 and msg.data[3] > 0.0:
             self.total_duration_hint = float(msg.data[3])
-        elif len(msg.data) >= 3 and msg.data[2] > 0.0:
-            self.total_duration_hint = max(
-                self.primitive_dt,
-                self.primitive_dt * self.primitive_steps * float(msg.data[2]),
-            )
         else:
-            self.total_duration_hint = max(self.primitive_dt, self.primitive_dt * self.primitive_steps)
+            self.total_duration_hint = self._estimate_path_duration()
         self._update_segment_duration()
 
     def _update_segment_duration(self) -> None:
         segments = max(1, len(self.path_points) - 1)
-        self.segment_duration_hint = max(
-            self.primitive_dt * 0.5, self.total_duration_hint / max(segments, 1)
-        )
+        self.segment_duration_hint = max(0.05, self.total_duration_hint / max(segments, 1))
         self.segment_time_remaining = self.segment_duration_hint
+
+    def _estimate_path_duration(self) -> float:
+        if len(self.path_points) < 2:
+            return max(self.total_duration_hint, 0.5)
+        distance = 0.0
+        for idx in range(1, len(self.path_points)):
+            prev = self.path_points[idx - 1]
+            curr = self.path_points[idx]
+            distance += math.sqrt(
+                (curr[0] - prev[0]) ** 2
+                + (curr[1] - prev[1]) ** 2
+                + (curr[2] - prev[2]) ** 2
+            )
+        return max(distance / max(self.max_speed, 1e-3), 0.5)
 
     def step(self, dt: float) -> None:
         if self.follow_path and self.path_points and self.path_index < len(self.path_points):

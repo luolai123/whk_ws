@@ -34,6 +34,7 @@ from autonomy_demo.safe_navigation import (
     orientation_rate_score,
     jerk_score,
     normalize_navigation_inputs,
+    compute_primitive_duration,
     primitive_quintic_trajectory,
     primitive_state_dim,
     primitive_state_vector,
@@ -225,10 +226,6 @@ class InferenceNode:
         self.ekf_process_noise = float(rospy.get_param("~ekf_process_noise", 0.15))
         self.ekf_measurement_noise = float(rospy.get_param("~ekf_measurement_noise", 0.35))
 
-        primitive_steps = int(rospy.get_param("~primitive_steps", 4))
-        self.primitive_steps = max(3, min(5, primitive_steps))
-        self.primitive_dt = float(rospy.get_param("~primitive_dt", 0.25))
-        self.primitive_duration = self.primitive_steps * self.primitive_dt
         self.primitive_candidate_count = int(rospy.get_param("~primitive_candidate_count", 24))
         primitive_seed = int(rospy.get_param("~primitive_seed", 0))
         self._rng = np.random.default_rng(primitive_seed or None)
@@ -266,14 +263,14 @@ class InferenceNode:
         )
         self.goal_feature_dim = 4
         self.policy_state_dim = primitive_state_dim(self.primitive_config) + self.goal_feature_dim
-        samples_per_step = int(rospy.get_param("~path_samples_per_step", 3))
-        self.path_samples_per_step = max(1, samples_per_step)
+        samples_per_second = int(rospy.get_param("~path_samples_per_step", 12))
+        self.path_sample_rate = max(1, samples_per_second)
 
-        publish_default = max(0.02, self.primitive_dt / max(self.primitive_steps, 1))
+        publish_default = max(0.02, self.primitive_config.traj_time / 3.0)
         self.plan_publish_period = rospy.Duration.from_sec(
             float(rospy.get_param("~plan_publish_period", publish_default))
         )
-        hold_default = max(self.plan_publish_period.to_sec(), self.primitive_dt * 0.6)
+        hold_default = max(self.plan_publish_period.to_sec(), self.primitive_config.traj_time * 0.6)
         self.plan_hold_time = rospy.Duration.from_sec(
             float(rospy.get_param("~plan_hold_time", hold_default))
         )
@@ -331,6 +328,9 @@ class InferenceNode:
         if speed < 1e-3:
             return self.default_speed
         return float(speed)
+
+    def _sample_count_from_duration(self, duration: float) -> int:
+        return max(3, int(math.ceil(duration * self.path_sample_rate)))
 
     def goal_callback(self, msg: PoseStamped) -> None:
         self.goal_world = np.array(
@@ -839,10 +839,6 @@ class InferenceNode:
         if self.enforce_fixed_altitude:
             origin = origin.copy()
             origin[2] = self.fixed_altitude
-        sample_count = max(
-            self.primitive_steps,
-            self.primitive_steps * self.path_samples_per_step,
-        )
         desired_speed = max(self._current_speed(), 1e-3)
         speed_scale = desired_speed / max(self.primitive_config.vel_max_train, 1e-3)
         target_distance = local_distance if local_distance is not None else goal_distance
@@ -873,6 +869,10 @@ class InferenceNode:
             if self.enforce_fixed_altitude:
                 goal_body = goal_body.copy()
                 goal_body[2] = 0.0
+            duration = compute_primitive_duration(
+                goal_body, self.primitive_config, speed_scale, duration_scale
+            )
+            sample_count = self._sample_count_from_duration(duration)
             points_body, velocities_body, duration = primitive_quintic_trajectory(
                 sample,
                 goal_body,
@@ -1105,8 +1105,9 @@ class InferenceNode:
             self._publish_empty_trajectory(stamp)
             return
         unit_vector = unit_vector / norm
-        steps = max(2, self.primitive_steps)
-        step_length = self.default_speed / steps
+        nominal_duration = max(self.primitive_config.traj_time, 1.0)
+        steps = self._sample_count_from_duration(nominal_duration)
+        step_length = self.default_speed / max(steps, 1)
 
         origin = np.array(
             [
