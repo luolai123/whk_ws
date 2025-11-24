@@ -852,7 +852,7 @@ class InferenceNode:
                 sample.start_vel_body = start_vel_body
             if start_acc_body is not None:
                 sample.start_acc_body = start_acc_body
-            state_vec = primitive_state_vector(sample, self.primitive_config)
+            state_vec = primitive_state_vector(sample, self.primitive_config, speed_scale)
             target_hint = np.zeros(3, dtype=np.float32)
             target_bias = 1.0
             if local_goal is not None:
@@ -925,11 +925,16 @@ class InferenceNode:
                 world_velocities[-1],
                 (world_points[-1] - origin),
                 self.primitive_config,
+                speed_scale,
             )
             normalized_local_goal = None
             if local_goal is not None:
                 _, _, normalized_local_goal = normalize_navigation_inputs(
-                    origin, world_velocities[-1], local_goal - origin, self.primitive_config
+                    origin,
+                    world_velocities[-1],
+                    local_goal - origin,
+                    self.primitive_config,
+                    speed_scale,
                 )
             normalized_goal_error = 0.0
             if normalized_local_goal is not None:
