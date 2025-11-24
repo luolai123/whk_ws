@@ -972,6 +972,11 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     base_dataset = ObstacleDataset(args.dataset)
     total_len = len(base_dataset)
+    min_samples = 10_000
+    if total_len < min_samples:
+        raise ValueError(
+            f"Dataset only contains {total_len} samples; collect at least {min_samples} before training"
+        )
     all_indices = list(range(total_len))
     random.shuffle(all_indices)
 
