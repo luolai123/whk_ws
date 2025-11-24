@@ -472,7 +472,7 @@ class InferenceNode:
         min_r, max_r, min_c, max_c = region.bounds
         cluster_mask[min_r : max_r + 1, min_c : max_c + 1] = region.mask
 
-        center_row, center_col = region.centroid
+        center_row, center_col = region.clearance_center
         total_pixels = height * width
         safe_fraction = region.area / float(total_pixels)
 
