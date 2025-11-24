@@ -203,11 +203,7 @@ def sample_motion_primitives(
 
         length_scale = float(np.clip(rng.normal(config.goal_length_scale, 0.15), 0.4, 1.4))
         goal_length = config.planning_horizon * length_scale
-        duration = max(
-            0.2,
-            (2.0 * goal_length)
-            / max(float(config.vel_max_train), 1e-3),
-        )
+        duration = compute_primitive_duration(goal_direction_body * goal_length, config)
 
         samples.append(
             PrimitiveSample(
@@ -224,6 +220,30 @@ def sample_motion_primitives(
         )
 
     return samples
+
+
+def compute_primitive_duration(
+    goal_body: np.ndarray,
+    config: PrimitiveConfig,
+    speed_scale: float = 1.0,
+    duration_scale: float = 1.0,
+) -> float:
+    """Compute the primitive duration using ``T = 2R / (v_max * α)``.
+
+    ``R`` is the distance from the current state to ``goal_body`` in meters,
+    ``v_max`` is ``config.vel_max_train``, and ``α`` corresponds to
+    ``speed_scale`` (the expected speed ratio at runtime). ``duration_scale``
+    allows policy outputs to stretch or shrink the duration without violating
+    the base physics-driven timing.
+    """
+
+    goal_body = np.asarray(goal_body, dtype=np.float32)
+    planning_radius = float(np.linalg.norm(goal_body))
+    effective_speed = max(
+        float(config.vel_max_train) * max(float(speed_scale), 1e-3), 1e-3
+    )
+    duration_base = (2.0 * planning_radius) / effective_speed
+    return max(0.2, duration_base * float(duration_scale))
 
 
 def primitive_state_vector(
@@ -352,12 +372,7 @@ def primitive_quintic_trajectory(
     """
 
     goal_body = np.asarray(goal_body, dtype=np.float32)
-    planning_radius = float(np.linalg.norm(goal_body))
-    effective_speed = max(
-        float(config.vel_max_train) * max(float(speed_scale), 1e-3), 1e-3
-    )
-    duration_base = (2.0 * planning_radius) / effective_speed
-    duration = max(0.2, duration_base * float(duration_scale))
+    duration = compute_primitive_duration(goal_body, config, speed_scale, duration_scale)
     coeffs = quintic_coefficients(
         np.zeros(3, dtype=np.float32),
         sample.start_vel_body,
@@ -415,12 +430,7 @@ def blended_quintic_transition(
     blended_vel = (1.0 - inherit_weight) * sample.start_vel_body + inherit_weight * end_vel
     blended_acc = (1.0 - inherit_weight) * sample.start_acc_body + inherit_weight * end_acc
 
-    planning_radius = float(np.linalg.norm(goal_body))
-    effective_speed = max(
-        float(config.vel_max_train) * max(float(speed_scale), 1e-3), 1e-3
-    )
-    duration_base = (2.0 * planning_radius) / effective_speed
-    duration = max(0.2, duration_base * float(duration_scale))
+    duration = compute_primitive_duration(goal_body, config, speed_scale, duration_scale)
     solver = Poly5Solver(duration=duration)
     coeffs = solver.solve(
         start_pos=end_pos,

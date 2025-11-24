@@ -9,7 +9,7 @@
 - **统一相机工具链 Unified camera utilities**：摄像头与数据采集器共享射线预计算与安装矩阵（`camera_utils.py`），确保上抬视角、相对机体系偏移完全一致，避免冗余代码与视角错位。
 - **自动采集 + 真实标签 Automated data capture**：`data_collection.launch` 默认调用离线采集器，逐像素光线投射生成 RGB/深度/红绿二分类标签，并保存完整障碍快照供训练使用。
 - **可微训练 Differentiable training**：UNet 二分类器 + 可微安全导航策略同时训练，奖励函数覆盖安全距离、目标导向、平滑与速度指标，适配 3–7 m/s 速度段。
-- **推理与轨迹 Tracking inference**：推理节点提取最大安全区，使用五阶多项式在 3–5×`primitive_dt` 内生成安全运动基元，并由姿态控制器跟踪。
+- **推理与轨迹 Tracking inference**：推理节点提取最大安全区，使用五阶多项式生成安全运动基元；每条轨迹的时长遵循 `T = 2R / (vmax · α)`（末端距当前机体距离为 `R`，`vmax` 为训练最大速度，`α` 为当前速度缩放），并由姿态控制器跟踪。
 
 ## 环境需求 / Requirements
 - Ubuntu 20.04, ROS Noetic (desktop-full 建议). 需要 `cv_bridge`、`image_transport` 等 ROS 包。
@@ -86,8 +86,8 @@ python3 src/autonomy_demo/training/train_classifier.py \
 - 策略阶段以五阶多项式轨迹评估安全性（碰撞率、最小距离）、目标导向度、轨迹 jerk 峰值与姿态变化率，并在训练时强制将采样目标与安全斑块边界的距离、角度关联起来，使策略真正学会“指向目标又保持安全”。
 
 ### YOPO 式安全运动基元 / YOPO-style motion primitives
-- **中文**：`train_classifier.py` 与 `inference_node.py` 现共享同一套 YOPO 运动基元参数。`radio_range` 定义轨迹地平线（默认 5 m），结合 `vel_max_train`、`primitive_dt/primitive_steps` 自动推导 3–5×`dt` 的轨迹时长。`v_forward_mean/sigma`（对数正态）、`v_std_unit`、`a_std_unit` 控制机体系速度/加速度采样分布，而 `yaw_std_deg`、`pitch_std_deg` + `horizon/vertical fov` 确保采样方向位于相机视野内。策略网络输出 3 维偏移量 + 1 个时长缩放，`offset_gain` 负责约束偏移幅度。`inference.launch` 中的参数与训练脚本的 `--radio_range --vel_max_train ... --camera_pitch_deg` 保持一一对应，可直接复现训练时的运动基元云。
-- **English**: Both the trainer and the inference node now draw YOPO-style primitives from the same `PrimitiveConfig`. `radio_range` fixes the horizon (5 m by default), while `vel_max_train`, `primitive_dt`, and `primitive_steps` determine the 3–5 × dt duration. Forward velocity follows a log-normal law (`v_forward_mean`/`v_forward_sigma`), lateral/vertical components use zero-mean Gaussians scaled by `v_std_unit`, and accelerations mirror `a_std_unit`. `yaw_std_deg`/`pitch_std_deg` together with the camera FOV restrict candidate directions to what the RGB sensor can actually observe. The policy outputs a 3D offset and a duration scale that are clamped via `offset_gain` and `duration_scale_[min|max]`. Keep the new CLI flags (`--radio_range`, `--primitive_dt`, `--path_samples_per_step`, `--camera_pitch_deg`, etc.) aligned with the ROS parameters in `inference.launch` to guarantee that training and runtime primitives stay consistent.
+- **中文**：`train_classifier.py` 与 `inference_node.py` 现共享同一套 YOPO 运动基元参数。`radio_range` 定义轨迹地平线（默认 5 m），结合 `vel_max_train` 与运行时速度比例自动套用 `T = 2R / (vmax · α)` 的时长。`v_forward_mean/sigma`（对数正态）、`v_std_unit`、`a_std_unit` 控制机体系速度/加速度采样分布，而 `yaw_std_deg`、`pitch_std_deg` + `horizon/vertical fov` 确保采样方向位于相机视野内。策略网络输出 3 维偏移量 + 1 个时长缩放，`offset_gain` 负责约束偏移幅度。`inference.launch` 中的参数与训练脚本的 `--radio_range --vel_max_train ... --camera_pitch_deg` 保持一一对应，可直接复现训练时的运动基元云。
+- **English**: Both the trainer and the inference node now draw YOPO-style primitives from the same `PrimitiveConfig`. `radio_range` fixes the horizon (5 m by default) and, together with `vel_max_train` and the runtime speed scale, sets the duration via `T = 2R / (vmax · α)`. Forward velocity follows a log-normal law (`v_forward_mean`/`v_forward_sigma`), lateral/vertical components use zero-mean Gaussians scaled by `v_std_unit`, and accelerations mirror `a_std_unit`. `yaw_std_deg`/`pitch_std_deg` together with the camera FOV restrict candidate directions to what the RGB sensor can actually observe. The policy outputs a 3D offset and a duration scale that are clamped via `offset_gain` and `duration_scale_[min|max]`. Keep the new CLI flags (`--radio_range`, `--path_samples_per_step`, `--camera_pitch_deg`, etc.) aligned with the ROS parameters in `inference.launch` to guarantee that training and runtime primitives stay consistent.
 
 ## 推理部署 / Inference Deployment
 ```bash
@@ -99,9 +99,9 @@ roslaunch autonomy_demo inference.launch \
   - `/drone/rgb/distance_class`：红/绿叠加图。
   - `/drone/safe_center`：最大安全斑块中心点。
   - `/drone/movement_command` / `/drone/movement_offsets`：长度、俯仰、偏航调节（offsets 现包含完整轨迹时长，模拟器据此平滑跟踪）。
-  - `/drone/safe_trajectory`：3–5 dt 的五阶多项式安全轨迹，姿态控制器按该轨迹跟踪至下个 goal；若当前路径与上一条相似，会自动保持旧轨迹以避免“走走停停”。
+  - `/drone/safe_trajectory`：基于 `T = 2R / (vmax · α)` 时长的五阶多项式安全轨迹，姿态控制器按该轨迹跟踪至下个 goal；若当前路径与上一条相似，会自动保持旧轨迹以避免“走走停停”。
 - `~goal_direction_blend`、`~goal_bias_distance` 控制安全方向与 RViz 目标方向的融合比例；`~plan_publish_period` 决定最小轨迹刷新周期，而 `~plan_hold_time` / `~plan_similarity_epsilon` 则决定何时强制推送最新轨迹，可显著减少实时运行时的顿挫感。
-- `~primitive_steps`、`~primitive_dt`、`~path_samples_per_step`（用于在同一 3–5 dt 轨迹内增加采样点，从而提升模拟器跟踪的连续性）、`~camera_pitch_deg`、`~max_obstacle_candidates` 等参数可在 launch 文件内调整，实现实时性与安全性折中。
+- `~path_samples_per_step`（作为采样频率控制轨迹分辨率）、`~camera_pitch_deg`、`~max_obstacle_candidates` 等参数可在 launch 文件内调整，实现实时性与安全性折中。
 - 模型文件保存为包含 `model_state`、`normalization(mean/std)` 以及 `input_size` 的字典；旧版仅含 `state_dict` 的模型仍可加载，但推理节点不会应用额外的标准化或重采样。
 
 ## 性能优化与容错 / Performance & Robustness

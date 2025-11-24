@@ -129,12 +129,11 @@ class NavigationPolicyInferenceNode:
         rospy.Subscriber("drone/safe_probability", Image, self.safe_probability_callback, queue_size=1)
         rospy.Subscriber("move_base_simple/goal", PoseStamped, self.goal_callback, queue_size=1)
 
-        primitive_steps = int(rospy.get_param("~primitive_steps", 4))
-        self.primitive_steps = max(3, min(5, primitive_steps))
-        self.primitive_dt = float(rospy.get_param("~primitive_dt", 0.25))
         self.primitive_smooth_window = max(
             1, int(rospy.get_param("~primitive_smooth_window", 3))
         )
+        samples_per_second = int(rospy.get_param("~path_samples_per_step", 12))
+        self.path_sample_rate = max(1, samples_per_second)
 
         self.current_safe_mask: Optional[np.ndarray] = None
         self.current_safe_prob: Optional[np.ndarray] = None
@@ -346,7 +345,12 @@ class NavigationPolicyInferenceNode:
         self.command_pub.publish(command_msg)
 
         offsets_msg = Float32MultiArray()
-        offsets_msg.data = [length_scale, math.degrees(pitch_offset), math.degrees(yaw_offset)]
+        offsets_msg.data = [
+            length_scale,
+            math.degrees(pitch_offset),
+            math.degrees(yaw_offset),
+            float(duration),
+        ]
         self.offset_pub.publish(offsets_msg)
 
         self._publish_trajectory(self.mask_header, path_points)
@@ -385,6 +389,9 @@ class NavigationPolicyInferenceNode:
         effective_speed = max(self.vel_max_train * max(speed_scale, 1e-3), 1e-3)
         return max(0.2, (2.0 * planning_radius) / effective_speed)
 
+    def _steps_from_duration(self, duration: float) -> int:
+        return max(3, int(math.ceil(duration * self.path_sample_rate)))
+
     def _limit_yaw_offset(self, yaw_offset: float, base_direction: np.ndarray) -> float:
         current_speed = max(float(np.linalg.norm(self._current_velocity())), self.default_speed)
         dt = self._primitive_duration(self.radio_range, self._speed_scale(current_speed))
@@ -408,10 +415,10 @@ class NavigationPolicyInferenceNode:
         final_direction_local: np.ndarray,
         commanded_speed: float,
         planning_radius: float,
+        duration: float,
         speed_scale: float,
         steps: int,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
-        duration = self._primitive_duration(planning_radius, speed_scale)
         final_dir_world = clamp_normalized(rotation.dot(final_direction_local))
         start_vel = self._current_velocity()
         start_acc = self._current_acceleration()
@@ -503,7 +510,7 @@ class NavigationPolicyInferenceNode:
             primitive_msg.vector.z = 0.0
             self.command_pub.publish(primitive_msg)
             offsets_msg = Float32MultiArray()
-            offsets_msg.data = [0.0, 0.0, 0.0]
+            offsets_msg.data = [0.0, 0.0, 0.0, 0.0]
             self.offset_pub.publish(offsets_msg)
 
     def _log_timing(self, start_time: float) -> None:
@@ -614,7 +621,9 @@ class NavigationPolicyInferenceNode:
         max_clearance: float,
     ) -> Optional[dict]:
         yaw_offset = self._limit_yaw_offset(yaw_offset, base_direction)
-        steps = max(2, self.primitive_steps)
+        planning_radius = self.radio_range * length_scale
+        duration = self._primitive_duration(planning_radius, speed_scale)
+        steps = self._steps_from_duration(duration)
         speed_scale = self._speed_scale(speed)
         directions = sample_yopo_directions(
             base_direction, yaw_offset, pitch_offset, 0.0, steps
@@ -660,7 +669,6 @@ class NavigationPolicyInferenceNode:
 
         # Build primitive points and kinematics
         commanded_speed = speed * length_scale
-        planning_radius = self.radio_range * length_scale
         (
             points,
             velocities,
@@ -674,6 +682,7 @@ class NavigationPolicyInferenceNode:
             directions[-1],
             commanded_speed,
             planning_radius,
+            duration,
             speed_scale,
             steps,
         )
@@ -783,7 +792,10 @@ class NavigationPolicyInferenceNode:
         planning_radius: float,
         directions: Optional[List[np.ndarray]] = None,
     ) -> np.ndarray:
-        steps = self.primitive_steps
+        duration = self._primitive_duration(
+            planning_radius, self._speed_scale(self.default_speed)
+        )
+        steps = self._steps_from_duration(duration)
         if directions is None:
             directions = sample_yopo_directions(
                 base_direction, yaw_offset, pitch_offset, 0.0, steps
@@ -841,8 +853,9 @@ class NavigationPolicyInferenceNode:
             self._publish_empty_trajectory(stamp)
             return
         unit_vector = unit_vector / norm
-        steps = max(2, self.primitive_steps)
-        step_length = self.default_speed / steps
+        duration = self._primitive_duration(self.radio_range, self._speed_scale(self.default_speed))
+        steps = self._steps_from_duration(duration)
+        step_length = self.default_speed / max(steps, 1)
 
         origin = np.array(
             [
