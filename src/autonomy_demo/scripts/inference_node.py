@@ -843,6 +843,8 @@ class InferenceNode:
             self.primitive_steps,
             self.primitive_steps * self.path_samples_per_step,
         )
+        desired_speed = max(self._current_speed(), 1e-3)
+        speed_scale = desired_speed / max(self.primitive_config.vel_max_train, 1e-3)
         target_distance = local_distance if local_distance is not None else goal_distance
         for sample in primitives:
             start_vel_body, start_acc_body = self._inherit_kinematics(rotation)
@@ -876,6 +878,8 @@ class InferenceNode:
                 goal_body,
                 duration_scale,
                 sample_count,
+                self.primitive_config,
+                speed_scale,
             )
             if points_body.size == 0:
                 continue
