@@ -273,10 +273,18 @@ class NavigationPolicyInferenceNode:
                 .unsqueeze(0)
                 .to(self.device)
             )
-            speed_norm = torch.tensor([(speed - 3.0) / 4.0], device=self.device, dtype=torch.float32)
+            speed_norm_value = (speed - 3.0) / 4.0
+            state_tensor = torch.zeros(
+                (1, self.policy.state_dim), device=self.device, dtype=torch.float32
+            )
+            state_tensor[:, 0] = speed_norm_value
             with torch.no_grad():
-                offsets = self.policy(mask_tensor, speed_norm)
-            length_delta, pitch_delta, yaw_delta = offsets.squeeze(0).cpu().numpy()
+                policy_out = self.policy(mask_tensor, state_tensor)
+            action, _ = (
+                policy_out if isinstance(policy_out, tuple) else (policy_out, None)
+            )
+            action_np = action.squeeze(0).cpu().numpy()
+            length_delta, pitch_delta, yaw_delta = action_np[0:3]
             length_est = float(np.clip(1.0 + 0.2 * length_delta, 0.5, 1.5))
             pitch_est = float(
                 np.clip(math.radians(15.0) * pitch_delta, -math.radians(15.0), math.radians(15.0))
