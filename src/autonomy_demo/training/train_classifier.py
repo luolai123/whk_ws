@@ -11,7 +11,6 @@ import numpy as np
 import cv2
 import torch
 import torch.nn.functional as F
-from torch.distributions import Normal
 from torch.utils.data import DataLoader, Dataset
 
 from autonomy_demo.safe_navigation import (
@@ -402,6 +401,7 @@ class NavigationDataset(Dataset):
             label = _normalize_label_array(_infer_label_map(first), None)
         self.height, self.width = label.shape
         self.target_hw: Tuple[int, int] = (self.height, self.width)
+        self._snapshot_cache: Dict[pathlib.Path, Dict[str, np.ndarray]] = {}
 
     def __len__(self) -> int:
         return len(self.files)
@@ -430,7 +430,19 @@ class NavigationDataset(Dataset):
                 "sphere_radii": _get("sphere_radii", np.empty((0,), dtype=np.float32)),
                 "box_centers": _get("box_centers", np.empty((0, 3), dtype=np.float32)),
                 "box_half_extents": _get("box_half_extents", np.empty((0, 3), dtype=np.float32)),
+                "box_rotations": _get("box_rotations", np.empty((0, 3, 3), dtype=np.float32)),
             }
+            env_dir = self.files[idx].parent
+            snapshot_path = env_dir / "world_snapshot.npz"
+            if snapshot_path.exists():
+                cached = self._snapshot_cache.get(snapshot_path)
+                if cached is None:
+                    with np.load(snapshot_path) as snapshot:
+                        cached = {key: snapshot[key].astype(np.float32) for key in snapshot.files}
+                    self._snapshot_cache[snapshot_path] = cached
+                for key in ("sphere_centers", "sphere_radii", "box_centers", "box_half_extents", "box_rotations"):
+                    if key in cached and cached[key].size:
+                        metadata[key] = cached[key]
         return safe_mask, distances, metadata
 
 
@@ -461,6 +473,137 @@ def _sample_goal_pixel(region: "SafeRegion", rng: random.Random) -> Tuple[float,
     return goal_row, goal_col
 
 
+def _quintic_coefficients_torch(
+    start_pos: torch.Tensor,
+    start_vel: torch.Tensor,
+    start_acc: torch.Tensor,
+    end_pos: torch.Tensor,
+    end_vel: torch.Tensor,
+    end_acc: torch.Tensor,
+    duration: torch.Tensor,
+) -> torch.Tensor:
+    """Torch-friendly quintic solver for端到端末端状态学习."""
+
+    duration = torch.clamp(duration, min=torch.tensor(1e-3, device=duration.device))
+    a0 = start_pos
+    a1 = start_vel
+    a2 = start_acc * 0.5
+
+    t1 = duration
+    t2 = t1 * t1
+    t3 = t2 * t1
+    t4 = t3 * t1
+    t5 = t4 * t1
+
+    rhs0 = end_pos - (a0 + a1 * t1 + a2 * t2)
+    rhs1 = end_vel - (a1 + 2.0 * a2 * t1)
+    rhs2 = end_acc - (2.0 * a2)
+
+    mat = torch.stack(
+        [
+            torch.stack([t3, t4, t5]),
+            torch.stack([3.0 * t2, 4.0 * t3, 5.0 * t4]),
+            torch.stack([6.0 * t1, 12.0 * t2, 20.0 * t3]),
+        ]
+    )
+    rhs = torch.stack([rhs0, rhs1, rhs2])
+    high_coeffs = torch.linalg.solve(mat, rhs)
+
+    coeffs = torch.zeros((6, 3), device=duration.device, dtype=duration.dtype)
+    coeffs[0] = a0
+    coeffs[1] = a1
+    coeffs[2] = a2
+    coeffs[3] = high_coeffs[0]
+    coeffs[4] = high_coeffs[1]
+    coeffs[5] = high_coeffs[2]
+    return coeffs
+
+
+def _sample_quintic_torch(
+    coeffs: torch.Tensor, duration: torch.Tensor, steps: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample quintic points/velocities with gradients preserved."""
+
+    steps = max(int(steps), 1)
+    duration = torch.clamp(duration, min=torch.tensor(1e-3, device=duration.device))
+    times = (
+        torch.arange(steps + 1, device=coeffs.device, dtype=coeffs.dtype)
+        / max(steps, 1)
+        * duration
+    )
+    powers = torch.stack([times**p for p in range(6)])  # (6, steps+1)
+    points = torch.einsum("pc,pt->tc", coeffs, powers)
+    vel_powers = torch.stack([p * (times ** (p - 1)) if p > 0 else torch.zeros_like(times) for p in range(6)])
+    velocities = torch.einsum("pc,pt->tc", coeffs, vel_powers)
+    return points, velocities
+
+
+def _compute_esdf_distance(points: torch.Tensor, metadata: Dict[str, Any]) -> torch.Tensor:
+    """Approximate ESDF using privileged obstacle snapshots."""
+
+    device = points.device
+    distances = torch.full((points.shape[0],), float("inf"), device=device)
+
+    sphere_centers = metadata.get("sphere_centers")
+    sphere_radii = metadata.get("sphere_radii")
+    if sphere_centers is not None and sphere_centers.numel() > 0:
+        diff = points[:, None, :] - sphere_centers[None, :, :]
+        sphere_dist = torch.linalg.norm(diff, dim=2) - sphere_radii[None, :]
+        distances = torch.minimum(distances, torch.min(sphere_dist, dim=1).values)
+
+    box_centers = metadata.get("box_centers")
+    box_half_extents = metadata.get("box_half_extents")
+    box_rotations = metadata.get("box_rotations")
+    if (
+        box_centers is not None
+        and box_half_extents is not None
+        and box_rotations is not None
+        and box_centers.numel() > 0
+    ):
+        rel = points[:, None, :] - box_centers[None, :, :]
+        local = torch.einsum("bij,pbj->pbi", box_rotations.transpose(1, 2), rel)
+        excess = torch.abs(local) - box_half_extents[None, :, :]
+        outside = torch.clamp(excess, min=0.0)
+        outside_norm = torch.linalg.norm(outside, dim=2)
+        inside = torch.clamp(torch.max(excess, dim=2).values, max=0.0)
+        box_dist = outside_norm + inside
+        distances = torch.minimum(distances, torch.min(box_dist, dim=1).values)
+
+    return distances
+
+
+def _metadata_to_torch(metadata: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    """Move特权场景几何到 GPU/CPU，供 ESDF & 末端状态 head 反传."""
+
+    result: Dict[str, Any] = {}
+    for key in (
+        "sphere_centers",
+        "sphere_radii",
+        "box_centers",
+        "box_half_extents",
+        "box_rotations",
+    ):
+        arr = metadata.get(key)
+        if arr is None:
+            continue
+        tensor = torch.as_tensor(arr, device=device, dtype=torch.float32)
+        result[key] = tensor
+    return result
+
+
+def _compute_duration_torch(goal_body: torch.Tensor, config: PrimitiveConfig, duration_scale: torch.Tensor) -> torch.Tensor:
+    """Differentiable版本的路径时长 T = 2R / (v_max * α)。"""
+
+    radius = torch.linalg.norm(goal_body)
+    effective_speed = torch.clamp(
+        torch.tensor(config.vel_max_train, device=goal_body.device, dtype=goal_body.dtype),
+        min=1e-3,
+    )
+    duration = (2.0 * radius) / effective_speed
+    duration = duration * duration_scale
+    return torch.clamp(duration, min=0.2)
+
+
 class SafeNavigationPolicy(torch.nn.Module):
     def __init__(self, height: int, width: int, state_dim: int = 8) -> None:
         super().__init__()
@@ -476,16 +619,22 @@ class SafeNavigationPolicy(torch.nn.Module):
             torch.nn.ReLU(inplace=True),
         )
         self.global_pool = torch.nn.AdaptiveAvgPool2d(1)
-        self.fc1 = torch.nn.Linear(64 + state_dim, 64)
-        self.fc2 = torch.nn.Linear(64, 4)
+        fusion_dim = 128
+        self.fc1 = torch.nn.Linear(64 + state_dim, fusion_dim)
+        self.action_head = torch.nn.Linear(fusion_dim, 4)
+        # 末端状态 head：Δp(3) + v_T(3) + a_T(3)
+        self.end_state_head = torch.nn.Linear(fusion_dim, 9)
 
-    def forward(self, mask: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, mask: torch.Tensor, state: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.backbone(mask)
         pooled = self.global_pool(features).view(mask.size(0), -1)
         combined = torch.cat([pooled, state], dim=1)
         hidden = F.relu(self.fc1(combined))
-        output = torch.tanh(self.fc2(hidden))
-        return output
+        action = torch.tanh(self.action_head(hidden))
+        end_state = torch.tanh(self.end_state_head(hidden))
+        return action, end_state
 
 
 class SegmentationLoss(torch.nn.Module):
@@ -662,7 +811,6 @@ def train_navigation_policy(
         ],
         dtype=np.float32,
     )
-    body_to_camera = camera_to_body.T
     rng = np.random.default_rng(seed or None)
     indices = list(range(len(dataset)))
 
@@ -702,15 +850,6 @@ def train_navigation_policy(
                 goal_direction_camera = compute_direction_from_pixel(
                     goal_col, goal_row, dataset.width, dataset.height, 120.0
                 ).astype(np.float32)
-                clearance_map = cv2.distanceTransform(
-                    (noisy_mask > 0.5).astype(np.uint8), cv2.DIST_L2, 5
-                ).astype(np.float32)
-                max_clearance = float(np.max(clearance_map))
-                if max_clearance > 1e-6:
-                    clearance_norm = clearance_map / max_clearance
-                else:
-                    clearance_norm = clearance_map
-
                 base_direction_camera = compute_direction_from_pixel(
                     center_col, center_row, dataset.width, dataset.height, 120.0
                 ).astype(np.float32)
@@ -734,167 +873,81 @@ def train_navigation_policy(
                 enriched_state = np.concatenate([state_vec, goal_features]).astype(np.float32)
                 state_tensor = torch.from_numpy(enriched_state).unsqueeze(0).to(device=device)
 
-                outputs = policy(mask_tensor, state_tensor)
-                # 使用带噪策略输出，允许对不可微奖励应用 REINFORCE（log_prob）梯度
-                action_std = torch.full_like(outputs[0], 0.1)
-                action_dist = Normal(outputs[0], action_std)
-                sampled_action = action_dist.rsample()
-                log_prob = action_dist.log_prob(sampled_action).sum()
+                action_out, end_state = policy(mask_tensor, state_tensor)
+                offset_raw = action_out[0, 0:3]
+                duration_delta = action_out[0, 3]
+                duration_scale = torch.clamp(1.0 + 0.2 * duration_delta, 0.7, 1.3)
 
-                offset_raw = sampled_action[0:3]
-                duration_delta = sampled_action[3]
-                duration_scale = torch.clamp(
-                    1.0 + 0.2 * duration_delta,
-                    0.7,
-                    1.3,
+                base_goal_body = (
+                    torch.from_numpy(sample.goal_direction_body * sample.goal_length)
+                    .to(device=device, dtype=torch.float32)
                 )
-                offset_vec = offset_raw.detach().cpu().numpy() * primitive_config.radio_range
-                goal_body = apply_goal_offset(sample, offset_vec, primitive_config)
-                duration_nominal = compute_primitive_duration(
-                    goal_body,
-                    primitive_config,
-                    1.0,
-                    float(duration_scale.detach().cpu()),
+                goal_body = base_goal_body + offset_raw * primitive_config.radio_range
+
+                delta_p = end_state[0, 0:3] * (primitive_config.radio_range * 0.5)
+                end_vel = end_state[0, 3:6] * primitive_config.vel_max_train
+                end_acc = end_state[0, 6:9] * primitive_config.acc_max_train
+                end_pos = goal_body + delta_p
+
+                duration_t = _compute_duration_torch(goal_body, primitive_config, duration_scale)
+                sample_count = max(2, int(math.ceil(float(duration_t.detach().cpu()) * samples_per_second)))
+
+                start_vel = torch.from_numpy(sample.start_vel_body).to(device=device, dtype=torch.float32)
+                start_acc = torch.from_numpy(sample.start_acc_body).to(device=device, dtype=torch.float32)
+
+                coeffs = _quintic_coefficients_torch(
+                    torch.zeros(3, device=device, dtype=torch.float32),
+                    start_vel,
+                    start_acc,
+                    end_pos,
+                    end_vel,
+                    end_acc,
+                    duration_t,
                 )
-                sample_count = max(2, int(math.ceil(duration_nominal * samples_per_second)))
-                points_np, velocities_np, duration_val = primitive_quintic_trajectory(
-                    sample,
-                    goal_body,
-                    float(duration_scale.detach().cpu()),
-                    sample_count,
-                    primitive_config,
+                points_t, velocities_t = _sample_quintic_torch(
+                    coeffs, duration_t, sample_count
                 )
-                if points_np.size == 0:
+                if points_t.numel() == 0:
                     continue
 
-                origin_body = np.zeros(3, dtype=np.float32)
-                _, _, normalized_goal_vec = normalize_navigation_inputs(
-                    origin_body, velocities_np[-1], goal_body, primitive_config
+                normalized_goal_vec = goal_body / torch.clamp(
+                    torch.linalg.norm(goal_body), min=torch.tensor(1e-6, device=device)
                 )
-                _, _, normalized_endpoint = normalize_navigation_inputs(
-                    origin_body, velocities_np[-1], points_np[-1], primitive_config
+                normalized_endpoint = points_t[-1] / torch.clamp(
+                    torch.linalg.norm(points_t[-1]), min=torch.tensor(1e-6, device=device)
                 )
-                normalized_goal_error = float(
-                    np.linalg.norm(normalized_endpoint - normalized_goal_vec)
-                )
+                normalized_goal_error = torch.norm(normalized_endpoint - normalized_goal_vec)
 
-                safety_hits: List[float] = []
-                clearance_values: List[float] = []
-                smoothness_sum = 0.0
-                prev_dir: Optional[np.ndarray] = None
-                last_col = center_col
-                last_row = center_row
-                for point in points_np[1:]:
-                    direction_body = clamp_normalized(point)
-                    direction_camera = body_to_camera.dot(direction_body)
-                    col_pix, row_pix = project_direction_to_pixel(
-                        direction_camera,
-                        dataset.width,
-                        dataset.height,
-                        120.0,
-                    )
-                    last_col, last_row = col_pix, row_pix
-                    col_i = int(round(col_pix))
-                    row_i = int(round(row_pix))
-                    if 0 <= row_i < dataset.height and 0 <= col_i < dataset.width:
-                        safety_hits.append(float(noisy_mask[row_i, col_i]))
-                        clearance_values.append(float(clearance_norm[row_i, col_i]))
-                    else:
-                        safety_hits.append(0.0)
-                        clearance_values.append(0.0)
-                    if prev_dir is not None:
-                        smoothness_sum += max(
-                            -1.0, min(1.0, float(np.dot(prev_dir, direction_body)))
-                        )
-                    prev_dir = direction_body
+                dt = duration_t / torch.tensor(
+                    max(sample_count, 1), device=device, dtype=torch.float32
+                )
+                vel = torch.diff(points_t, dim=0) / torch.clamp(dt, min=1e-3)
+                acc = torch.diff(vel, dim=0) / torch.clamp(dt, min=1e-3)
+                jerk = torch.diff(acc, dim=0) / torch.clamp(dt, min=1e-3)
+                Js = torch.sum(jerk ** 2) * dt
 
-                if not safety_hits:
-                    continue
+                metadata_torch = _metadata_to_torch(_metadata, device)
+                esdf = _compute_esdf_distance(points_t, metadata_torch)
+                clearance_penalty = F.relu(0.2 - esdf)
+                Jc = torch.mean(clearance_penalty**2)
 
-                safety_ratio = sum(safety_hits) / len(safety_hits)
-                clearance_min = max(0.0, min(clearance_values))
-                if safety_ratio < 0.45 or clearance_min < 0.05:
-                    continue
+                Jg = torch.mean((points_t[-1] - goal_body) ** 2)
 
-                smoothness_score = max(
-                    0.0,
-                    min(1.0, (smoothness_sum / max(len(safety_hits) - 1, 1) + 1.0) * 0.5),
-                )
-                goal_error = math.sqrt((last_col - goal_col) ** 2 + (last_row - goal_row) ** 2)
-                goal_direction_camera = compute_direction_from_pixel(
-                    goal_col,
-                    goal_row,
-                    dataset.width,
-                    dataset.height,
-                    120.0,
-                )
-                final_direction = clamp_normalized(points_np[-1])
-                final_cam = body_to_camera.dot(final_direction)
-                goal_alignment = float(
-                    max(-1.0, min(1.0, np.dot(clamp_normalized(final_cam), goal_direction_camera)))
-                )
-                jerk_dt = duration_val / max(sample_count - 1, 1)
-                jerk_metric_val = jerk_score(points_np, jerk_dt)
-                orientation_metric_val = orientation_rate_score(velocities_np)
-                goal_heading = clamp_normalized(goal_body)
-                path_heading = clamp_normalized(points_np[-1])
-                heading_alignment = float(
-                    max(-1.0, min(1.0, np.dot(goal_heading, path_heading)))
-                )
-
-                safety_score = torch.tensor(safety_ratio, device=device, dtype=torch.float32)
-                clearance_score = torch.tensor(
-                    min(1.0, clearance_min), device=device, dtype=torch.float32
-                )
-                goal_score = torch.exp(
-                    -torch.tensor(goal_error / diag, device=device, dtype=torch.float32)
-                )
-                goal_alignment_score = torch.tensor(
-                    (goal_alignment + 1.0) * 0.5, device=device, dtype=torch.float32
-                )
-                smoothness_score_t = torch.tensor(
-                    smoothness_score, device=device, dtype=torch.float32
-                )
-                jerk_score_t = torch.tensor(
-                    max(0.0, min(1.0, jerk_metric_val)), device=device, dtype=torch.float32
-                )
-                orientation_score_t = torch.tensor(
-                    max(0.0, min(1.0, orientation_metric_val)),
-                    device=device,
-                    dtype=torch.float32,
-                )
-                heading_alignment_score = torch.tensor(
-                    (heading_alignment + 1.0) * 0.5, device=device, dtype=torch.float32
-                )
-                normalized_goal_penalty = torch.tensor(
-                    min(0.25, normalized_goal_error * 0.2),
-                    device=device,
-                    dtype=torch.float32,
-                )
-
-                reward = (
-                    0.45 * safety_score
-                    + 0.2 * clearance_score
-                    + 0.18 * goal_score
-                    + 0.1 * goal_alignment_score
-                    + 0.05 * heading_alignment_score
-                    + 0.05 * smoothness_score_t
-                    + 0.03 * jerk_score_t
-                    + 0.02 * orientation_score_t
-                    - 1.2 * normalized_goal_penalty
-                )
-                reward_tensor = reward.detach()
-                loss = -reward_tensor * log_prob
+                loss = 0.6 * Jc + 0.25 * Js + 0.15 * Jg
                 batch_loss += loss
                 valid_samples += 1
 
-                metrics_accumulator["safety"] += safety_ratio
-                metrics_accumulator["clearance"] += clearance_min
-                metrics_accumulator["goal"] += float(goal_score.detach().cpu())
-                metrics_accumulator["goal_alignment"] += (goal_alignment + 1.0) * 0.5
-                metrics_accumulator["smoothness"] += smoothness_score
-                metrics_accumulator["jerk"] += jerk_metric_val
-                metrics_accumulator["orientation"] += orientation_metric_val
+                metrics_accumulator["safety"] += float(torch.mean((esdf > 0.0).float()).item())
+                metrics_accumulator["clearance"] += float(torch.mean(esdf).item())
+                metrics_accumulator["goal"] += float(Jg.detach().cpu())
+                metrics_accumulator["goal_alignment"] += float(
+                    normalized_goal_error.detach().cpu()
+                )
+                metrics_accumulator["smoothness"] += float(Js.detach().cpu())
+                metrics_accumulator["jerk"] += float(torch.max(torch.linalg.norm(jerk, dim=1)).item())
+                metrics_accumulator["orientation"] += float(
+                    torch.linalg.norm(end_vel).detach().cpu()
+                )
 
                 epoch_count += 1
 
@@ -912,7 +965,7 @@ def train_navigation_policy(
                 key: value / epoch_count for key, value in metrics_accumulator.items()
             }
             print(
-                "Policy epoch {}/{} - avg loss: {:.4f}, safety: {:.3f}, clearance: {:.3f}, goal: {:.3f}, align: {:.3f}, smoothness: {:.3f}, jerk: {:.3f}, orientation: {:.3f}".format(
+                "Policy epoch {}/{} - avg loss: {:.4f}, clearance_hit: {:.3f}, clearance_mean: {:.3f}, Jg: {:.4f}, goal_norm_err: {:.4f}, Js: {:.4f}, jerk_peak: {:.4f}, |v_T|: {:.3f}".format(
                     epoch + 1,
                     epochs,
                     avg_loss,
