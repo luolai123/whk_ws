@@ -622,9 +622,9 @@ class NavigationPolicyInferenceNode:
     ) -> Optional[dict]:
         yaw_offset = self._limit_yaw_offset(yaw_offset, base_direction)
         planning_radius = self.radio_range * length_scale
+        speed_scale = self._speed_scale(speed)
         duration = self._primitive_duration(planning_radius, speed_scale)
         steps = self._steps_from_duration(duration)
-        speed_scale = self._speed_scale(speed)
         directions = sample_yopo_directions(
             base_direction, yaw_offset, pitch_offset, 0.0, steps
         )
