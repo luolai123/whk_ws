@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import cv2
@@ -1046,3 +1046,91 @@ class Poly5Solver:
             jerk += power * (power - 1) * (power - 2) * coeffs[power] * (t ** (power - 3))
 
         return pos, vel, acc, jerk
+
+
+def generate_axis_poly5_solvers(
+    start_pos: np.ndarray,
+    start_vel: np.ndarray,
+    start_acc: np.ndarray,
+    end_pos: np.ndarray,
+    end_vel: np.ndarray,
+    end_acc: np.ndarray,
+    duration: float,
+) -> Dict[str, Tuple[Poly5Solver, np.ndarray]]:
+    """Instantiate per-axis quintic solvers and coefficients.
+
+    Each axis is solved independently to build three 1D quintic polynomials,
+    which can later be recombined into a smooth 3D trajectory.
+    """
+
+    start_pos = np.asarray(start_pos, dtype=np.float32)
+    start_vel = np.asarray(start_vel, dtype=np.float32)
+    start_acc = np.asarray(start_acc, dtype=np.float32)
+    end_pos = np.asarray(end_pos, dtype=np.float32)
+    end_vel = np.asarray(end_vel, dtype=np.float32)
+    end_acc = np.asarray(end_acc, dtype=np.float32)
+
+    duration = max(float(duration), 1e-3)
+
+    solvers: Dict[str, Tuple[Poly5Solver, np.ndarray]] = {}
+    for axis_idx, axis_name in enumerate(("x", "y", "z")):
+        solver = Poly5Solver(duration=duration)
+        coeffs = quintic_coefficients(
+            np.array([start_pos[axis_idx], 0.0, 0.0], dtype=np.float32),
+            np.array([start_vel[axis_idx], 0.0, 0.0], dtype=np.float32),
+            np.array([start_acc[axis_idx], 0.0, 0.0], dtype=np.float32),
+            np.array([end_pos[axis_idx], 0.0, 0.0], dtype=np.float32),
+            np.array([end_vel[axis_idx], 0.0, 0.0], dtype=np.float32),
+            np.array([end_acc[axis_idx], 0.0, 0.0], dtype=np.float32),
+            duration,
+        )[:, 0]
+        solvers[axis_name] = (solver, coeffs)
+
+    return solvers
+
+
+def combine_axis_poly5_trajectory(
+    axis_solvers: Dict[str, Tuple[Poly5Solver, np.ndarray]], steps: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """Recombine per-axis quintics into a unified 3D trajectory.
+
+    Returns position, velocity, acceleration, and jerk samples plus the common
+    trajectory duration. All axis solvers must share the same duration.
+    """
+
+    if not axis_solvers:
+        raise ValueError("No axis solvers provided")
+
+    durations = {solver.duration for solver, _ in axis_solvers.values()}
+    if len(durations) != 1:
+        raise ValueError("Axis solvers must share a common duration")
+    duration = durations.pop()
+
+    steps = max(1, int(steps))
+    times = np.linspace(0.0, duration, steps + 1, dtype=np.float32)
+
+    positions = np.zeros((steps + 1, 3), dtype=np.float32)
+    velocities = np.zeros_like(positions)
+    accelerations = np.zeros_like(positions)
+    jerks = np.zeros_like(positions)
+
+    axis_to_index = {"x": 0, "y": 1, "z": 2}
+
+    for axis_name, (solver, coeffs) in axis_solvers.items():
+        if axis_name not in axis_to_index:
+            raise ValueError(f"Unexpected axis name: {axis_name}")
+        idx = axis_to_index[axis_name]
+        coeffs = np.asarray(coeffs, dtype=np.float32)
+
+        for power in range(6):
+            positions[:, idx] += coeffs[power] * (times**power)
+        for power in range(1, 6):
+            velocities[:, idx] += power * coeffs[power] * (times ** (power - 1))
+        for power in range(2, 6):
+            accelerations[:, idx] += power * (power - 1) * coeffs[power] * (times ** (power - 2))
+        for power in range(3, 6):
+            jerks[:, idx] += (
+                power * (power - 1) * (power - 2) * coeffs[power] * (times ** (power - 3))
+            )
+
+    return positions, velocities, accelerations, jerks, duration
