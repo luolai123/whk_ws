@@ -27,7 +27,6 @@ from autonomy_demo.safe_navigation import (
     jerk_score,
     orientation_rate_score,
     path_smoothness,
-    project_direction_to_pixel,
     sample_yopo_directions,
 )
 
@@ -40,7 +39,6 @@ from train_classifier import (
     SafeNavigationPolicy,
     add_noise,
     apply_offsets_torch,
-    compute_ray_safety,
     quaternion_to_matrix,
 )
 
@@ -207,6 +205,7 @@ def train_navigation_policy(
     yaw_limit    = torch.tensor(math.radians(15.0), device=device, dtype=torch.float32)
     diag_t       = torch.tensor(math.sqrt(dataset.width ** 2 + dataset.height ** 2), device=device, dtype=torch.float32)
     smooth_weight = 0.3
+    safety_decay = torch.tensor(0.35, device=device, dtype=torch.float32)
 
     # AMP scaler
     scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
@@ -297,12 +296,6 @@ def train_navigation_policy(
 
                 clearance_center = _bilinear(cache.clr_t)
 
-                # ---- 世界坐标系下的安全射线评估 ----
-                world_direction = cache.rotation_t.matmul(rotated_dir)
-                world_direction = world_direction / torch.linalg.norm(world_direction)
-                safety_ray = compute_ray_safety(world_direction, cache.origin_t, cache.centers_t, cache.radii_t, max_range)
-                safety_score = torch.clamp(safety_ray / max_range, 0.0, 1.0)
-
                 # ---- 目标性（偏离中心像素的距离）----
                 goal_distance = torch.sqrt((col - cache.center_col_t) ** 2 + (row - cache.center_row_t) ** 2)
                 goal_score    = torch.exp(-(goal_distance / diag_t))
@@ -333,7 +326,15 @@ def train_navigation_policy(
                 smooth_steps = max(3, len(dirs))
                 fractions = torch.linspace(0.0, 1.0, smooth_steps, device=device)
                 dirs_t = []
-                segment_dt = max(sample.duration / max(smooth_steps - 1, 1), 1e-3)
+                traj_duration = torch.clamp(
+                    (2.0 * max_range) / torch.clamp(commanded_speed, min=1.0),
+                    min=0.5,
+                    max=5.0,
+                )
+                segment_dt = torch.clamp(
+                    traj_duration / max(smooth_steps - 1, 1),
+                    min=torch.tensor(1e-3, device=device, dtype=torch.float32),
+                )
                 for frac in fractions:
                     direction_t = apply_offsets_torch(
                         cache.base_dir_t, yaw_offset * frac, pitch_offset * frac
@@ -355,62 +356,81 @@ def train_navigation_policy(
                     smoothing_term = 0.5 * smooth_loss + 0.5 * jerk_loss
                 else:
                     smoothing_term = torch.tensor(0.0, device=device, dtype=torch.float32)
-                points = [np.zeros(3, dtype=np.float32)]
-                for direction in dirs:
-                    points.append(points[-1] + direction)
 
-                # 从预缓存的 clr_np 读取沿路线的最小 clearance 值（无需重新 distanceTransform）
-                clr_vals: List[float] = []
-                for direction in dirs:
-                    col_dir, row_dir = project_direction_to_pixel(direction, dataset.width, dataset.height, fov_deg)
-                    ci, ri = int(round(col_dir)), int(round(row_dir))
-                    if 0 <= ci < dataset.width and 0 <= ri < dataset.height:
-                        clr_vals.append(float(cache.clr_np[ri, ci]))
-                    else:
-                        clr_vals.append(0.0)
-                if clr_vals:
-                    min_clearance_val = max(0.0, min(clr_vals))
-                else:
-                    min_clearance_val = float(clearance_center.detach().cpu().item())
-                clearance_score = torch.tensor(min(1.0, max(0.0, min_clearance_val)), device=device, dtype=torch.float32)
+            # ---- 基于 mask / clearance 的 2D 势场积分 ----
+            traj_steps = max(len(dirs_t), 1)
+            grid_dirs = torch.stack(dirs_t, dim=0) if dirs_t else rotated_dir.unsqueeze(0)
+            horiz_all = torch.atan2(grid_dirs[:, 1], grid_dirs[:, 0])
+            vert_all = torch.atan2(
+                grid_dirs[:, 2],
+                torch.sqrt(grid_dirs[:, 0] * grid_dirs[:, 0] + grid_dirs[:, 1] * grid_dirs[:, 1]),
+            )
+            u_all = torch.clamp(torch.tan(horiz_all) / tan_half_h_t, -1.0, 1.0)
+            v_all = torch.clamp(torch.tan(vert_all) / tan_half_v_t, -1.0, 1.0)
+            cols_all = ((u_all + 1.0) * 0.5) * dataset.width - 0.5
+            rows_all = (1.0 - (v_all + 1.0) * 0.5) * dataset.height - 0.5
+            norm_w = torch.tensor(max(dataset.width - 1, 1), device=device, dtype=torch.float32)
+            norm_h = torch.tensor(max(dataset.height - 1, 1), device=device, dtype=torch.float32)
+            grid_x = (cols_all / norm_w) * 2.0 - 1.0
+            grid_y = (rows_all / norm_h) * 2.0 - 1.0
+            grid = torch.stack([grid_x, grid_y], dim=1).view(1, traj_steps, 1, 2)
 
-                # jerk / orientation（与原逻辑一致）
-                jerk_dt = sample.duration / max(len(points) - 1, 1)
-                jerk_metric_val = jerk_score(points, jerk_dt)
-                jerk_score_t    = torch.tensor(float(max(0.0, min(1.0, jerk_metric_val))), device=device, dtype=torch.float32)
-                orientation_metric_val = orientation_rate_score(dirs)
-                orientation_score_t    = torch.tensor(float(max(0.0, min(1.0, orientation_metric_val))), device=device, dtype=torch.float32)
+            mask_samples = F.grid_sample(mask_tensor, grid, align_corners=True).view(-1)
+            clr_field = cache.clr_t.unsqueeze(0).unsqueeze(0)
+            clr_samples = F.grid_sample(clr_field, grid, align_corners=True).view(-1)
 
-                # ---- 奖励 & 损失（与原脚本权重一致）----
-                reward = (
-                    0.45 * safety_score
-                    + 0.20 * clearance_score
-                    + 0.18 * goal_score
-                    + 0.06 * smoothness_score
-                    + 0.04 * jerk_score_t
-                    + 0.04 * orientation_score_t
-                    + 0.02 * stability_score
-                    + 0.01 * speed_score
-                )
-                reward_loss = -reward
-                loss = reward_loss + smooth_weight * smoothing_term
+            potential_mask = 1.0 - mask_samples
+            potential_dist = torch.exp(-torch.clamp(clr_samples, min=0.0) / safety_decay)
+            traj_dt = traj_duration / max(traj_steps, 1)
+            traj_cost = torch.sum((0.5 * potential_mask + 0.5 * potential_dist) * traj_dt)
+            safety_score = torch.exp(-traj_cost / torch.clamp(traj_duration, min=1e-3))
 
-                # 反传（AMP）
-                scaler.scale(loss).backward()
-                batch_loss_accum += float(loss.detach().cpu().item())
-                valid_samples += 1
+            if clr_samples.numel() > 0:
+                clearance_score = torch.clamp(torch.mean(clr_samples), 0.0, 1.0)
+            else:
+                clearance_score = torch.clamp(clearance_center, 0.0, 1.0)
 
-                # 统计指标（与原脚本一致）
-                metrics_acc["safety"]      += float(safety_score.detach().cpu())
-                metrics_acc["clearance"]   += float(clearance_score.detach().cpu())
-                metrics_acc["goal"]        += float(goal_score.detach().cpu())
-                metrics_acc["stability"]   += float(stability_score.detach().cpu())
-                metrics_acc["speed"]       += float(speed_score.detach().cpu())
-                metrics_acc["jerk"]        += float(jerk_metric_val)
-                metrics_acc["orientation"] += float(orientation_metric_val)
-                metrics_acc["smoothness"]  += path_smoothness(points)
-                metrics_acc["smooth_penalty"] += float(smoothing_term.detach().cpu())
-                epoch_count += 1
+            points = [np.zeros(3, dtype=np.float32)]
+            for direction in dirs:
+                points.append(points[-1] + direction)
+
+            # jerk / orientation（与原逻辑一致）
+            jerk_dt = float(traj_duration.detach().cpu()) / max(len(points) - 1, 1)
+            jerk_metric_val = jerk_score(points, jerk_dt)
+            jerk_score_t    = torch.tensor(float(max(0.0, min(1.0, jerk_metric_val))), device=device, dtype=torch.float32)
+            orientation_metric_val = orientation_rate_score(dirs)
+            orientation_score_t    = torch.tensor(float(max(0.0, min(1.0, orientation_metric_val))), device=device, dtype=torch.float32)
+
+            # ---- 奖励 & 损失（与原脚本权重一致）----
+            reward = (
+                0.45 * safety_score
+                + 0.20 * clearance_score
+                + 0.18 * goal_score
+                + 0.06 * smoothness_score
+                + 0.04 * jerk_score_t
+                + 0.04 * orientation_score_t
+                + 0.02 * stability_score
+                + 0.01 * speed_score
+            )
+            reward_loss = -reward
+            loss = reward_loss + smooth_weight * smoothing_term
+
+            # 反传（AMP）
+            scaler.scale(loss).backward()
+            batch_loss_accum += float(loss.detach().cpu().item())
+            valid_samples += 1
+
+            # 统计指标（与原脚本一致）
+            metrics_acc["safety"]      += float(safety_score.detach().cpu())
+            metrics_acc["clearance"]   += float(clearance_score.detach().cpu())
+            metrics_acc["goal"]        += float(goal_score.detach().cpu())
+            metrics_acc["stability"]   += float(stability_score.detach().cpu())
+            metrics_acc["speed"]       += float(speed_score.detach().cpu())
+            metrics_acc["jerk"]        += float(jerk_metric_val)
+            metrics_acc["orientation"] += float(orientation_metric_val)
+            metrics_acc["smoothness"]  += path_smoothness(points)
+            metrics_acc["smooth_penalty"] += float(smoothing_term.detach().cpu())
+            epoch_count += 1
 
             if valid_samples == 0:
                 # 该 batch 没有有效样本
