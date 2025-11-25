@@ -322,6 +322,7 @@ class NavigationPolicyInferenceNode:
         if final_world_direction is None:
             final_world_direction = clamp_normalized(rotation.dot(final_direction_local))
         commanded_speed = speed * length_scale
+        duration = float(candidate.get("poly_duration", 0.0))
 
         command_vector_world = final_world_direction * commanded_speed
         if path_points.shape[0] >= 2:
@@ -407,6 +408,39 @@ class NavigationPolicyInferenceNode:
         )
         limited_offset = float(np.clip(limited_yaw - yaw_base, -max_change, max_change))
         return limited_offset
+
+    def _smooth_directions(self, directions: List[np.ndarray]) -> List[np.ndarray]:
+        if len(directions) < 2:
+            return directions
+        smoothed: List[np.ndarray] = [directions[0]]
+        # Low-pass filter to avoid abrupt heading transitions that produce overshoot
+        alpha = 0.35
+        for direction in directions[1:]:
+            blended = clamp_normalized(alpha * direction + (1.0 - alpha) * smoothed[-1])
+            smoothed.append(blended)
+        return smoothed
+
+    def _dynamic_slowdown(
+        self,
+        yaw_offset: float,
+        pitch_offset: float,
+        min_clearance: float,
+        max_clearance: float,
+        planning_radius: float,
+    ) -> float:
+        yaw_limit = math.radians(15.0)
+        pitch_limit = math.radians(15.0)
+        heading_penalty = max(abs(yaw_offset) / max(yaw_limit, 1e-6), abs(pitch_offset) / max(pitch_limit, 1e-6))
+
+        clearance_penalty = 0.0
+        if max_clearance > 0.0:
+            clearance_target = max(self.min_clearance_px * 2.0, 1e-3)
+            clearance_penalty = max(0.0, 1.0 - min_clearance / clearance_target)
+
+        response_penalty = 0.5 * heading_penalty + 0.35 * clearance_penalty
+        range_penalty = max(0.0, planning_radius - self.radio_range) / max(self.radio_range, 1e-3)
+        total_penalty = min(1.5, response_penalty + 0.15 * range_penalty)
+        return float(np.clip(1.0 - total_penalty, 0.35, 1.0))
 
     def _build_poly_trajectory(
         self,
@@ -625,37 +659,48 @@ class NavigationPolicyInferenceNode:
         speed_scale = self._speed_scale(speed)
         duration = self._primitive_duration(planning_radius, speed_scale)
         steps = self._steps_from_duration(duration)
-        directions = sample_yopo_directions(
-            base_direction, yaw_offset, pitch_offset, 0.0, steps
-        )
-        if directions:
-            dir_array = smooth_trajectory(np.stack(directions, axis=0), self.primitive_smooth_window)
-            directions = [clamp_normalized(vec) for vec in dir_array]
+
+        def build_directions(step_count: int) -> List[np.ndarray]:
+            sampled = sample_yopo_directions(
+                base_direction, yaw_offset, pitch_offset, 0.0, step_count
+            )
+            if sampled:
+                dir_array = smooth_trajectory(
+                    np.stack(sampled, axis=0), self.primitive_smooth_window
+                )
+                sampled = [clamp_normalized(vec) for vec in dir_array]
+                sampled = self._smooth_directions(sampled)
+            return sampled
+
+        def evaluate_directions(directions: List[np.ndarray]) -> Tuple[float, float, float]:
+            min_prob_eval = 1.0
+            min_clearance_eval = max_clearance if max_clearance > 0.0 else 0.0
+            collision = 0
+            for direction in directions:
+                col, row = project_direction_to_pixel(direction, width, height, fov_deg)
+                if not (0.0 <= col < width and 0.0 <= row < height):
+                    return 0.0, 0.0, 1.0
+                col_idx = int(round(col))
+                row_idx = int(round(row))
+                if not (0 <= col_idx < width and 0 <= row_idx < height):
+                    return 0.0, 0.0, 1.0
+                inside_safe = bool(safe_mask[row_idx, col_idx])
+                if not inside_safe:
+                    collision += 1
+                prob = float(safe_prob[row_idx, col_idx])
+                min_prob_eval = min(min_prob_eval, prob)
+                if max_clearance > 0.0:
+                    clearance = float(distance_field[row_idx, col_idx])
+                    min_clearance_eval = min(min_clearance_eval, clearance)
+
+            collision_rate_eval = collision / float(max(1, len(directions)))
+            return min_prob_eval, min_clearance_eval, collision_rate_eval
+
+        directions = build_directions(steps)
         if not directions:
             return None
 
-        # Evaluate along YOPO directions on image grid
-        min_prob = 1.0
-        min_clearance = max_clearance if max_clearance > 0.0 else 0.0
-        collision_count = 0
-        for direction in directions:
-            col, row = project_direction_to_pixel(direction, width, height, fov_deg)
-            if not (0.0 <= col < width and 0.0 <= row < height):
-                return None
-            col_idx = int(round(col))
-            row_idx = int(round(row))
-            if not (0 <= col_idx < width and 0 <= row_idx < height):
-                return None
-            inside_safe = bool(safe_mask[row_idx, col_idx])
-            if not inside_safe:
-                collision_count += 1
-            prob = float(safe_prob[row_idx, col_idx])
-            min_prob = min(min_prob, prob)
-            if max_clearance > 0.0:
-                clearance = float(distance_field[row_idx, col_idx])
-                min_clearance = min(min_clearance, clearance)
-
-        collision_rate = collision_count / float(max(1, len(directions)))
+        min_prob, min_clearance, collision_rate = evaluate_directions(directions)
 
         # One-vote veto on safety (probability, min clearance, collision)
         prob_threshold = max(self.safe_threshold, self.prob_threshold)
@@ -667,8 +712,21 @@ class NavigationPolicyInferenceNode:
             if min_clearance < self.min_clearance_px:
                 min_clearance = 0.0
 
+        slowdown = self._dynamic_slowdown(
+            yaw_offset, pitch_offset, min_clearance, max_clearance, planning_radius
+        )
+        planning_radius = planning_radius * (0.7 + 0.3 * slowdown)
+        duration = self._primitive_duration(planning_radius, speed_scale * slowdown)
+        steps = self._steps_from_duration(duration)
+        directions = build_directions(steps)
+        if not directions:
+            return None
+        min_prob, min_clearance, collision_rate = evaluate_directions(directions)
+        if (min_prob < prob_threshold) or (min_clearance < self.min_clearance_px) or (collision_rate > 0.0):
+            return None
+
         # Build primitive points and kinematics
-        commanded_speed = speed * length_scale
+        commanded_speed = speed * length_scale * slowdown
         (
             points,
             velocities,
@@ -723,6 +781,10 @@ class NavigationPolicyInferenceNode:
             + abs(yaw_offset) / yaw_limit
         ) / 3.0
         stability_score = math.exp(-max(0.0, stability_penalty))
+        aggressiveness_penalty = (
+            max(abs(yaw_offset) / yaw_limit, abs(pitch_offset) / pitch_limit)
+        ) * max(0.0, 1.0 - clearance_norm)
+        aggressiveness_score = math.exp(-1.5 * max(0.0, aggressiveness_penalty))
 
         temporal_score = 1.0
         if self.last_offsets is not None:
@@ -766,7 +828,7 @@ class NavigationPolicyInferenceNode:
             + self.weight["jerk"] * jerk_metric
             + self.weight["jerk_peak"] * jerk_peak_score
             + self.weight["orient"] * orientation_metric
-            + self.weight["stability"] * stability_score
+            + self.weight["stability"] * stability_score * aggressiveness_score
             + self.weight["temporal"] * temporal_score
         )
 
