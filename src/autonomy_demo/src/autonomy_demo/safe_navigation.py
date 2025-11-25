@@ -362,6 +362,7 @@ def primitive_quintic_trajectory(
     steps: int,
     config: PrimitiveConfig,
     speed_scale: float = 1.0,
+    end_state_body: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """Return body-frame samples along the quintic primitive.
 
@@ -373,13 +374,23 @@ def primitive_quintic_trajectory(
 
     goal_body = np.asarray(goal_body, dtype=np.float32)
     duration = compute_primitive_duration(goal_body, config, speed_scale, duration_scale)
+    if end_state_body is None:
+        end_pos = goal_body
+        end_vel = np.zeros(3, dtype=np.float32)
+        end_acc = np.zeros(3, dtype=np.float32)
+    else:
+        end_pos, end_vel, end_acc = end_state_body
+        end_pos = np.asarray(end_pos, dtype=np.float32)
+        end_vel = np.asarray(end_vel, dtype=np.float32)
+        end_acc = np.asarray(end_acc, dtype=np.float32)
+
     coeffs = quintic_coefficients(
         np.zeros(3, dtype=np.float32),
         sample.start_vel_body,
         sample.start_acc_body,
-        goal_body,
-        np.zeros(3, dtype=np.float32),
-        np.zeros(3, dtype=np.float32),
+        end_pos,
+        end_vel,
+        end_acc,
         duration,
     )
     sample_count = max(steps, 1)

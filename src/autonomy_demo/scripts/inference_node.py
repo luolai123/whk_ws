@@ -222,6 +222,7 @@ class InferenceNode:
         self._ekf_cov: Optional[np.ndarray] = None
         self._last_odom_time: Optional[float] = None
         self._previous_end_state: Optional[dict] = None
+        self.endstate_pred: Optional[np.ndarray] = None
 
         self.ekf_process_noise = float(rospy.get_param("~ekf_process_noise", 0.15))
         self.ekf_measurement_noise = float(rospy.get_param("~ekf_measurement_noise", 0.35))
@@ -789,9 +790,51 @@ class InferenceNode:
             start_acc_body.astype(np.float32) if start_acc_body is not None else None
         )
 
+    def _end_state_targets(
+        self, goal_body: np.ndarray, rotation: np.ndarray, origin: np.ndarray
+    ) -> Tuple[dict, dict]:
+        """Construct body/world-frame end states before solving the quintic."""
+
+        end_pos_body = np.asarray(goal_body, dtype=np.float32)
+        end_vel_body = np.zeros(3, dtype=np.float32)
+        end_acc_body = np.zeros(3, dtype=np.float32)
+
+        if self.endstate_pred is not None:
+            prediction = np.asarray(self.endstate_pred, dtype=np.float32).reshape(-1)
+            if prediction.size >= 9:
+                end_pos_body = prediction[0:3]
+                end_vel_body = prediction[3:6]
+                end_acc_body = prediction[6:9]
+
+        end_state_body = {
+            "position": end_pos_body,
+            "velocity": end_vel_body,
+            "acceleration": end_acc_body,
+        }
+
+        end_state_world = {
+            "position": origin + rotation.dot(end_pos_body),
+            "velocity": rotation.dot(end_vel_body),
+            "acceleration": rotation.dot(end_acc_body),
+        }
+        return end_state_body, end_state_world
+
     def _record_plan_state(self, plan: dict) -> None:
         if not plan:
             return
+        end_state_world = plan.get("end_state_world")
+        if end_state_world is not None:
+            position = end_state_world.get("position")
+            velocity = end_state_world.get("velocity")
+            acceleration = end_state_world.get("acceleration")
+            if position is not None and velocity is not None and acceleration is not None:
+                self._previous_end_state = {
+                    "position": np.asarray(position, dtype=np.float32),
+                    "velocity": np.asarray(velocity, dtype=np.float32),
+                    "acceleration": np.asarray(acceleration, dtype=np.float32),
+                }
+                return
+
         velocities = plan.get("velocities_world")
         points = plan.get("points_world")
         duration = float(plan.get("duration", 0.0))
@@ -869,8 +912,12 @@ class InferenceNode:
             if self.enforce_fixed_altitude:
                 goal_body = goal_body.copy()
                 goal_body[2] = 0.0
+            end_state_body, end_state_world = self._end_state_targets(
+                goal_body, rotation, origin
+            )
+
             duration = compute_primitive_duration(
-                goal_body, self.primitive_config, speed_scale, duration_scale
+                end_state_body["position"], self.primitive_config, speed_scale, duration_scale
             )
             sample_count = self._sample_count_from_duration(duration)
             points_body, velocities_body, duration = primitive_quintic_trajectory(
@@ -880,6 +927,11 @@ class InferenceNode:
                 sample_count,
                 self.primitive_config,
                 speed_scale,
+                (
+                    end_state_body["position"],
+                    end_state_body["velocity"],
+                    end_state_body["acceleration"],
+                ),
             )
             if points_body.size == 0:
                 continue
@@ -992,6 +1044,7 @@ class InferenceNode:
                 "duration_scale": duration_scale,
                 "offset_norm": float(np.linalg.norm(offset_vec)),
                 "offset_vector": offset_vec.copy(),
+                "end_state_world": end_state_world,
                 "sample": sample,
             }
             best_score = score
