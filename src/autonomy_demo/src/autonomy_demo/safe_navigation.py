@@ -155,51 +155,61 @@ def sample_motion_primitives(
         )
         goal_direction_body = clamp_normalized(camera_to_body.dot(offset_direction_camera))
 
-        vx = float(
+        forward, lateral, vertical = _local_basis(goal_direction_body)
+
+        forward_speed = float(
             np.clip(
                 rng.lognormal(config.forward_log_mean, config.forward_log_sigma),
                 0.0,
                 config.vel_max_train,
             )
         )
-        vy = float(
+        lateral_speed = float(
             np.clip(
                 rng.normal(0.0, config.vel_max_train * config.v_std_unit),
                 -config.vel_max_train,
                 config.vel_max_train,
             )
         )
-        vz = float(
+        vertical_speed = float(
             np.clip(
                 rng.normal(0.0, config.vel_max_train * config.v_std_unit * 0.8),
                 -config.vel_max_train,
                 config.vel_max_train,
             )
         )
-        start_vel = np.array([vx, vy, vz], dtype=np.float32)
+        start_vel = (
+            forward * forward_speed
+            + lateral * lateral_speed
+            + vertical * vertical_speed
+        ).astype(np.float32)
 
-        ax = float(
+        forward_acc = float(
             np.clip(
                 rng.normal(0.0, config.acc_max_train * config.a_std_unit),
                 -config.acc_max_train,
                 config.acc_max_train,
             )
         )
-        ay = float(
+        lateral_acc = float(
             np.clip(
                 rng.normal(0.0, config.acc_max_train * config.a_std_unit),
                 -config.acc_max_train,
                 config.acc_max_train,
             )
         )
-        az = float(
+        vertical_acc = float(
             np.clip(
                 rng.normal(0.0, config.acc_max_train * config.a_std_unit),
                 -config.acc_max_train,
                 config.acc_max_train,
             )
         )
-        start_acc = np.array([ax, ay, az], dtype=np.float32)
+        start_acc = (
+            forward * forward_acc
+            + lateral * lateral_acc
+            + vertical * vertical_acc
+        ).astype(np.float32)
 
         length_scale = float(np.clip(rng.normal(config.goal_length_scale, 0.15), 0.4, 1.4))
         goal_length = config.planning_horizon * length_scale
