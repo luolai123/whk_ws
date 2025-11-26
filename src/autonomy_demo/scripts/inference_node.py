@@ -27,7 +27,6 @@ from tf_conversions import transformations
 
 from autonomy_demo.safe_navigation import (
     PrimitiveConfig,
-    apply_goal_offset,
     clamp_normalized,
     compute_direction_from_pixel,
     find_largest_safe_region,
@@ -36,8 +35,6 @@ from autonomy_demo.safe_navigation import (
     normalize_navigation_inputs,
     compute_primitive_duration,
     primitive_quintic_trajectory,
-    primitive_state_dim,
-    primitive_state_vector,
     project_direction_to_pixel,
     sample_motion_primitives,
 )
@@ -103,7 +100,7 @@ class DistanceClassifier(torch.nn.Module):
 
 
 class SafeNavigationPolicy(torch.nn.Module):
-    def __init__(self, height: int, width: int, state_dim: int = 8) -> None:
+    def __init__(self, height: int, width: int, state_dim: int = 9) -> None:
         super().__init__()
         self.height = height
         self.width = width
@@ -263,8 +260,7 @@ class InferenceNode:
             goal_length_scale=max(0.2, goal_length_scale),
             offset_gain=max(0.05, offset_gain),
         )
-        self.goal_feature_dim = 4
-        self.policy_state_dim = primitive_state_dim(self.primitive_config) + self.goal_feature_dim
+        self.policy_state_dim = 9  # position(3) + velocity(3) + acceleration(3)
         samples_per_second = int(rospy.get_param("~path_samples_per_step", 12))
         self.path_sample_rate = max(1, samples_per_second)
 
@@ -370,6 +366,35 @@ class InferenceNode:
         if previous_position is None:
             return current_origin
         return previous_position.astype(np.float32)
+
+    def _planner_state_vector(
+        self, origin: np.ndarray, rotation: np.ndarray
+    ) -> np.ndarray:
+        """Return normalized state features (position, velocity, acceleration)."""
+
+        position = origin.astype(np.float32)
+        velocity_world = np.zeros(3, dtype=np.float32)
+        if self.odom is not None:
+            velocity_world = np.array(
+                [
+                    self.odom.twist.twist.linear.x,
+                    self.odom.twist.twist.linear.y,
+                    self.odom.twist.twist.linear.z,
+                ],
+                dtype=np.float32,
+            )
+
+        velocity_body = rotation.T.dot(velocity_world)
+        acceleration_body = np.zeros(3, dtype=np.float32)
+
+        range_scale = max(self.primitive_config.radio_range, 1e-3)
+        vel_scale = max(self.primitive_config.vel_max_train, 1e-3)
+        acc_scale = max(self.primitive_config.acc_max_train, 1e-3)
+
+        pos_norm = position / range_scale
+        vel_norm = velocity_body / vel_scale
+        acc_norm = acceleration_body / acc_scale
+        return np.concatenate([pos_norm, vel_norm, acc_norm]).astype(np.float32)
 
     def _publish_stop_command(self, stamp: rospy.Time) -> None:
         if self.odom is None:
@@ -526,6 +551,7 @@ class InferenceNode:
             rotation,
             base_direction_camera,
             cluster_mask,
+            safe_prob,
             clearance_map,
             center_row,
             center_col,
@@ -709,25 +735,29 @@ class InferenceNode:
         return False
 
 
-    def _policy_offsets(
-        self, safe_mask: np.ndarray, state_vec: np.ndarray
-    ) -> Tuple[np.ndarray, float]:
+    def _predict_end_state(self, safe_prob: np.ndarray, state_vec: np.ndarray) -> None:
+        """Run PlannerNet on visual features + current state to predict end state."""
+
         if self.policy is None:
-            return np.zeros(3, dtype=np.float32), 1.0
-        mask_tensor = (
-            torch.from_numpy(safe_mask.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(self.device)
+            self.endstate_pred = None
+            return
+
+        image_tensor = (
+            torch.from_numpy(safe_prob.astype(np.float32))
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(self.device)
         )
         state_tensor = torch.from_numpy(state_vec.astype(np.float32)).unsqueeze(0).to(self.device)
+
         with torch.no_grad():
-            raw_end = self.policy(mask_tensor, state_tensor)
+            raw_end = self.policy(image_tensor, state_tensor)
 
         raw_np = raw_end.squeeze(0).cpu().numpy()
         delta_p = np.tanh(raw_np[0:3]) * self.primitive_config.radio_range
         v_t = np.tanh(raw_np[3:6]) * self.primitive_config.vel_max_train
         a_t = np.tanh(raw_np[6:9]) * self.primitive_config.acc_max_train
         self.endstate_pred = np.concatenate([delta_p, v_t, a_t]).astype(np.float32)
-
-        return np.zeros(3, dtype=np.float32), 1.0
 
     def _ekf_correct(self, msg: Odometry) -> Odometry:
         position = np.array(
@@ -850,6 +880,7 @@ class InferenceNode:
         rotation: np.ndarray,
         base_direction_camera: np.ndarray,
         cluster_mask: np.ndarray,
+        safe_prob: np.ndarray,
         clearance_map: np.ndarray,
         center_row: float,
         center_col: float,
@@ -864,6 +895,8 @@ class InferenceNode:
         if width == 0 or height == 0:
             return None
         fov_deg = math.degrees(2.0 * math.atan(self.tan_half_h)) if self.tan_half_h else 120.0
+        state_vec = self._planner_state_vector(origin, rotation)
+        self._predict_end_state(safe_prob, state_vec)
         primitives = sample_motion_primitives(
             base_direction_camera,
             self._camera_to_body,
@@ -886,24 +919,8 @@ class InferenceNode:
                 sample.start_vel_body = start_vel_body
             if start_acc_body is not None:
                 sample.start_acc_body = start_acc_body
-            state_vec = primitive_state_vector(sample, self.primitive_config, speed_scale)
-            target_hint = np.zeros(3, dtype=np.float32)
-            target_bias = 1.0
-            if local_goal is not None:
-                local_hint = rotation.T.dot(local_goal - origin)
-                target_hint = clamp_normalized(local_hint)
-                target_bias = min(
-                    1.0, np.linalg.norm(local_hint) / max(self.primitive_config.radio_range, 1e-3)
-                )
-            elif goal_direction is not None:
-                target_hint = clamp_normalized(rotation.T.dot(goal_direction))
-                target_bias = 0.5
-            goal_features = np.concatenate(
-                [target_hint, np.array([target_bias], dtype=np.float32)]
-            ).astype(np.float32)
-            state_vec = np.concatenate([state_vec, goal_features]).astype(np.float32)
-            offset_vec, duration_scale = self._policy_offsets(cluster_mask, state_vec)
-            goal_body = apply_goal_offset(sample, offset_vec, self.primitive_config)
+            duration_scale = 1.0
+            goal_body = sample.goal_direction_body * sample.goal_length
             if self.enforce_fixed_altitude:
                 goal_body = goal_body.copy()
                 goal_body[2] = 0.0
@@ -912,7 +929,7 @@ class InferenceNode:
             )
 
             duration = compute_primitive_duration(
-                end_state_body["position"], self.primitive_config, speed_scale, duration_scale
+                end_state_body["position"], self.primitive_config, speed_scale, 1.0
             )
             sample_count = self._sample_count_from_duration(duration)
             points_body, velocities_body, duration = primitive_quintic_trajectory(
