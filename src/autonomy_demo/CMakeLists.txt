@@ -25,6 +25,7 @@ catkin_install_python(PROGRAMS
   scripts/camera_simulator.py
   scripts/data_collector.py
   scripts/inference_node.py
+  scripts/planner_net_inference.py
   training/auto_dataset_generator.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
