@@ -119,17 +119,14 @@ class SafeNavigationPolicy(torch.nn.Module):
         self.global_pool = torch.nn.AdaptiveAvgPool2d(1)
         fusion_dim = 128
         self.fc1 = torch.nn.Linear(64 + state_dim, fusion_dim)
-        self.action_head = torch.nn.Linear(fusion_dim, 4)
         self.end_state_head = torch.nn.Linear(fusion_dim, 9)
 
-    def forward(self, mask: torch.Tensor, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, mask: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
         features = self.backbone(mask)
         pooled = self.global_pool(features).view(mask.size(0), -1)
         combined = torch.cat([pooled, state], dim=1)
         hidden = torch.relu(self.fc1(combined))
-        action = torch.tanh(self.action_head(hidden))
-        end_state = torch.tanh(self.end_state_head(hidden))
-        return action, end_state
+        return self.end_state_head(hidden)
 
 
 class InferenceNode:
@@ -722,31 +719,15 @@ class InferenceNode:
         )
         state_tensor = torch.from_numpy(state_vec.astype(np.float32)).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            policy_out = self.policy(mask_tensor, state_tensor)
-        action, end_state = (
-            policy_out if isinstance(policy_out, tuple) else (policy_out, None)
-        )
-        action_np = action.squeeze(0).cpu().numpy()
-        if end_state is not None:
-            self.endstate_pred = end_state.squeeze(0).cpu().numpy()
-        offset = np.clip(action_np[0:3], -1.0, 1.0)
-        duration_scale = float(
-            np.clip(
-                1.0 + 0.2 * action_np[3],
-                self.duration_scale_min,
-                self.duration_scale_max,
-            )
-        )
-        offset_vec = offset * self.primitive_config.radio_range
-        offset_vec = offset_vec.astype(np.float32)
-        if self.enforce_fixed_altitude:
-            offset_vec[2] = 0.0
-        if self._last_committed_offset is not None and self.offset_filter_alpha < 1.0:
-            offset_vec = (
-                self.offset_filter_alpha * offset_vec
-                + (1.0 - self.offset_filter_alpha) * self._last_committed_offset
-            )
-        return offset_vec, duration_scale
+            raw_end = self.policy(mask_tensor, state_tensor)
+
+        raw_np = raw_end.squeeze(0).cpu().numpy()
+        delta_p = np.tanh(raw_np[0:3]) * self.primitive_config.radio_range
+        v_t = np.tanh(raw_np[3:6]) * self.primitive_config.vel_max_train
+        a_t = np.tanh(raw_np[6:9]) * self.primitive_config.acc_max_train
+        self.endstate_pred = np.concatenate([delta_p, v_t, a_t]).astype(np.float32)
+
+        return np.zeros(3, dtype=np.float32), 1.0
 
     def _ekf_correct(self, msg: Odometry) -> Odometry:
         position = np.array(
