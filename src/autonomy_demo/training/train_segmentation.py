@@ -4,13 +4,23 @@
 import argparse
 import pathlib
 import random
+import sys
 from typing import List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+
+# Make sure the package modules are available when running the script directly.
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
+PACKAGE_SRC = PROJECT_ROOT.parent / "src"
+for path in (PROJECT_ROOT, PACKAGE_SRC):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+
 # Reuse the core implementations from the primary training script.
-from autonomy_demo.training.train_classifier import (
+from train_classifier import (
     DistanceClassifier,
     ObstacleDataset,
     SegmentationLoss,
