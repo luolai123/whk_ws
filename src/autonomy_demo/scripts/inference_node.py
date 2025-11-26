@@ -106,7 +106,7 @@ class SafeNavigationPolicy(torch.nn.Module):
         self.width = width
         self.state_dim = state_dim
         self.backbone = torch.nn.Sequential(
-            torch.nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            torch.nn.Conv2d(3, 16, kernel_size=3, padding=1),
             torch.nn.ReLU(inplace=True),
             torch.nn.Conv2d(16, 32, kernel_size=3, padding=1, stride=2),
             torch.nn.ReLU(inplace=True),
@@ -118,9 +118,13 @@ class SafeNavigationPolicy(torch.nn.Module):
         self.fc1 = torch.nn.Linear(64 + state_dim, fusion_dim)
         self.end_state_head = torch.nn.Linear(fusion_dim, 9)
 
-    def forward(self, mask: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        features = self.backbone(mask)
-        pooled = self.global_pool(features).view(mask.size(0), -1)
+    def forward(self, image: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
+        if image.size(1) == 1:
+            image = image.repeat(1, 3, 1, 1)
+        features = self.backbone(image)
+        pooled = self.global_pool(features).view(image.size(0), -1)
         combined = torch.cat([pooled, state], dim=1)
         hidden = torch.relu(self.fc1(combined))
         return self.end_state_head(hidden)
@@ -551,6 +555,7 @@ class InferenceNode:
             rotation,
             base_direction_camera,
             cluster_mask,
+            normalized,
             safe_prob,
             clearance_map,
             center_row,
@@ -735,16 +740,16 @@ class InferenceNode:
         return False
 
 
-    def _predict_end_state(self, safe_prob: np.ndarray, state_vec: np.ndarray) -> None:
-        """Run PlannerNet on visual features + current state to predict end state."""
+    def _predict_end_state(self, normalized_rgb: np.ndarray, state_vec: np.ndarray) -> None:
+        """Run PlannerNet on RGB + current state to predict end state."""
 
         if self.policy is None:
             self.endstate_pred = None
             return
 
         image_tensor = (
-            torch.from_numpy(safe_prob.astype(np.float32))
-            .unsqueeze(0)
+            torch.from_numpy(normalized_rgb.astype(np.float32))
+            .permute(2, 0, 1)
             .unsqueeze(0)
             .to(self.device)
         )
@@ -880,6 +885,7 @@ class InferenceNode:
         rotation: np.ndarray,
         base_direction_camera: np.ndarray,
         cluster_mask: np.ndarray,
+        normalized_rgb: np.ndarray,
         safe_prob: np.ndarray,
         clearance_map: np.ndarray,
         center_row: float,
@@ -896,7 +902,7 @@ class InferenceNode:
             return None
         fov_deg = math.degrees(2.0 * math.atan(self.tan_half_h)) if self.tan_half_h else 120.0
         state_vec = self._planner_state_vector(origin, rotation)
-        self._predict_end_state(safe_prob, state_vec)
+        self._predict_end_state(normalized_rgb, state_vec)
         primitives = sample_motion_primitives(
             base_direction_camera,
             self._camera_to_body,

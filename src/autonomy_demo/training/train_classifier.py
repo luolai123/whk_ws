@@ -391,21 +391,32 @@ class ObstacleDataset(Dataset):
 
 
 class NavigationDataset(Dataset):
-    def __init__(self, data_dir: pathlib.Path) -> None:
+    def __init__(
+        self,
+        data_dir: pathlib.Path,
+        mean: Optional[np.ndarray] = None,
+        std: Optional[np.ndarray] = None,
+        target_hw: Optional[Tuple[int, int]] = None,
+    ) -> None:
         self.files: List[pathlib.Path] = sorted(data_dir.rglob("*.npz"))
         if not self.files:
             raise FileNotFoundError(f"No samples found in {data_dir}")
         with np.load(self.files[0]) as first:
-            label = _normalize_label_array(_infer_label_map(first), None)
+            label = _normalize_label_array(_infer_label_map(first), target_hw)
         self.height, self.width = label.shape
-        self.target_hw: Tuple[int, int] = (self.height, self.width)
+        self.target_hw: Tuple[int, int] = target_hw or (self.height, self.width)
+        self.mean = mean
+        self.std = std
         self._snapshot_cache: Dict[pathlib.Path, Dict[str, np.ndarray]] = {}
 
     def __len__(self) -> int:
         return len(self.files)
 
-    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
         with np.load(self.files[idx]) as sample:
+            image = _normalize_image_array(_infer_image(sample), self.target_hw) / 255.0
+            if self.mean is not None and self.std is not None:
+                image = (image - self.mean) / np.clip(self.std, 1e-4, None)
             label = _normalize_label_array(_infer_label_map(sample), self.target_hw)
             safe_mask = (label == 0).astype(np.float32)
             distances = _infer_distance_map(sample)
@@ -420,6 +431,8 @@ class NavigationDataset(Dataset):
 
             metadata: Dict[str, Any] = {
                 "pose_position": _get("pose_position", None),
+                "pose_velocity": _get("pose_velocity", None),
+                "pose_acceleration": _get("pose_acceleration", None),
                 "pose_orientation": _get("pose_orientation", None),
                 "camera_offset": _get(
                     "camera_offset", np.array([0.15, 0.0, 0.05], dtype=np.float32)
@@ -441,7 +454,7 @@ class NavigationDataset(Dataset):
                 for key in ("sphere_centers", "sphere_radii", "box_centers", "box_half_extents", "box_rotations"):
                     if key in cached and cached[key].size:
                         metadata[key] = cached[key]
-        return safe_mask, distances, metadata
+        return image.astype(np.float32), safe_mask, distances, metadata
 
 
 def _sample_goal_pixel(region: "SafeRegion", rng: random.Random) -> Tuple[float, float]:
@@ -585,7 +598,7 @@ class SafeNavigationPolicy(torch.nn.Module):
         self.width = width
         self.state_dim = state_dim
         self.backbone = torch.nn.Sequential(
-            torch.nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            torch.nn.Conv2d(3, 16, kernel_size=3, padding=1),
             torch.nn.ReLU(inplace=True),
             torch.nn.Conv2d(16, 32, kernel_size=3, padding=1, stride=2),
             torch.nn.ReLU(inplace=True),
@@ -598,9 +611,13 @@ class SafeNavigationPolicy(torch.nn.Module):
         # 末端状态 head：Δp_raw(3) + y_v(3) + y_a(3)
         self.end_state_head = torch.nn.Linear(fusion_dim, 9)
 
-    def forward(self, mask: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        features = self.backbone(mask)
-        pooled = self.global_pool(features).view(mask.size(0), -1)
+    def forward(self, image: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
+        if image.size(1) == 1:
+            image = image.repeat(1, 3, 1, 1)
+        features = self.backbone(image)
+        pooled = self.global_pool(features).view(image.size(0), -1)
         combined = torch.cat([pooled, state], dim=1)
         hidden = F.relu(self.fc1(combined))
         return self.end_state_head(hidden)
@@ -791,6 +808,7 @@ def train_navigation_policy(
     samples_per_second: int,
     camera_pitch_deg: float,
     seed: int,
+    seg_model: Optional[DistanceClassifier] = None,
 ) -> None:
     state_dim = 9
     policy = SafeNavigationPolicy(dataset.height, dataset.width, state_dim=state_dim).to(device)
@@ -808,6 +826,9 @@ def train_navigation_policy(
     camera_to_body_t = torch.from_numpy(camera_to_body).to(device=device, dtype=torch.float32)
     rng = np.random.default_rng(seed or None)
     indices = list(range(len(dataset)))
+    if seg_model is not None:
+        seg_model.eval()
+        seg_model.to(device)
 
     for epoch in range(epochs):
         random.shuffle(indices)
@@ -830,7 +851,7 @@ def train_navigation_policy(
             valid_samples = 0
 
             for idx in batch:
-                safe_mask, distances, metadata = dataset[idx]
+                image, safe_mask, _distances_unused, metadata = dataset[idx]
                 noisy_mask = add_noise(safe_mask, noise_rate)
                 region = find_largest_safe_region(noisy_mask.astype(bool), 0.05)
                 if region is None:
@@ -838,9 +859,6 @@ def train_navigation_policy(
 
                 center_row, center_col = region.centroid
                 goal_row, goal_col = _sample_goal_pixel(region, random)
-                mask_tensor = torch.from_numpy(noisy_mask).to(device=device, dtype=torch.float32)
-                mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
-
                 goal_direction_camera = compute_direction_from_pixel(
                     goal_col, goal_row, dataset.width, dataset.height, 120.0
                 ).astype(np.float32)
@@ -861,6 +879,7 @@ def train_navigation_policy(
                     torch.from_numpy(goal_direction_body * sample.goal_length)
                     .to(device=device, dtype=torch.float32)
                 )
+
                 position = metadata.get("pose_position")
                 velocity = metadata.get("pose_velocity")
                 acceleration = metadata.get("pose_acceleration")
@@ -872,14 +891,27 @@ def train_navigation_policy(
                 )
                 state_tensor = torch.from_numpy(state_vec).unsqueeze(0).to(device=device)
 
-                end_state_raw = policy(mask_tensor, state_tensor)[0]
+                image_tensor = (
+                    torch.from_numpy(image)
+                    .to(device=device, dtype=torch.float32)
+                    .permute(2, 0, 1)
+                    .unsqueeze(0)
+                )
+                with torch.no_grad():
+                    if seg_model is not None:
+                        seg_logits = seg_model(image_tensor)
+                        safe_prob_pred = torch.softmax(seg_logits, dim=1)[:, 0:1, :, :]
+                    else:
+                        safe_prob_pred = torch.sigmoid(image_tensor[:, 0:1, :, :])
+
+                end_state_raw = policy(image_tensor, state_tensor)[0]
 
                 delta_p_raw = end_state_raw[0, 0:3]
                 y_v = end_state_raw[0, 3:6]
                 y_a = end_state_raw[0, 6:9]
 
                 delta_p = torch.tanh(delta_p_raw) * primitive_config.radio_range
-                end_pos = delta_p
+                end_pos = (torch.zeros(3, device=device, dtype=torch.float32) if position is None else torch.from_numpy(position).to(device=device, dtype=torch.float32)) + delta_p
                 end_vel = torch.tanh(y_v) * primitive_config.vel_max_train
                 end_acc = torch.tanh(y_a) * primitive_config.acc_max_train
 
@@ -892,11 +924,24 @@ def train_navigation_policy(
                     2, int(math.ceil(float(duration_t.detach().cpu()) * samples_per_second))
                 )
 
-                start_vel = torch.from_numpy(sample.start_vel_body).to(device=device, dtype=torch.float32)
-                start_acc = torch.from_numpy(sample.start_acc_body).to(device=device, dtype=torch.float32)
+                start_pos = (
+                    torch.zeros(3, device=device, dtype=torch.float32)
+                    if position is None
+                    else torch.from_numpy(position).to(device=device, dtype=torch.float32)
+                )
+                start_vel = (
+                    torch.zeros(3, device=device, dtype=torch.float32)
+                    if velocity is None
+                    else torch.from_numpy(velocity).to(device=device, dtype=torch.float32)
+                )
+                start_acc = (
+                    torch.zeros(3, device=device, dtype=torch.float32)
+                    if acceleration is None
+                    else torch.from_numpy(acceleration).to(device=device, dtype=torch.float32)
+                )
 
                 coeffs = _quintic_coefficients_torch(
-                    torch.zeros(3, device=device, dtype=torch.float32),
+                    start_pos,
                     start_vel,
                     start_acc,
                     end_pos,
@@ -929,7 +974,7 @@ def train_navigation_policy(
                 grid = _project_points_to_mask(
                     points_t, camera_to_body_t, dataset.height, dataset.width, 120.0
                 )
-                danger = 1.0 - mask_tensor
+                danger = 1.0 - safe_prob_pred
                 danger_samples = F.grid_sample(
                     danger, grid, align_corners=True, mode="bilinear", padding_mode="border"
                 ).view(-1)
@@ -1092,7 +1137,9 @@ def main() -> None:
     print(f"Saved trained model to {args.output}")
 
     if not args.no_policy:
-        nav_dataset = NavigationDataset(args.dataset)
+    nav_dataset = NavigationDataset(
+        args.dataset, mean=channel_mean, std=channel_std, target_hw=target_hw
+    )
         primitive_config = PrimitiveConfig(
             radio_range=args.radio_range,
             vel_max_train=args.vel_max_train,
@@ -1120,6 +1167,7 @@ def main() -> None:
             samples_per_second,
             args.camera_pitch_deg,
             args.policy_seed,
+            seg_model=model,
         )
 
 
