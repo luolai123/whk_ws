@@ -1,132 +1,96 @@
-# Autonomy Demo Workspace
+# 无人机单目安全导航（ROS1 Noetic）
 
-## 项目概览 / Project Overview
-- **中文**：该工作区面向 Ubuntu 20.04 + ROS Noetic，提供随机障碍世界、四旋翼+RGB 相机仿真、自动数据采集、二分类+安全导航训练以及推理闭环，可直接通过 RViz 进行交互。
-- **English**: Complete ROS1 workspace for a UAV navigating procedurally generated obstacle fields with a pitched RGB camera, automated dataset capture, PyTorch training, and short-horizon safe navigation that can be monitored and directed from RViz.
+基于**单目 RGB 相机**与**像素级安全/障碍物二分类**的无人机导航项目。流程包含：
+- 自动数据采集（在线模拟或离线生成）：同步保存图像、mask、机体状态与目标。
+- 离线训练：UNet 分割网络 + 末端状态预测（PlannerNet）+ 五阶多项式（quintic）轨迹生成。
+- 在线推理与控制：SegNet 与 PlannerNet 推理后发布轨迹与 `/cmd_vel`。
 
-## 功能亮点 / Feature Highlights
-- **随机世界 Randomized world**：支持巨大的可配置空域、盒体/球体/门框等多类障碍，并输出 `MarkerArray` + `OccupancyGrid` 供 RViz 与算法订阅。
-- **统一相机工具链 Unified camera utilities**：摄像头与数据采集器共享射线预计算与安装矩阵（`camera_utils.py`），确保上抬视角、相对机体系偏移完全一致，避免冗余代码与视角错位。
-- **自动采集 + 真实标签 Automated data capture**：`data_collection.launch` 默认调用离线采集器，逐像素光线投射生成 RGB/深度/红绿二分类标签，并保存完整障碍快照供训练使用。
-- **可微训练 Differentiable training**：UNet 二分类器 + 可微安全导航策略同时训练，奖励函数覆盖安全距离、目标导向、平滑与速度指标，适配 3–7 m/s 速度段。
-- **推理与轨迹 Tracking inference**：推理节点提取最大安全区，使用五阶多项式生成安全运动基元；每条轨迹的时长遵循 `T = 2R / (vmax · α)`（末端距当前机体距离为 `R`，`vmax` 为训练最大速度，`α` 为当前速度缩放），并由姿态控制器跟踪。
+## 依赖环境
+- Ubuntu 20.04 + ROS Noetic（需 `cv_bridge`、`image_transport` 等常见依赖）。
+- Python 3，推荐使用虚拟环境。
+- 主要 Python 包：`torch`、`torchvision`、`numpy`、`pillow`、`opencv-python`、`pyyaml`。
 
-## 环境需求 / Requirements
-- Ubuntu 20.04, ROS Noetic (desktop-full 建议). 需要 `cv_bridge`、`image_transport` 等 ROS 包。
-- Python 依赖 / Python deps:
+## 编译与安装
+1. 将仓库放入 `~/catkin_ws/src`（或任意 catkin 工作空间的 `src`）：
+   ```bash
+   cd ~/catkin_ws/src
+   git clone <repo_url> autonomy_demo
+   ```
+2. 在工作空间根目录编译并加载环境：
+   ```bash
+   cd ~/catkin_ws
+   catkin_make
+   source devel/setup.bash
+   ```
+
+## 数据采集
+支持两种模式：
+
+- **离线批量生成**（默认）：
   ```bash
-  pip install numpy torch torchvision pillow
+  roslaunch autonomy_demo data_collection.launch \
+    dataset_config:=config/auto_dataset.yaml \
+    output_dir:=__from_config__ \
+    overwrite:=true
   ```
+  - 输出路径由 `dataset_config` 的 `dataset.output_dir` 指定，或通过 `output_dir` 覆盖。
+  - 生成的目录结构：`env_xxx/world_snapshot.npz` + `env_xxx/sample_yyyyy.npz`，每个样本包含 `image`、`label`/`mask`、`distances`、`pose_position`、`pose_orientation`、`camera_offset` 等字段。
 
-## 编译步骤 / Build
-```bash
-source /opt/ros/noetic/setup.bash
-cd /path/to/whk_ws
-catkin_make
-source devel/setup.bash
-```
-
-## 运行仿真 / Run the Simulation
-```bash
-roslaunch autonomy_demo sim.launch
-```
-- RViz 会自动加载 `config/world.rviz`。Use the **2D Nav Goal** tool to select the next waypoint.
-- 主题 Topics：`/world/obstacles` (MarkerArray), `/world/occupancy` (OccupancyGrid), `/drone/rgb/image_raw` (RGB feed), `/drone/safe_trajectory` (短期安全轨迹)。
-- 通过 `rosservice call /world_generator/regenerate` 可即时刷新场景。
-
-## 自动数据采集 / Automated Dataset Collection
-默认离线无界面：
-```bash
-roslaunch autonomy_demo data_collection.launch \
-  dataset_config:=config/auto_dataset.yaml \
-  output_dir:=/your/dataset/path \
-  overwrite:=true
-```
-- `dataset_config` 可写绝对路径、`package://autonomy_demo/...`，或简单地写成 `config/auto_dataset.yaml`（会自动按包路径解析，即使误写成 `/config/...` 也会自动修正）；`dataset_config` accepts absolute paths, `package://autonomy_demo/...` URIs, or short `config/auto_dataset.yaml` strings and will auto-resolve them to the package.
-- `output_dir:=__from_config__`（默认值）时使用 YAML 中的 `dataset.output_dir`；显式填写则覆盖。
-- `overwrite` 接收 `true/false` 字符串。
-- YAML 描述环境范围、采样次数、安全距离、相机姿态等，生成的 `env_xxx/sample_xxxxx.npz` 包含 RGB、红/绿二分类标签（红=障碍，绿=安全）、深度、相机偏移与障碍快照。
-- 默认 `config/auto_dataset.yaml` 将分辨率固定为 128×72，与 `sim.launch` 中的相机参数一致，便于训练-推理对齐；如需更高分辨率，可同步修改 launch 与 YAML 中的宽高。
-
-若需要旧版在线采集（打开 RViz + 手动移动）：
-```bash
-roslaunch autonomy_demo data_collection.launch mode:=online hardware_accel:=true
-```
-此模式会启动模拟器，采集节点实时记录图像/标签。
-
-### CLI (Headless) 方式 / Standalone CLI
-```bash
-python3 src/autonomy_demo/training/auto_dataset_generator.py \
-  src/autonomy_demo/config/auto_dataset.yaml \
-  --output /tmp/dataset_run \
-  --overwrite true
-```
-参数支持 `true/false` 字符串，便于脚本或 `roslaunch` 统一调用。
-
-## 训练流程 / Training Pipeline
-```bash
-python3 src/autonomy_demo/training/train_classifier.py \
-  /your/dataset/path \
-  --epochs 15 --batch 8 --lr 5e-4 \
-  --policy_epochs 40 --policy_batch 8 --policy_lr 5e-4 \
-  --output ~/autonomy_demo/model.pt \
-  --policy_output ~/autonomy_demo/navigation_policy.pt
-```
-- 如需专注提升像素级二分类，可运行 `training/train_segmentation.py`：
+- **在线采集（仿真驱动）**：
   ```bash
-  python3 src/autonomy_demo/training/train_segmentation.py \
-    /your/dataset/path --epochs 20 --batch 16 --lr 1e-3 \
-    --output ~/autonomy_demo/segmentation_model.pt --distill
+  roslaunch autonomy_demo data_collection.launch mode:=online
   ```
-- For a segmentation-only curriculum run `training/train_segmentation.py` with the same dataset; it reuses the UNet, applies class-balanced losses, and optionally distills from the teacher branch.
-- 训练集自动划分验证集，报告 loss、IoU、precision/recall。
-- 训练脚本会在切分后统计训练集 RGB 通道均值/方差，并写入模型 checkpoint；推理节点会自动按同样的分辨率与标准化重新采样输
-  入帧，避免出现“全部红色”的 domain shift。
-- 二分类标签使用红/绿二值图，损失函数为加权交叉熵 + dice；推理阶段会渲染红色障碍与绿色安全区，并仅对聚类得到的最大安全斑块执行轨迹规划，确保路径永远位于真实连通区域内。
-- 策略阶段以五阶多项式轨迹评估安全性（碰撞率、最小距离）、目标导向度、轨迹 jerk 峰值与姿态变化率，并在训练时强制将采样目标与安全斑块边界的距离、角度关联起来，使策略真正学会“指向目标又保持安全”。
+  - 会启动 `sim.launch` 的世界、无人机与相机模拟器，并运行 `data_collector` 节点。
+  - 默认保存到 `~/autonomy_demo/dataset`，文件名形如 `sample_000000.npz`，字段与离线生成一致。
 
-### YOPO 式安全运动基元 / YOPO-style motion primitives
-- **中文**：`train_classifier.py` 与 `inference_node.py` 现共享同一套 YOPO 运动基元参数。`radio_range` 定义轨迹地平线（默认 5 m），结合 `vel_max_train` 与运行时速度比例自动套用 `T = 2R / (vmax · α)` 的时长。`v_forward_mean/sigma`（对数正态）、`v_std_unit`、`a_std_unit` 控制机体系速度/加速度采样分布，而 `yaw_std_deg`、`pitch_std_deg` + `horizon/vertical fov` 确保采样方向位于相机视野内。策略网络输出 3 维偏移量 + 1 个时长缩放，`offset_gain` 负责约束偏移幅度。`inference.launch` 中的参数与训练脚本的 `--radio_range --vel_max_train ... --camera_pitch_deg` 保持一一对应，可直接复现训练时的运动基元云。
-- **English**: Both the trainer and the inference node now draw YOPO-style primitives from the same `PrimitiveConfig`. `radio_range` fixes the horizon (5 m by default) and, together with `vel_max_train` and the runtime speed scale, sets the duration via `T = 2R / (vmax · α)`. Forward velocity follows a log-normal law (`v_forward_mean`/`v_forward_sigma`), lateral/vertical components use zero-mean Gaussians scaled by `v_std_unit`, and accelerations mirror `a_std_unit`. `yaw_std_deg`/`pitch_std_deg` together with the camera FOV restrict candidate directions to what the RGB sensor can actually observe. The policy outputs a 3D offset and a duration scale that are clamped via `offset_gain` and `duration_scale_[min|max]`. Keep the new CLI flags (`--radio_range`, `--path_samples_per_step`, `--camera_pitch_deg`, etc.) aligned with the ROS parameters in `inference.launch` to guarantee that training and runtime primitives stay consistent.
+## 训练步骤
+1. **分割网络（SegNet）**：
+   ```bash
+   python3 src/autonomy_demo/training/train_segmentation.py \
+     /path/to/dataset --epochs 20 --batch 16 --lr 1e-3 \
+     --output ~/autonomy_demo/segmentation_model.pt --distill
+   ```
 
-## 推理部署 / Inference Deployment
+2. **末端状态 / 规划网络（PlannerNet）**：
+   ```bash
+   python3 src/autonomy_demo/training/train_navigation_policy.py \
+     /path/to/dataset --epochs 40 --batch 8 --lr 5e-4 \
+     --output ~/autonomy_demo/navigation_policy.pt
+   ```
+
+两者共用 `*.npz` 样本：`train_segmentation.py` 读取 `label`/`mask` 或由 `distances` + `near_threshold` 生成标签；`train_navigation_policy.py` 额外使用 `pose_*`、障碍物快照等元数据以生成 quintic 基元监督。
+
+## 在线推理与控制
+启动端到端推理（SegNet + PlannerNet）：
 ```bash
 roslaunch autonomy_demo inference.launch \
-  model_path:=/abs/path/model.pt \
-  policy_path:=/abs/path/navigation_policy.pt
-```
-- 节点输出：
-  - `/drone/rgb/distance_class`：红/绿叠加图。
-  - `/drone/safe_center`：最大安全斑块中心点。
-  - `/drone/movement_command` / `/drone/movement_offsets`：长度、俯仰、偏航调节（offsets 现包含完整轨迹时长，模拟器据此平滑跟踪）。
-  - `/drone/safe_trajectory`：基于 `T = 2R / (vmax · α)` 时长的五阶多项式安全轨迹，姿态控制器按该轨迹跟踪至下个 goal；若当前路径与上一条相似，会自动保持旧轨迹以避免“走走停停”。
-- `~goal_direction_blend`、`~goal_bias_distance` 控制安全方向与 RViz 目标方向的融合比例；`~plan_publish_period` 决定最小轨迹刷新周期，而 `~plan_hold_time` / `~plan_similarity_epsilon` 则决定何时强制推送最新轨迹，可显著减少实时运行时的顿挫感。
-- `~path_samples_per_step`（作为采样频率控制轨迹分辨率）、`~camera_pitch_deg`、`~max_obstacle_candidates` 等参数可在 launch 文件内调整，实现实时性与安全性折中。
-- 模型文件保存为包含 `model_state`、`normalization(mean/std)` 以及 `input_size` 的字典；旧版仅含 `state_dict` 的模型仍可加载，但推理节点不会应用额外的标准化或重采样。
-
-## 性能优化与容错 / Performance & Robustness
-- `camera_utils.py` 在摄像机和数据采集端共享射线与安装矩阵，避免重复计算并保证视角一致。`max_obstacle_candidates` + Torch 加速可控制单帧耗时。
-- 推理阶段对候选轨迹执行安全一票否决：任何低概率或低净空的轨迹会被直接丢弃，并触发后退/侧移备用基元。
-- `data_collection.launch` 的 offline 模式不再启动 RViz，可在服务器/CI 上持续采集；需要图形界面时切换到 `mode:=online`。
-
-## 常见问题 / Troubleshooting
-- **构建失败 Build issues**：确保执行 `catkin_make` 前已 `source /opt/ros/noetic/setup.bash`。
-- **相机视角错误 Camera pitch**：调整 `camera_pitch_deg`，正值表示向上抬头；摄像机、数据采集器、离线生成器都会共享该偏置。
-- **运行缓慢 Performance**：降低 `max_obstacle_candidates`、减小分辨率，或设置 `hardware_accel:=true hardware_device:=cuda` 以启用 torch。
-
-## 目录结构 / Repository Layout
-```
-whk_ws/
-├── README.md
-├── src/autonomy_demo/
-│   ├── config/                # RViz & dataset 配置
-│   ├── launch/                # sim / data_collection / inference 启动文件
-│   ├── scripts/               # world_generator, drone_simulator, camera_simulator, data_collector, inference_node
-│   ├── src/autonomy_demo/     # Python 模块：obstacle_field, safe_navigation, camera_utils
-│   ├── training/              # train_classifier.py, auto_dataset_generator.py
-│   └── setup.py, CMakeLists.txt, package.xml
-└── ...
+  model_path:=~/autonomy_demo/model.pt \
+  policy_path:=~/autonomy_demo/navigation_policy.pt
 ```
 
-## License
-MIT License.
+关键话题：
+- 订阅：`/drone/rgb/image_raw`、`/drone/rgb/camera_info`、`/drone/odometry`、`/move_base_simple/goal`。
+- 发布：
+  - `/drone/rgb/distance_class`：红/绿二分类可视化。
+  - `/drone/safe_center`：最大安全连通块中心。
+  - `/drone/movement_offsets`：规划偏移与时长（供模拟器跟踪）。
+  - `/drone/safe_trajectory`：五阶多项式轨迹（`Path` 消息，可被 `drone_simulator` 或实际控制器跟踪）。
+
+若需要将分割与规划分开运行，可使用 `inference_separate.launch` 启动 `inference_segmentation.py` 与 `inference_navigation_policy.py` 两个节点。
+
+## 注意事项
+- **训练 vs. 推理的障碍物信息**：
+  - 训练/数据生成阶段可直接获取环境真值并生成精确 mask 与障碍物快照。
+  - 在线推理阶段仅依赖相机图像和已训练模型，不再访问环境真值；因此请确保相机参数（分辨率、FOV、pitch、`camera_offset`）与训练一致，避免域偏移。
+
+- **超参数调节**：
+  - 轨迹采样：`radio_range`（视野半径）、`v_max`/`a_max`、`path_samples_per_step`、`yaw/pitch_std_deg` 等参数在 `inference.launch` 与训练脚本中一一对应，需保持一致。
+  - 规划代价：`primitive_safety_gate`、`primitive_clearance_gate`、`min_clearance_fraction`、`offset_gain` 控制安全裕度；`goal_stop_distance`、`goal_tolerance` 决定收敛判据。
+  - 损失权重：`train_segmentation.py` 中可调整 `distill_weight`、`teacher_weight`；`train_navigation_policy.py` 中可修改 jerk/姿态变化等惩罚系数以平衡平滑度与机动性。
+
+## 数据流与逻辑校验摘要
+- **数据采集链路**：`world_generator` 发布 `world/obstacles`；`drone_simulator` 发布 `/drone/pose` 与 `/drone/odometry`；`camera_simulator` 基于上述信息渲染 `/drone/rgb/image_raw` 与 `camera_info`；`data_collector` 订阅上述话题生成 `*.npz` 样本（图像 + mask/距离 + 机体姿态 + 障碍物快照）。
+- **分割训练链路**：`train_segmentation.py`/`train_classifier.py` 通过 `ObstacleDataset` 递归读取 `*.npz`，可直接使用 mask，或从 `distances` + `near_threshold` 重建标签；均值方差在训练时统计并写入 checkpoint，推理端自动复用。
+- **末端状态训练链路**：`train_navigation_policy.py`/`NavigationDataset` 读取同一批样本，使用安全掩码与障碍物快照生成安全区域中心、清障距离与相机射线，进一步评估 jerk、姿态变化、goal 对齐等奖励来拟合 PlannerNet。
+- **推理链路**：`inference_node.py` 订阅相机、里程计和 goal，将图像经 SegNet 得到安全 mask，再由 PlannerNet 预测末端状态与偏移，结合 quintic 轨迹（`path_samples_per_step`、`radio_range`、`vel_max_train` 等参数）生成 `/drone/safe_trajectory` 与 `/drone/movement_offsets`，实现闭环控制。
+
