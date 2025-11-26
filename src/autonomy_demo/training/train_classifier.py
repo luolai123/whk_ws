@@ -1137,9 +1137,9 @@ def main() -> None:
     print(f"Saved trained model to {args.output}")
 
     if not args.no_policy:
-    nav_dataset = NavigationDataset(
-        args.dataset, mean=channel_mean, std=channel_std, target_hw=target_hw
-    )
+        nav_dataset = NavigationDataset(
+            args.dataset, mean=channel_mean, std=channel_std, target_hw=target_hw
+        )
         primitive_config = PrimitiveConfig(
             radio_range=args.radio_range,
             vel_max_train=args.vel_max_train,
