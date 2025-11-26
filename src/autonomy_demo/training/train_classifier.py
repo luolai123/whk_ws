@@ -15,9 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from autonomy_demo.safe_navigation import (
     PrimitiveConfig,
-    apply_goal_offset,
     clamp_normalized,
-    compute_primitive_duration,
     compute_direction_from_pixel,
     find_largest_safe_region,
     jerk_score,
@@ -482,41 +480,48 @@ def _quintic_coefficients_torch(
     end_acc: torch.Tensor,
     duration: torch.Tensor,
 ) -> torch.Tensor:
-    """Torch-friendly quintic solver for端到端末端状态学习."""
+    """Solve 6×6 quintic coefficients via端点约束."""
 
     duration = torch.clamp(duration, min=torch.tensor(1e-3, device=duration.device))
-    a0 = start_pos
-    a1 = start_vel
-    a2 = start_acc * 0.5
+    t = duration
+    powers = torch.stack([t ** i for i in range(6)])
 
-    t1 = duration
-    t2 = t1 * t1
-    t3 = t2 * t1
-    t4 = t3 * t1
-    t5 = t4 * t1
-
-    rhs0 = end_pos - (a0 + a1 * t1 + a2 * t2)
-    rhs1 = end_vel - (a1 + 2.0 * a2 * t1)
-    rhs2 = end_acc - (2.0 * a2)
-
-    mat = torch.stack(
+    a_matrix = torch.stack(
         [
-            torch.stack([t3, t4, t5]),
-            torch.stack([3.0 * t2, 4.0 * t3, 5.0 * t4]),
-            torch.stack([6.0 * t1, 12.0 * t2, 20.0 * t3]),
+            torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=t.device, dtype=t.dtype),
+            torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0, 0.0], device=t.device, dtype=t.dtype),
+            torch.tensor([0.0, 0.0, 2.0, 0.0, 0.0, 0.0], device=t.device, dtype=t.dtype),
+            torch.stack([powers[0], powers[1], powers[2], powers[3], powers[4], powers[5]]),
+            torch.stack([
+                torch.tensor(0.0, device=t.device, dtype=t.dtype),
+                torch.tensor(1.0, device=t.device, dtype=t.dtype),
+                torch.tensor(2.0, device=t.device, dtype=t.dtype) * powers[1],
+                torch.tensor(3.0, device=t.device, dtype=t.dtype) * powers[2],
+                torch.tensor(4.0, device=t.device, dtype=t.dtype) * powers[3],
+                torch.tensor(5.0, device=t.device, dtype=t.dtype) * powers[4],
+            ]),
+            torch.stack([
+                torch.tensor(0.0, device=t.device, dtype=t.dtype),
+                torch.tensor(0.0, device=t.device, dtype=t.dtype),
+                torch.tensor(2.0, device=t.device, dtype=t.dtype),
+                torch.tensor(6.0, device=t.device, dtype=t.dtype) * powers[1],
+                torch.tensor(12.0, device=t.device, dtype=t.dtype) * powers[2],
+                torch.tensor(20.0, device=t.device, dtype=t.dtype) * powers[3],
+            ]),
         ]
     )
-    rhs = torch.stack([rhs0, rhs1, rhs2])
-    high_coeffs = torch.linalg.solve(mat, rhs)
 
-    coeffs = torch.zeros((6, 3), device=duration.device, dtype=duration.dtype)
-    coeffs[0] = a0
-    coeffs[1] = a1
-    coeffs[2] = a2
-    coeffs[3] = high_coeffs[0]
-    coeffs[4] = high_coeffs[1]
-    coeffs[5] = high_coeffs[2]
-    return coeffs
+    b_matrix = torch.stack([
+        start_pos,
+        start_vel,
+        start_acc,
+        end_pos,
+        end_vel,
+        end_acc,
+    ])
+
+    solution = torch.linalg.solve(a_matrix, b_matrix)
+    return solution
 
 
 def _sample_quintic_torch(
@@ -538,57 +543,26 @@ def _sample_quintic_torch(
     return points, velocities
 
 
-def _compute_esdf_distance(points: torch.Tensor, metadata: Dict[str, Any]) -> torch.Tensor:
-    """Approximate ESDF using privileged obstacle snapshots."""
+def _project_points_to_mask(
+    points: torch.Tensor,
+    camera_to_body: torch.Tensor,
+    height: int,
+    width: int,
+    fov_deg: float,
+) -> torch.Tensor:
+    """Project 3D body-frame points to normalized image coords for ``grid_sample``."""
 
-    device = points.device
-    distances = torch.full((points.shape[0],), float("inf"), device=device)
+    fov_rad = math.radians(fov_deg)
+    tan_half_h = math.tan(fov_rad / 2.0)
+    tan_half_v = tan_half_h * (height / float(max(width, 1)))
 
-    sphere_centers = metadata.get("sphere_centers")
-    sphere_radii = metadata.get("sphere_radii")
-    if sphere_centers is not None and sphere_centers.numel() > 0:
-        diff = points[:, None, :] - sphere_centers[None, :, :]
-        sphere_dist = torch.linalg.norm(diff, dim=2) - sphere_radii[None, :]
-        distances = torch.minimum(distances, torch.min(sphere_dist, dim=1).values)
-
-    box_centers = metadata.get("box_centers")
-    box_half_extents = metadata.get("box_half_extents")
-    box_rotations = metadata.get("box_rotations")
-    if (
-        box_centers is not None
-        and box_half_extents is not None
-        and box_rotations is not None
-        and box_centers.numel() > 0
-    ):
-        rel = points[:, None, :] - box_centers[None, :, :]
-        local = torch.einsum("bij,pbj->pbi", box_rotations.transpose(1, 2), rel)
-        excess = torch.abs(local) - box_half_extents[None, :, :]
-        outside = torch.clamp(excess, min=0.0)
-        outside_norm = torch.linalg.norm(outside, dim=2)
-        inside = torch.clamp(torch.max(excess, dim=2).values, max=0.0)
-        box_dist = outside_norm + inside
-        distances = torch.minimum(distances, torch.min(box_dist, dim=1).values)
-
-    return distances
-
-
-def _metadata_to_torch(metadata: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
-    """Move特权场景几何到 GPU/CPU，供 ESDF & 末端状态 head 反传."""
-
-    result: Dict[str, Any] = {}
-    for key in (
-        "sphere_centers",
-        "sphere_radii",
-        "box_centers",
-        "box_half_extents",
-        "box_rotations",
-    ):
-        arr = metadata.get(key)
-        if arr is None:
-            continue
-        tensor = torch.as_tensor(arr, device=device, dtype=torch.float32)
-        result[key] = tensor
-    return result
+    cam_dirs = torch.einsum("ij,pj->pi", camera_to_body.transpose(0, 1), points)
+    x = torch.clamp(cam_dirs[:, 0], min=1e-3)
+    u = cam_dirs[:, 1] / (x * tan_half_h)
+    v = cam_dirs[:, 2] / (x * tan_half_v)
+    grid = torch.stack([u, v * -1.0], dim=1)  # flip v to align image coordinates
+    grid = grid.view(1, -1, 1, 2)
+    return grid
 
 
 def _compute_duration_torch(goal_body: torch.Tensor, config: PrimitiveConfig, duration_scale: torch.Tensor) -> torch.Tensor:
@@ -621,20 +595,15 @@ class SafeNavigationPolicy(torch.nn.Module):
         self.global_pool = torch.nn.AdaptiveAvgPool2d(1)
         fusion_dim = 128
         self.fc1 = torch.nn.Linear(64 + state_dim, fusion_dim)
-        self.action_head = torch.nn.Linear(fusion_dim, 4)
-        # 末端状态 head：Δp(3) + v_T(3) + a_T(3)
+        # 末端状态 head：Δp_raw(3) + y_v(3) + y_a(3)
         self.end_state_head = torch.nn.Linear(fusion_dim, 9)
 
-    def forward(
-        self, mask: torch.Tensor, state: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, mask: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
         features = self.backbone(mask)
         pooled = self.global_pool(features).view(mask.size(0), -1)
         combined = torch.cat([pooled, state], dim=1)
         hidden = F.relu(self.fc1(combined))
-        action = torch.tanh(self.action_head(hidden))
-        end_state = torch.tanh(self.end_state_head(hidden))
-        return action, end_state
+        return self.end_state_head(hidden)
 
 
 class SegmentationLoss(torch.nn.Module):
@@ -811,6 +780,7 @@ def train_navigation_policy(
         ],
         dtype=np.float32,
     )
+    camera_to_body_t = torch.from_numpy(camera_to_body).to(device=device, dtype=torch.float32)
     rng = np.random.default_rng(seed or None)
     indices = list(range(len(dataset)))
 
@@ -820,8 +790,7 @@ def train_navigation_policy(
         epoch_count = 0
         policy.train()
         metrics_accumulator = {
-            "safety": 0.0,
-            "clearance": 0.0,
+            "collision": 0.0,
             "goal": 0.0,
             "goal_alignment": 0.0,
             "smoothness": 0.0,
@@ -864,6 +833,10 @@ def train_navigation_policy(
                 goal_direction_body = clamp_normalized(
                     camera_to_body.dot(goal_direction_camera)
                 )
+                goal_body = (
+                    torch.from_numpy(goal_direction_body * sample.goal_length)
+                    .to(device=device, dtype=torch.float32)
+                )
                 goal_bias = math.sqrt(
                     (goal_col - center_col) ** 2 + (goal_row - center_row) ** 2
                 ) / max(diag, 1e-3)
@@ -873,24 +846,25 @@ def train_navigation_policy(
                 enriched_state = np.concatenate([state_vec, goal_features]).astype(np.float32)
                 state_tensor = torch.from_numpy(enriched_state).unsqueeze(0).to(device=device)
 
-                action_out, end_state = policy(mask_tensor, state_tensor)
-                offset_raw = action_out[0, 0:3]
-                duration_delta = action_out[0, 3]
-                duration_scale = torch.clamp(1.0 + 0.2 * duration_delta, 0.7, 1.3)
+                end_state_raw = policy(mask_tensor, state_tensor)[0]
 
-                base_goal_body = (
-                    torch.from_numpy(sample.goal_direction_body * sample.goal_length)
-                    .to(device=device, dtype=torch.float32)
+                delta_p_raw = end_state_raw[0, 0:3]
+                y_v = end_state_raw[0, 3:6]
+                y_a = end_state_raw[0, 6:9]
+
+                delta_p = torch.tanh(delta_p_raw) * primitive_config.radio_range
+                end_pos = delta_p
+                end_vel = torch.tanh(y_v) * primitive_config.vel_max_train
+                end_acc = torch.tanh(y_a) * primitive_config.acc_max_train
+
+                traj_radius = torch.linalg.norm(delta_p)
+                duration_t = torch.clamp(
+                    2.0 * traj_radius / max(primitive_config.vel_max_train, 1e-3),
+                    min=0.2,
                 )
-                goal_body = base_goal_body + offset_raw * primitive_config.radio_range
-
-                delta_p = end_state[0, 0:3] * (primitive_config.radio_range * 0.5)
-                end_vel = end_state[0, 3:6] * primitive_config.vel_max_train
-                end_acc = end_state[0, 6:9] * primitive_config.acc_max_train
-                end_pos = goal_body + delta_p
-
-                duration_t = _compute_duration_torch(goal_body, primitive_config, duration_scale)
-                sample_count = max(2, int(math.ceil(float(duration_t.detach().cpu()) * samples_per_second)))
+                sample_count = max(
+                    2, int(math.ceil(float(duration_t.detach().cpu()) * samples_per_second))
+                )
 
                 start_vel = torch.from_numpy(sample.start_vel_body).to(device=device, dtype=torch.float32)
                 start_acc = torch.from_numpy(sample.start_acc_body).to(device=device, dtype=torch.float32)
@@ -926,19 +900,22 @@ def train_navigation_policy(
                 jerk = torch.diff(acc, dim=0) / torch.clamp(dt, min=1e-3)
                 Js = torch.sum(jerk ** 2) * dt
 
-                metadata_torch = _metadata_to_torch(_metadata, device)
-                esdf = _compute_esdf_distance(points_t, metadata_torch)
-                clearance_penalty = F.relu(0.2 - esdf)
-                Jc = torch.mean(clearance_penalty**2)
+                grid = _project_points_to_mask(
+                    points_t, camera_to_body_t, dataset.height, dataset.width, 120.0
+                )
+                danger = 1.0 - mask_tensor
+                danger_samples = F.grid_sample(
+                    danger, grid, align_corners=True, mode="bilinear", padding_mode="border"
+                ).view(-1)
+                Jc = torch.sum(danger_samples * dt)
 
                 Jg = torch.mean((points_t[-1] - goal_body) ** 2)
 
-                loss = 0.6 * Jc + 0.25 * Js + 0.15 * Jg
+                loss = 1.0 * Jc + 0.3 * Js + 1.0 * Jg
                 batch_loss += loss
                 valid_samples += 1
 
-                metrics_accumulator["safety"] += float(torch.mean((esdf > 0.0).float()).item())
-                metrics_accumulator["clearance"] += float(torch.mean(esdf).item())
+                metrics_accumulator["collision"] += float(Jc.detach().cpu())
                 metrics_accumulator["goal"] += float(Jg.detach().cpu())
                 metrics_accumulator["goal_alignment"] += float(
                     normalized_goal_error.detach().cpu()
@@ -965,12 +942,11 @@ def train_navigation_policy(
                 key: value / epoch_count for key, value in metrics_accumulator.items()
             }
             print(
-                "Policy epoch {}/{} - avg loss: {:.4f}, clearance_hit: {:.3f}, clearance_mean: {:.3f}, Jg: {:.4f}, goal_norm_err: {:.4f}, Js: {:.4f}, jerk_peak: {:.4f}, |v_T|: {:.3f}".format(
+                "Policy epoch {}/{} - avg loss: {:.4f}, Jc: {:.4f}, Jg: {:.4f}, goal_norm_err: {:.4f}, Js: {:.4f}, jerk_peak: {:.4f}, |v_T|: {:.3f}".format(
                     epoch + 1,
                     epochs,
                     avg_loss,
-                    averaged_metrics["safety"],
-                    averaged_metrics["clearance"],
+                    averaged_metrics["collision"],
                     averaged_metrics["goal"],
                     averaged_metrics["goal_alignment"],
                     averaged_metrics["smoothness"],

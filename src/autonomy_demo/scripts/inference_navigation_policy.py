@@ -279,20 +279,15 @@ class NavigationPolicyInferenceNode:
             )
             state_tensor[:, 0] = speed_norm_value
             with torch.no_grad():
-                policy_out = self.policy(mask_tensor, state_tensor)
-            action, _ = (
-                policy_out if isinstance(policy_out, tuple) else (policy_out, None)
+                raw_end = self.policy(mask_tensor, state_tensor)
+            raw_np = raw_end.squeeze(0).cpu().numpy()
+            delta_p = np.tanh(raw_np[0:3]) * self.radio_range
+            length_est = float(
+                np.clip(
+                    np.linalg.norm(delta_p) / max(self.radio_range, 1e-3), 0.5, 1.5
+                )
             )
-            action_np = action.squeeze(0).cpu().numpy()
-            length_delta, pitch_delta, yaw_delta = action_np[0:3]
-            length_est = float(np.clip(1.0 + 0.2 * length_delta, 0.5, 1.5))
-            pitch_est = float(
-                np.clip(math.radians(15.0) * pitch_delta, -math.radians(15.0), math.radians(15.0))
-            )
-            yaw_est = float(
-                np.clip(math.radians(15.0) * yaw_delta, -math.radians(15.0), math.radians(15.0))
-            )
-            policy_offsets = (length_est, pitch_est, yaw_est)
+            policy_offsets = (length_est, 0.0, 0.0)
 
         best_candidate = None
         for idx in range(K):
