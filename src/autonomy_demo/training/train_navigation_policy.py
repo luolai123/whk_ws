@@ -97,7 +97,7 @@ def _build_dataset_cache(
 
     for idx in range(len(dataset)):
         cache = _SampleCache()
-        safe_mask, _distances_unused, metadata = dataset[idx]
+        _image_unused, safe_mask, _distances_unused, metadata = dataset[idx]
 
         # ---- 基本校验 ----
         if not isinstance(safe_mask, np.ndarray):
