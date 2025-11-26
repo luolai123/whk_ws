@@ -579,7 +579,7 @@ def _compute_duration_torch(goal_body: torch.Tensor, config: PrimitiveConfig, du
 
 
 class SafeNavigationPolicy(torch.nn.Module):
-    def __init__(self, height: int, width: int, state_dim: int = 8) -> None:
+    def __init__(self, height: int, width: int, state_dim: int = 9) -> None:
         super().__init__()
         self.height = height
         self.width = width
@@ -636,6 +636,32 @@ def add_noise(mask: np.ndarray, noise_rate: float) -> np.ndarray:
     noisy = mask.copy()
     noisy[noise] = 1.0 - noisy[noise]
     return noisy
+
+
+def planner_state_features(
+    position: Optional[np.ndarray],
+    velocity: Optional[np.ndarray],
+    acceleration: Optional[np.ndarray],
+    config: PrimitiveConfig,
+) -> np.ndarray:
+    """Normalize position/velocity/acceleration for PlannerNet consumption."""
+
+    pos = np.zeros(3, dtype=np.float32) if position is None else np.asarray(position, dtype=np.float32)
+    vel = np.zeros(3, dtype=np.float32) if velocity is None else np.asarray(velocity, dtype=np.float32)
+    acc = (
+        np.zeros(3, dtype=np.float32)
+        if acceleration is None
+        else np.asarray(acceleration, dtype=np.float32)
+    )
+
+    range_scale = max(config.radio_range, 1e-3)
+    vel_scale = max(config.vel_max_train, 1e-3)
+    acc_scale = max(config.acc_max_train, 1e-3)
+
+    pos_norm = pos / range_scale
+    vel_norm = vel / vel_scale
+    acc_norm = acc / acc_scale
+    return np.concatenate([pos_norm, vel_norm, acc_norm]).astype(np.float32)
 
 
 def evaluate_classifier(
@@ -766,8 +792,7 @@ def train_navigation_policy(
     camera_pitch_deg: float,
     seed: int,
 ) -> None:
-    goal_feature_dim = 4
-    state_dim = primitive_state_dim(primitive_config) + goal_feature_dim
+    state_dim = 9
     policy = SafeNavigationPolicy(dataset.height, dataset.width, state_dim=state_dim).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
     diag = math.sqrt(dataset.width ** 2 + dataset.height ** 2)
@@ -805,7 +830,7 @@ def train_navigation_policy(
             valid_samples = 0
 
             for idx in batch:
-                safe_mask, distances, _metadata = dataset[idx]
+                safe_mask, distances, metadata = dataset[idx]
                 noisy_mask = add_noise(safe_mask, noise_rate)
                 region = find_largest_safe_region(noisy_mask.astype(bool), 0.05)
                 if region is None:
@@ -829,7 +854,6 @@ def train_navigation_policy(
                     primitive_config,
                     1,
                 )[0]
-                state_vec = primitive_state_vector(sample, primitive_config)
                 goal_direction_body = clamp_normalized(
                     camera_to_body.dot(goal_direction_camera)
                 )
@@ -837,14 +861,16 @@ def train_navigation_policy(
                     torch.from_numpy(goal_direction_body * sample.goal_length)
                     .to(device=device, dtype=torch.float32)
                 )
-                goal_bias = math.sqrt(
-                    (goal_col - center_col) ** 2 + (goal_row - center_row) ** 2
-                ) / max(diag, 1e-3)
-                goal_features = np.concatenate(
-                    [goal_direction_body, np.array([goal_bias], dtype=np.float32)]
+                position = metadata.get("pose_position")
+                velocity = metadata.get("pose_velocity")
+                acceleration = metadata.get("pose_acceleration")
+                state_vec = planner_state_features(
+                    position,
+                    velocity,
+                    acceleration,
+                    primitive_config,
                 )
-                enriched_state = np.concatenate([state_vec, goal_features]).astype(np.float32)
-                state_tensor = torch.from_numpy(enriched_state).unsqueeze(0).to(device=device)
+                state_tensor = torch.from_numpy(state_vec).unsqueeze(0).to(device=device)
 
                 end_state_raw = policy(mask_tensor, state_tensor)[0]
 

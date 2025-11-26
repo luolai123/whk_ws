@@ -39,6 +39,7 @@ from train_classifier import (
     SafeNavigationPolicy,
     add_noise,
     apply_offsets_torch,
+    planner_state_features,
     quaternion_to_matrix,
 )
 
@@ -250,10 +251,12 @@ def train_navigation_policy(
                 # 随速（与原脚本一致）
                 speed = torch.rand(1, device=device, dtype=torch.float32) * 4.0 + 3.0
                 normalized_speed = (speed - 3.0) / 4.0
+                state_tensor = torch.zeros((1, 9), device=device, dtype=torch.float32)
+                state_tensor[0, 3] = normalized_speed
 
                 # 前向（AMP）
                 with torch.cuda.amp.autocast(enabled=(use_amp and device.type == "cuda")):
-                    outputs = policy(mask_tensor, normalized_speed)
+                    outputs = policy(mask_tensor, state_tensor)
                 # 假设输出形状与原脚本一致：取第一个样本的三个分量
                 length_delta, pitch_delta, yaw_delta = outputs[0]
                 length_scale = torch.clamp(1.0 + 0.2 * length_delta, 0.5, 1.5)
