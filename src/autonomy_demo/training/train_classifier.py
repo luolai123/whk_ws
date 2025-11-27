@@ -142,6 +142,30 @@ def _infer_image(sample: np.lib.npyio.NpzFile) -> np.ndarray:
             return arr.astype(np.float32)
     raise KeyError("No RGB image found in sample")
 
+import numpy as np
+
+def quaternion_to_matrix(quaternion: np.ndarray) -> np.ndarray:
+    """
+    将四元数（x, y, z, w）转换为 3x3 旋转矩阵。
+    四元数需满足单位长度（未归一化时会自动归一化）。
+    """
+    q = np.asarray(quaternion, dtype=np.float32)
+    if len(q) != 4:
+        raise ValueError("四元数必须是长度为4的数组 (x, y, z, w)")
+    
+    # 归一化四元数
+    norm = np.linalg.norm(q)
+    if norm < 1e-6:
+        return np.eye(3, dtype=np.float32)
+    q /= norm
+    x, y, z, w = q
+    
+    # 计算旋转矩阵
+    return np.array([
+        [1 - 2*y**2 - 2*z**2, 2*x*y - 2*w*z, 2*x*z + 2*w*y],
+        [2*x*y + 2*w*z, 1 - 2*x**2 - 2*z**2, 2*y*z - 2*w*x],
+        [2*x*z - 2*w*y, 2*y*z + 2*w*x, 1 - 2*x**2 - 2*y**2]
+    ], dtype=np.float32)
 
 def _infer_distance_map(sample: np.lib.npyio.NpzFile) -> Optional[np.ndarray]:
     for key in ("distances", "distance", "depth", "depth_map", "distance_map"):
