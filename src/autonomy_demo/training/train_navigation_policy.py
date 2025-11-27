@@ -258,7 +258,10 @@ def train_navigation_policy(
                 with torch.cuda.amp.autocast(enabled=(use_amp and device.type == "cuda")):
                     outputs = policy(mask_tensor, state_tensor)
                 # 假设输出形状与原脚本一致：取第一个样本的三个分量
-                length_delta, pitch_delta, yaw_delta = outputs[0]
+                delta_p, y_v, y_a = outputs[0].split([3, 3, 3], dim=0)  # 按实际维度拆分
+                length_delta = torch.norm(delta_p)  # 从位置偏移中计算长度
+                pitch_delta = y_v[1]  # 假设速度的y分量对应俯仰角
+                yaw_delta = y_v[2]    # 假设速度的z分量对应偏航角
                 length_scale = torch.clamp(1.0 + 0.2 * length_delta, 0.5, 1.5)
                 pitch_offset = pitch_limit * pitch_delta
                 yaw_offset   = yaw_limit   * yaw_delta
