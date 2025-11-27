@@ -126,7 +126,6 @@ def train_segmentation(
             loss.backward()
             optimizer.step()
             if teacher is not None and teacher_optimizer is not None:
-                loss_teacher.backward()
                 teacher_optimizer.step()
             running_loss += float(loss.item())
 
