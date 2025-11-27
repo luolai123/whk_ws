@@ -87,6 +87,41 @@ class DistanceClassifier(torch.nn.Module):
         x = self.up1(x, x1)
         return self.classifier(x)
 
+class TeacherDistanceClassifier(torch.nn.Module):
+    """教师模型，接收 RGB 图像和障碍物信息作为输入（用于蒸馏训练）"""
+    def __init__(self) -> None:
+        super().__init__()
+        # 编码器部分：额外接收障碍物通道（1维），因此输入通道数为 3(RGB) + 1(obstacle) = 4
+        self.enc1 = ConvBlock(4, 32)  # 与学生模型不同，输入通道数为4
+        self.enc2 = ConvBlock(32, 64)
+        self.enc3 = ConvBlock(64, 128)
+        self.pool = torch.nn.MaxPool2d(2)
+        self.bottleneck = ConvBlock(128, 256)
+        self.up3 = UpBlock(256, 128)
+        self.up2 = UpBlock(128, 64)
+        self.up1 = UpBlock(64, 32)
+        self.classifier = torch.nn.Conv2d(32, 2, kernel_size=1)  # 输出与学生模型一致（2类：安全/障碍物）
+
+    def forward(self, x: torch.Tensor, obstacle: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: RGB 图像张量，形状为 (B, 3, H, W)
+            obstacle: 障碍物信息张量，形状为 (B, 1, H, W)
+        Returns:
+            分类输出，形状为 (B, 2, H, W)
+        """
+        # 将 RGB 图像与障碍物信息拼接（通道维度）
+        combined = torch.cat([x, obstacle], dim=1)  # 输出形状：(B, 4, H, W)
+        
+        # 后续流程与学生模型（DistanceClassifier）一致
+        x1 = self.enc1(combined)
+        x2 = self.enc2(self.pool(x1))
+        x3 = self.enc3(self.pool(x2))
+        bottleneck = self.bottleneck(self.pool(x3))
+        x = self.up3(bottleneck, x3)
+        x = self.up2(x, x2)
+        x = self.up1(x, x1)
+        return self.classifier(x)
 
 def _infer_image(sample: np.lib.npyio.NpzFile) -> np.ndarray:
     if "image" in sample:
