@@ -122,6 +122,15 @@ class TeacherDistanceClassifier(torch.nn.Module):
         x = self.up2(x, x2)
         x = self.up1(x, x1)
         return self.classifier(x)
+        
+class SegmentationLoss(torch.nn.Module):
+    """分割任务损失函数（交叉熵损失）"""
+    def __init__(self, class_weights: Optional[torch.Tensor] = None) -> None:
+        super().__init__()
+        self.criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+
+    def forward(self, outputs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        return self.criterion(outputs, labels)
 
 def _infer_image(sample: np.lib.npyio.NpzFile) -> np.ndarray:
     if "image" in sample:
